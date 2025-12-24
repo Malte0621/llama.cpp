@@ -7,6 +7,18 @@
 #include <cstring>
 #include <future>
 
+// Local helper to query RPC configuration when streaming to RPC backends.
+#include <cstdlib>
+static inline uint64_t llama_rpc_get_max_msg_size() {
+    const char * v = std::getenv("GGML_RPC_MAX_MSG_SIZE");
+    if (!v) return 256ull * 1024ull * 1024ull;
+    char * endptr = nullptr;
+    unsigned long long val = strtoull(v, &endptr, 10);
+    if (endptr == v) return 256ull * 1024ull * 1024ull;
+    return (uint64_t) val;
+}
+
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1161,11 +1173,103 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    read_buf.resize(n_size);
-                    file->read_raw_at(read_buf.data(), n_size, weight->offs);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    // detect if the target buffer is an RPC buffer so we can stream the tensor
+                    bool is_rpc_buf = false;
+                    if (cur->buffer) {
+                        auto * buft = ggml_backend_buffer_get_type(cur->buffer);
+                        if (buft) {
+                            auto * dev = ggml_backend_buft_get_device(buft);
+                            if (dev) {
+                                auto * reg = ggml_backend_dev_backend_reg(dev);
+                                if (reg) {
+                                    const char * reg_name = ggml_backend_reg_name(reg);
+                                    if (reg_name) {
+                                        std::string rn(reg_name);
+                                        std::transform(rn.begin(), rn.end(), rn.begin(), ::tolower);
+                                        if (rn == "rpc") is_rpc_buf = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (is_rpc_buf) {
+                        // Stream tensor in aligned chunks directly from file to the remote buffer
+                        size_t offset = weight->offs;
+                        alignment = file->read_alignment();
+                        size_t aligned_offset = offset & ~(alignment - 1);
+                        size_t offset_from_alignment = offset - aligned_offset;
+                        file->seek(aligned_offset, SEEK_SET);
+
+                        // Calculate aligned read boundaries
+                        size_t read_start = aligned_offset;
+                        size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+
+                        size_t bytes_read = 0;
+                        size_t data_read = 0; // actual tensor data copied (excluding padding)
+
+                        // Determine an upload chunk size that respects both the RPC message
+                        // size and the remote buffer maximum size (if available).
+                        auto * buft = ggml_backend_buffer_get_type(cur->buffer);
+
+                        // conservative RPC payload sizing: subtract a small safety margin to account
+                        // for protocol headers so we do not exceed the remote max message size
+                        const size_t rpc_safe_overhead = 4096; // bytes
+                        uint64_t rpc_max_msg = llama_rpc_get_max_msg_size();
+                        size_t rpc_payload_max = rpc_max_msg > rpc_safe_overhead ? (size_t)(rpc_max_msg - rpc_safe_overhead) : 1;
+
+                        size_t buft_max = ggml_backend_buft_get_max_size(buft);
+                        // If buft_max == 0 it means unknown/unlimited for this backend; leave rpc_payload_max as the limit
+                        if (buft_max != 0) {
+                            rpc_payload_max = std::min(rpc_payload_max, buft_max);
+                        }
+
+                        // chunk buffer needs room for alignment padding + payload
+                        size_t desired_chunk_read = std::min<size_t>(buffer_size, rpc_payload_max + alignment);
+                        const size_t chunk_buf_size = std::max<size_t>(alignment, desired_chunk_read);
+                        std::vector<uint8_t> chunk_buf(chunk_buf_size);
+
+                        while (bytes_read < read_end - read_start) {
+                            size_t read_size = std::min<size_t>(chunk_buf_size, read_end - read_start - bytes_read);
+
+                            file->read_raw(reinterpret_cast<void*>(chunk_buf.data()), read_size);
+
+                            uintptr_t ptr_data = reinterpret_cast<uintptr_t>(chunk_buf.data());
+                            size_t data_to_copy = read_size;
+
+                            // Skip alignment padding at start of first chunk
+                            if (bytes_read == 0) {
+                                ptr_data += offset_from_alignment;
+                                data_to_copy -= offset_from_alignment;
+                            }
+
+                            // Trim alignment padding at end of last chunk
+                            if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                                data_to_copy -= (read_end - (offset + n_size));
+                            }
+
+                            if (check_tensors) {
+                                if (!ggml_validate_row_data(cur->type, reinterpret_cast<void*>(ptr_data), data_to_copy)) {
+                                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                                }
+                            }
+
+                            // send chunk to backend (may be RPC-backed)
+                            // note: ggml_backend_tensor_set will split large chunks further to respect
+                            // RPC message limits; by sizing the read chunks to be <= rpc_payload_max
+                            // we avoid excessive splitting and keep memory use reasonable
+                            ggml_backend_tensor_set(cur, reinterpret_cast<void*>(ptr_data), data_read, data_to_copy);
+
+                            data_read += data_to_copy;
+                            bytes_read += read_size;
+                        }
+                    } else {
+                        read_buf.resize(n_size);
+                        file->read_raw_at(read_buf.data(), n_size, weight->offs);
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
                     }
                 }
             }

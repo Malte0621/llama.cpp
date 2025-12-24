@@ -164,6 +164,18 @@ static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t mi
     if (alloc->n_chunks >= GGML_VBUFFER_MAX_CHUNKS) {
         return -1;
     }
+
+    // If the allocator knows a maximum chunk size (e.g., remote buft max),
+    // a single tensor that exceeds this maximum cannot be satisfied on this
+    // buffer type and we should fail early so the higher-level allocator can
+    // try a different buffer type (e.g., host buffer). This prevents us from
+    // creating an oversized chunk that would later generate a failing remote
+    // allocation request (common with RPC backends).
+    if (alloc->max_chunk_size != 0 && min_size > alloc->max_chunk_size) {
+        // indicate that we couldn't create a chunk that satisfies min_size
+        return -1;
+    }
+
     struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
     chunk->n_free_blocks = 1;
     chunk->free_blocks[0].offset = 0;
@@ -1175,6 +1187,28 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
 
+    // If max_size is unknown (0) and this is an RPC backend, use a conservative default
+    if (max_size == 0) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (reg) {
+                const char * reg_name = ggml_backend_reg_name(reg);
+                if (reg_name) {
+                    // case-insensitive check for "rpc" substring
+                    for (const char * p = reg_name; *p; ++p) {
+                        char c = (char)tolower((unsigned char)*p);
+                        if (c == 'r' && p[1] && (char)tolower((unsigned char)p[1]) == 'p' && p[2] && (char)tolower((unsigned char)p[2]) == 'c') {
+                            max_size = 256 * 1024 * 1024; // conservative default: 256 MiB
+                            GGML_LOG_INFO("%s: backend '%s' reports unknown max_size; using conservative default %zu\n", __func__, reg_name, max_size);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ggml_backend_buffer_t * buffers = NULL;
     size_t n_buffers = 0;
     *nbytes_total = 0;
@@ -1185,6 +1219,12 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+        }
+
+        // If a single tensor would exceed the buft's max allowed size, fail early
+        if (max_size != 0 && this_size > max_size) {
+            GGML_LOG_ERROR("%s: single tensor size %zu exceeds buffer max %zu\n", __func__, this_size, max_size);
+            return NULL;
         }
 
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {

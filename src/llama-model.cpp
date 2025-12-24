@@ -312,9 +312,17 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     for (const auto & cur : buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
-            return cur_buft;
+        if (!weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+            continue;
         }
+        // Ensure that the buffer type can actually hold the tensor: query required alloc size and compare with buft max
+        size_t required = ggml_backend_buft_get_alloc_size(cur_buft, tensor);
+        size_t max_size = ggml_backend_buft_get_max_size(cur_buft);
+        if (max_size != 0 && required > max_size) {
+            LLAMA_LOG_DEBUG("select_weight_buft: skipping %s because required size %zu > max %zu\n", ggml_backend_buft_name(cur_buft), required, max_size);
+            continue;
+        }
+        return cur_buft;
     }
 
     return nullptr;

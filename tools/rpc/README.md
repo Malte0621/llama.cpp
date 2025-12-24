@@ -95,6 +95,19 @@ $ bin/rpc-server -c
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.
 
+### RDMA (experimental)
+
+The RPC transport is pluggable and supports an experimental RDMA transport for high-throughput low-latency transfers. RDMA support is disabled by default and must be enabled at build time:
+
+```bash
+cmake .. -DGGML_RPC=ON -DGGML_RPC_RDMA=ON
+cmake --build . --config Release
+```
+
+When RDMA is enabled, use the `rdma://` scheme to select the RDMA transport when specifying endpoints (e.g. `rdma://192.168.1.10:50052`). RDMA is only supported on Linux and requires RDMA-capable hardware and the `libibverbs` / `librdmacm` libraries.
+
+> ⚠️ **Security**: RDMA bypasses parts of the OS networking stack and can expose memory directly on the fabric. Never enable RDMA on untrusted networks and follow your infra security policies.
+
 ### Troubleshooting
 
 Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc-server`:

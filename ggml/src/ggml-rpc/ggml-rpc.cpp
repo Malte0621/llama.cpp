@@ -2,6 +2,15 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "rpc-transport.h"
+
+// Forward declarations for transport helpers (ensure availability during parsing)
+bool transport_send_msg(std::shared_ptr<socket_t> sock, const void * msg, size_t msg_size);
+bool transport_recv_msg(std::shared_ptr<socket_t> sock, void * msg, size_t msg_size);
+bool transport_recv_vector(std::shared_ptr<socket_t> sock, std::vector<uint8_t> & input);
+bool transport_send_data(std::shared_ptr<socket_t> sock, const void * data, size_t size);
+bool transport_recv_data(std::shared_ptr<socket_t> sock, void * data, size_t size);
+
 
 #include <cinttypes>
 #include <string>
@@ -10,6 +19,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
+#include <atomic>
+#include <chrono>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  ifndef NOMINMAX
@@ -41,26 +53,8 @@ namespace fs = std::filesystem;
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 
-#ifdef _WIN32
-typedef SOCKET sockfd_t;
-using ssize_t = __int64;
-#else
-typedef int sockfd_t;
-#endif
+// socket_t and sockfd_t are defined in rpc-transport.h
 
-// cross-platform socket
-struct socket_t {
-    sockfd_t fd;
-    socket_t(sockfd_t fd) : fd(fd) {}
-    ~socket_t() {
-        LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
-#ifdef _WIN32
-        closesocket(this->fd);
-#else
-        close(this->fd);
-#endif
-    }
-};
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
@@ -314,76 +308,16 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
-    struct sockaddr_in addr;
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    auto sock_ptr = make_socket(sockfd);
-    if (sock_ptr == nullptr) {
-        return nullptr;
-    }
-    if (!set_no_delay(sockfd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
-        GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
-        return nullptr;
-    }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
-    }
-    return sock_ptr;
-}
+// socket_connect was replaced by transport_connect/tcp_socket_connect in rpc-transport.cpp
 
-static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
-    auto client_socket_fd = accept(srv_sockfd, NULL, NULL);
-    auto client_socket = make_socket(client_socket_fd);
-    if (client_socket == nullptr) {
-        return nullptr;
-    }
-    if (!set_no_delay(client_socket_fd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    return client_socket;
-}
 
-static std::shared_ptr<socket_t> create_server_socket(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    auto sock = make_socket(sockfd);
-    if (sock == nullptr) {
-        return nullptr;
-    }
-    if (!set_reuse_addr(sockfd)) {
-        GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
-    }
-    if (inet_addr(host) == INADDR_NONE) {
-        GGML_LOG_ERROR("Invalid host address: %s\n", host);
-        return nullptr;
-    }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
+// legacy socket helpers removed; use transport_* functions in rpc-transport.cpp instead
 
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        return nullptr;
-    }
-    if (listen(sockfd, 1) < 0) {
-        return nullptr;
-    }
-    return sock;
-}
 
 static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
-        size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
+        size_t size_to_send = (size - bytes_sent) < MAX_CHUNK_SIZE ? (size - bytes_sent) : MAX_CHUNK_SIZE;
         ssize_t n = send(sockfd, (const char *)data + bytes_sent, size_to_send, 0);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
@@ -398,7 +332,7 @@ static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
 static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
-        size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        size_t size_to_recv = (size - bytes_recv) < MAX_CHUNK_SIZE ? (size - bytes_recv) : MAX_CHUNK_SIZE;
         ssize_t n = recv(sockfd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
@@ -446,30 +380,21 @@ static bool recv_msg(sockfd_t sockfd, std::vector<uint8_t> & input) {
     return recv_data(sockfd, input.data(), size);
 }
 
-static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
-    if (pos == std::string::npos) {
-        return false;
-    }
-    host = endpoint.substr(0, pos);
-    port = std::stoi(endpoint.substr(pos + 1));
-    return true;
+static bool parse_endpoint(const std::string & endpoint, std::string & scheme, std::string & host, int & port) {
+    return parse_endpoint_scheme(endpoint, scheme, host, port);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    uint8_t cmd_byte = cmd;
-    if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!send_data(sock->fd, &input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!send_data(sock->fd, input, input_size)) {
-        return false;
-    }
-    return true;
+    // Send cmd byte and size in a single header
+    uint8_t header[1 + sizeof(uint64_t)];
+    header[0] = (uint8_t)cmd;
+    uint64_t sz = input_size;
+    memcpy(header + 1, &sz, sizeof(sz));
+    if (!transport_send_data(sock, header, sizeof(header))) return false;
+    if (sz == 0) return true;
+    return transport_send_data(sock, input, input_size);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -481,13 +406,13 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     // TODO: currently the output_size is always known, do we need support for commands with variable output size?
     // even if we do, we can skip sending output_size from the server for commands with known output size
     uint64_t out_size;
-    if (!recv_data(sock->fd, &out_size, sizeof(out_size))) {
+    if (!transport_recv_data(sock, &out_size, sizeof(out_size))) {
         return false;
     }
     if (out_size != output_size) {
         return false;
     }
-    if (!recv_data(sock->fd, output, output_size)) {
+    if (!transport_recv_data(sock, output, output_size)) {
         return false;
     }
     return true;
@@ -498,7 +423,10 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
     rpc_msg_hello_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to check RPC server version (connection error or malformed response)\n");
+        return false;
+    }
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
         return false;
@@ -521,9 +449,10 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
             return sock;
         }
     }
+    std::string scheme;
     std::string host;
     int port;
-    if (!parse_endpoint(endpoint, host, port)) {
+    if (!parse_endpoint(endpoint, scheme, host, port)) {
         return nullptr;
     }
 #ifdef _WIN32
@@ -538,7 +467,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 #else
     GGML_UNUSED(initialized);
 #endif
-    auto sock = socket_connect(host.c_str(), port);
+    auto sock = transport_connect(scheme, host.c_str(), port);
     if (sock == nullptr) {
         return nullptr;
     }
@@ -554,8 +483,10 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
-    delete ctx;
+    if (!status) {
+        GGML_LOG_ERROR("Failed to send FREE_BUFFER to RPC server (endpoint=%s)\n", ctx->sock ? "<socket>" : "<null>");
+    }
+    delete ctx; 
 }
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -566,9 +497,12 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to get remote buffer base from RPC server\n");
+        return nullptr;
+    }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
-    return ctx->base_ptr;
+    return ctx->base_ptr; 
 }
 
 static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
@@ -627,45 +561,102 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
         request.tensor = serialize_tensor(tensor);
 
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            GGML_LOG_ERROR("Failed to request remote tensor init\n");
+        }
     }
-    return GGML_STATUS_SUCCESS;
+    return GGML_STATUS_SUCCESS; 
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
-        rpc_msg_set_tensor_hash_req request;
-        request.tensor = rpc_tensor;
-        request.offset = offset;
-        request.hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
-        if (response.result) {
-            // the server has the same data, no need to send it
+
+    // Validate that the write fits within the buffer bounds
+    size_t buf_size = ggml_backend_buffer_get_size(buffer);
+    if (offset + size > buf_size) {
+        GGML_LOG_ERROR("Attempt to set tensor data beyond buffer bounds: offset=%zu size=%zu buf_size=%zu\n", offset, size, buf_size);
+        return;
+    }
+
+    // Determine maximum payload per RPC message, accounting for headers
+    const size_t header_overhead = sizeof(rpc_tensor) + sizeof(uint64_t);
+    uint64_t rpc_max_msg = rpc_get_max_msg_size();
+    size_t max_payload = rpc_max_msg > header_overhead ? (size_t)(rpc_max_msg - header_overhead) : 1;
+
+    // Send data in chunks that fit within the RPC message size.
+    // For large chunks, attempt SET_TENSOR_HASH first to avoid redundant transfers.
+    const uint8_t * ptr = reinterpret_cast<const uint8_t *>(data);
+    size_t sent = 0;
+
+    while (sent < size) {
+        size_t chunk = (std::min)(max_payload, size - sent);
+
+        // If the chunk is large enough, try SET_TENSOR_HASH first
+        if (chunk > HASH_THRESHOLD) {
+            rpc_msg_set_tensor_hash_req request;
+            request.tensor = rpc_tensor;
+            request.offset = offset + sent;
+            request.hash = fnv_hash(ptr + sent, chunk);
+            rpc_msg_set_tensor_hash_rsp response;
+            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+            if (!status) {
+                GGML_LOG_ERROR("Failed to send SET_TENSOR_HASH to RPC server\n");
+            } else if (response.result) {
+                // server already has this chunk
+                sent += chunk;
+                continue;
+            }
+        }
+
+        // Build and send SET_TENSOR for this chunk
+        size_t input_size = header_overhead + chunk;
+        std::vector<uint8_t> input(input_size);
+        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+        uint64_t off64 = offset + sent;
+        memcpy(input.data() + sizeof(rpc_tensor), &off64, sizeof(off64));
+        memcpy(input.data() + header_overhead, ptr + sent, chunk);
+
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        if (!status) {
+            GGML_LOG_ERROR("Failed to send SET_TENSOR to RPC server\n");
             return;
         }
+
+        sent += chunk;
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
-    request.offset = offset;
-    request.size = size;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    RPC_STATUS_ASSERT(status);
+
+    // We may need to split the GET into multiple smaller requests to avoid exceeding
+    // the RPC maximum message size. Use a small safety overhead to account for headers.
+    const size_t rpc_safe_overhead = 4096;
+    uint64_t rpc_max_msg = rpc_get_max_msg_size();
+    size_t max_payload = rpc_max_msg > rpc_safe_overhead ? (size_t)(rpc_max_msg - rpc_safe_overhead) : 1;
+
+    size_t fetched = 0;
+    uint8_t * out_ptr = reinterpret_cast<uint8_t *>(data);
+
+    while (fetched < size) {
+        size_t chunk = (std::min)(max_payload, size - fetched);
+        request.offset = offset + fetched;
+        request.size = chunk;
+
+        // receive chunk into temporary buffer
+        std::vector<uint8_t> tmp(chunk);
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
+        if (!status) {
+            GGML_LOG_ERROR("Failed to GET_TENSOR from RPC server; zeroing remainder to avoid uninitialized data\n");
+            memset(out_ptr + fetched, 0, size - fetched);
+            return;
+        }
+        memcpy(out_ptr + fetched, tmp.data(), chunk);
+        fetched += chunk;
+    }
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -684,8 +675,11 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
-        return response.result;
+        if (!status) {
+            GGML_LOG_ERROR("Failed to COPY_TENSOR via RPC server\n");
+            return false;
+        }
+        return response.result; 
     }
     return false;
 }
@@ -694,7 +688,9 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to send BUFFER_CLEAR to RPC server\n");
+    } 
 }
 
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
@@ -714,13 +710,41 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
     return buft_ctx->name.c_str();
 }
 
+static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t device) {
+    rpc_msg_get_max_size_req request = { device };
+    rpc_msg_get_max_size_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
+    if (!status) {
+        GGML_LOG_ERROR("Failed to query remote max_size; falling back to max_size=0\n");
+        return 0;
+    }
+    return response.max_size;
+} 
+
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+
+    auto sock = get_socket(buft_ctx->endpoint);
+    if (!sock) {
+        GGML_LOG_ERROR("Failed to connect to RPC endpoint %s\n", buft_ctx->endpoint.c_str());
+        return nullptr;
+    }
+
+    // Query remote max size and fail early if requested size exceeds remote capability
+    size_t remote_max = get_max_size(sock, buft_ctx->device);
+    if (remote_max != 0 && size > remote_max) {
+        GGML_LOG_ERROR("Requested buffer size %zu exceeds remote max %zu on %s\n", size, remote_max, buft_ctx->endpoint.c_str());
+        return nullptr;
+    }
+
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
-    auto sock = get_socket(buft_ctx->endpoint);
+
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to allocate remote buffer on %s (maybe server rejected the request)\n", buft_ctx->endpoint.c_str());
+        return nullptr;
+    }
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
@@ -729,28 +753,23 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
         return buffer;
     } else {
         return nullptr;
-    }
+    } 
 }
 
 static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t device) {
     rpc_msg_get_alignment_req request = {device};
     rpc_msg_get_alignment_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to query remote alignment; falling back to alignment=1\n");
+        return 1;
+    }
     return response.alignment;
-}
+} 
 
 static size_t ggml_backend_rpc_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     return buft_ctx->alignment;
-}
-
-static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t device) {
-    rpc_msg_get_max_size_req request = {device};
-    rpc_msg_get_max_size_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
-    return response.max_size;
 }
 
 static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
@@ -788,7 +807,10 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            GGML_LOG_ERROR("Failed to query remote alloc size; falling back to local buft allocation size\n");
+            return ggml_backend_buft_get_alloc_size(buft, tensor);
+        }
 
         return response.alloc_size;
     }
@@ -920,6 +942,17 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t alignment = get_alignment(sock, device);
     size_t max_size = get_max_size(sock, device);
+    // Clamp or default remote max size to the RPC message limit to avoid
+    // allocating buffers the server will reject. If the server reports
+    // max_size == 0 (unknown), use a conservative default equal to the
+    // configured RPC max message size.
+    uint64_t rpc_max = rpc_get_max_msg_size();
+    if (max_size == 0) {
+        max_size = (size_t) std::min<uint64_t>(rpc_max, 256ull * 1024ull * 1024ull);
+    } else if ((uint64_t)max_size > rpc_max) {
+        max_size = (size_t) rpc_max;
+    }
+
     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
         /* .endpoint  = */ endpoint,
         /* .device    = */ device,
@@ -1080,6 +1113,17 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         return false;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    size_t buft_max = ggml_backend_buft_get_max_size(buft);
+    uint64_t max_allowed = rpc_get_max_msg_size();
+    if (request.size > buft_max) {
+        GGML_LOG_ERROR("Requested buffer size %" PRIu64 " exceeds device max %zu\n", request.size, buft_max);
+        return false;
+    }
+    if (request.size > max_allowed) {
+        GGML_LOG_ERROR("Requested buffer size %" PRIu64 " exceeds server max %" PRIu64 "\n", request.size, max_allowed);
+        return false;
+    }
+
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
     response.remote_size = 0;
@@ -1263,10 +1307,18 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     }
     std::ifstream ifs(cache_file, std::ios::binary);
     ifs.seekg(0, std::ios::end);
-    size_t size = ifs.tellg();
+    std::streamoff s = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
-    data.resize(size);
-    ifs.read((char *)data.data(), size);
+    if (s < 0) return false;
+    uint64_t size = (uint64_t)s;
+    uint64_t max_size = rpc_get_max_msg_size();
+    if (size > max_size) {
+        GGML_LOG_ERROR("Cached file too large (%" PRIu64 " > %" PRIu64 ")\n", size, max_size);
+        return false;
+    }
+    data.resize((size_t)size);
+    ifs.read((char *)data.data(), (std::streamsize)size);
+    if (!ifs) return false;
     return true;
 }
 
@@ -1576,10 +1628,10 @@ rpc_server::~rpc_server() {
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             sockfd_t sockfd) {
+                             std::shared_ptr<socket_t> sock) {
     rpc_server server(backends, cache_dir);
     uint8_t cmd;
-    if (!recv_data(sockfd, &cmd, 1)) {
+    if (!transport_recv_data(sock, &cmd, 1)) {
         return;
     }
     // the first command sent by the client must be HELLO
@@ -1587,16 +1639,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         GGML_LOG_ERROR("Expected HELLO command, update client\n");
         return;
     }
-    if (!recv_msg(sockfd, nullptr, 0)) {
+    if (!transport_recv_msg(sock, nullptr, 0)) {
         return;
     }
     rpc_msg_hello_rsp response;
     server.hello(response);
-    if (!send_msg(sockfd, &response, sizeof(response))) {
+    if (!transport_send_msg(sock, &response, sizeof(response))) {
         return;
     }
     while (true) {
-        if (!recv_data(sockfd, &cmd, 1)) {
+        if (!transport_recv_data(sock, &cmd, 1)) {
             break;
         }
         if (cmd >= RPC_CMD_COUNT) {
@@ -1610,115 +1662,115 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 return;
             }
             case RPC_CMD_DEVICE_COUNT: {
-                if (!recv_msg(sockfd, nullptr, 0)) {
+                if (!transport_recv_msg(sock, nullptr, 0)) {
                     return;
                 }
                 rpc_msg_device_count_rsp response;
                 response.device_count = backends.size();
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_ALLOC_BUFFER: {
                 rpc_msg_alloc_buffer_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_alloc_buffer_rsp response;
                 if (!server.alloc_buffer(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_ALLOC_SIZE: {
                 rpc_msg_get_alloc_size_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_get_alloc_size_rsp response;
                 if (!server.get_alloc_size(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_ALIGNMENT: {
                 rpc_msg_get_alignment_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_get_alignment_rsp response;
                 if (!server.get_alignment(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_MAX_SIZE: {
                 rpc_msg_get_max_size_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_get_max_size_rsp response;
                 if (!server.get_max_size(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_BUFFER_GET_BASE: {
                 rpc_msg_buffer_get_base_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_buffer_get_base_rsp response;
                 if (!server.buffer_get_base(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_FREE_BUFFER: {
                 rpc_msg_free_buffer_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 if (!server.free_buffer(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                if (!transport_send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_BUFFER_CLEAR: {
                 rpc_msg_buffer_clear_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 if (!server.buffer_clear(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                if (!transport_send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
-                if (!recv_msg(sockfd, input)) {
+                if (!transport_recv_vector(sock, input)) {
                     return;
                 }
                 if (!server.set_tensor(input)) {
@@ -1728,62 +1780,62 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_set_tensor_hash_rsp response;
                 if (!server.set_tensor_hash(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
                 rpc_msg_init_tensor_req request;
-                if (!recv_msg(sockfd, &request,sizeof(request))) {
+                if (!transport_recv_msg(sock, &request,sizeof(request))) {
                     return;
                 }
                 if (!server.init_tensor(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                if (!transport_send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, response.data(), response.size())) {
+                if (!transport_send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_copy_tensor_rsp response;
                 if (!server.copy_tensor(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
-                if (!recv_msg(sockfd, input)) {
+                if (!transport_recv_vector(sock, input)) {
                     return;
                 }
                 if (!server.graph_compute(input)) {
@@ -1793,7 +1845,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
                 rpc_msg_graph_recompute_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 if (!server.graph_recompute(request)) {
@@ -1803,14 +1855,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
-                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                if (!transport_recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_get_device_memory_rsp response;
                 if (!server.get_device_memory(request, response)) {
                     return;
                 }
-                if (!send_msg(sockfd, &response, sizeof(response))) {
+                if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
@@ -1858,9 +1910,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 
+    std::string scheme;
     std::string host;
     int port;
-    if (!parse_endpoint(endpoint, host, port)) {
+    if (!parse_endpoint(endpoint, scheme, host, port)) {
         return;
     }
 #ifdef _WIN32
@@ -1873,22 +1926,40 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 #endif
-    auto server_socket = create_server_socket(host.c_str(), port);
+    auto server_socket = transport_create_server(scheme, host.c_str(), port);
     if (server_socket == nullptr) {
-        fprintf(stderr, "Failed to create server socket\n");
+        fprintf(stderr, "Failed to create server socket (scheme=%s)\n", scheme.c_str());
         return;
     }
+    // Run server accept loop and spawn a thread per client up to a configured limit
+    const int max_clients = rpc_get_max_clients();
+    static std::atomic<int> current_clients{0};
     while (true) {
-        auto client_socket = socket_accept(server_socket->fd);
+        auto client_socket = transport_accept(server_socket);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            // don't return here - keep server running
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
+
+        if (current_clients.load() >= max_clients) {
+            fprintf(stderr, "Max concurrent clients reached (%d) - rejecting connection\n", max_clients);
+            // Close client by letting shared_ptr go out of scope
+            continue;
+        }
+
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket->fd);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        current_clients.fetch_add(1);
+        // detach thread for now - could be switched to a thread-pool later
+        std::thread([client_socket, backends, cache_dir]() {
+            rpc_serve_client(backends, cache_dir, client_socket);
+            printf("Client connection closed\n");
+            fflush(stdout);
+            // decrement client count
+            current_clients.fetch_sub(1);
+        }).detach();
     }
 #ifdef _WIN32
     WSACleanup();
