@@ -858,6 +858,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         std::vector<ggml_backend_dev_t> gpus;
         std::vector<ggml_backend_dev_t> igpus;
         std::vector<ggml_backend_dev_t> rpc_servers;
+        std::vector<std::pair<ggml_backend_dev_t, size_t>> rpc_servers_mem; // collect (dev, free_mem) to sort deterministically by VRAM
 
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -870,7 +871,10 @@ static struct llama_model * llama_model_load_from_file_impl(
                 case GGML_BACKEND_DEVICE_TYPE_GPU: {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                     if (ggml_backend_reg_name(reg) == std::string("RPC")) {
-                        rpc_servers.push_back(dev);
+                        // collect free/total memory for RPC devices so we can sort deterministically by available memory
+                        size_t free_mem = 0, total_mem = 0;
+                        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                        rpc_servers_mem.emplace_back(dev, free_mem);
                     } else {
                         // check if there is already a GPU with the same device id
                         ggml_backend_dev_props props;
@@ -903,7 +907,16 @@ static struct llama_model * llama_model_load_from_file_impl(
             }
         }
 
-        // add RPC servers at the front of the list to minimize network transfers
+        // sort RPC servers deterministically by available memory (desc) to distribute the model proportional to VRAM/RAM
+        std::sort(rpc_servers_mem.begin(), rpc_servers_mem.end(), [](const auto &a, const auto &b) {
+            if (a.second != b.second) return a.second > b.second;
+            // tie-break deterministically by device description (endpoint)
+            return strcmp(ggml_backend_dev_description(a.first), ggml_backend_dev_description(b.first)) < 0;
+        });
+        for (const auto &p : rpc_servers_mem) {
+            rpc_servers.push_back(p.first);
+        }
+
         model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
 
         // add GPUs
