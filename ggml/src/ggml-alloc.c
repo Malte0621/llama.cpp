@@ -268,10 +268,11 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         best_fit_block = 0;
     }
     if (best_fit_chunk == -1) {
-        // since the last chunk always has virtually endless memory, this should never happen
+        // none of the existing chunks could satisfy the request and we failed to create a
+        // new chunk — return an invalid address so allocation can fail gracefully instead
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %zu bytes, largest block available %zu bytes\n",
             __func__, size, max_avail);
-        GGML_ABORT("graph allocation: failed to reserve memory");
+        return GGML_BUFFER_ADDRESS_INVALID;
     }
 
     struct tallocr_chunk * chunk = alloc->chunks[best_fit_chunk];
@@ -636,7 +637,7 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
-static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
+static bool ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
@@ -682,7 +683,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
-                            return;
+                            return true;
                         }
                     } else {
                         AT_PRINTF("reusing parent %s for %s\n", parent->name, node->name);
@@ -690,7 +691,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
                         ggml_gallocr_free_extra_space(galloc, node, parent);
-                        return;
+                        return true;
                     }
                 }
             }
@@ -701,7 +702,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+
+        if (hn->addr.chunk == -1) {
+            // allocation failed due to fragmentation / insufficient contiguous block
+            GGML_LOG_WARN("%s: failed to allocate tensor %s (%zu bytes) in buffer %s\n", __func__, node->name, size, ggml_backend_buft_name(buft));
+            hn->allocated = false; // revert the allocated flag
+            return false;
+        }
     }
+    return true;
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
@@ -731,7 +740,7 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
@@ -740,7 +749,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
-        ggml_gallocr_allocate_node(galloc, leaf, get_node_buffer_id(leaf_buffer_ids, i));
+        if (!ggml_gallocr_allocate_node(galloc, leaf, get_node_buffer_id(leaf_buffer_ids, i))) {
+            return false;
+        }
     }
 
     // count number of children and views
@@ -758,7 +769,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
 
         if (node->flags & GGML_TENSOR_FLAG_INPUT) {
-            ggml_gallocr_allocate_node(galloc, graph->nodes[i], get_node_buffer_id(node_buffer_ids, i));
+            if (!ggml_gallocr_allocate_node(galloc, graph->nodes[i], get_node_buffer_id(node_buffer_ids, i))) {
+                return false;
+            }
         }
 
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -771,7 +784,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
             // allocate explicit inputs
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {
-                ggml_gallocr_allocate_node(galloc, src, get_node_buffer_id(node_buffer_ids, i));
+                if (!ggml_gallocr_allocate_node(galloc, src, get_node_buffer_id(node_buffer_ids, i))) {
+                    return false;
+                }
             }
         }
     }
@@ -787,11 +802,15 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             if (parent == NULL) {
                 continue;
             }
-            ggml_gallocr_allocate_node(galloc, parent, buffer_id);
+            if (!ggml_gallocr_allocate_node(galloc, parent, buffer_id)) {
+                return false;
+            }
         }
 
         // allocate node
-        ggml_gallocr_allocate_node(galloc, node, buffer_id);
+        if (!ggml_gallocr_allocate_node(galloc, node, buffer_id)) {
+            return false;
+        }
 
         AT_PRINTF("exec: %s (%s) <= ", ggml_op_desc(node), node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -861,7 +880,10 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // allocate in hash table
-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    if (!ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids)) {
+        GGML_LOG_WARN("%s: graph allocation failed due to insufficient contiguous memory\n", __func__);
+        return false;
+    }
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
@@ -966,9 +988,16 @@ static bool ggml_gallocr_reserve_n_impl(
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    bool ok = ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true);
+    if (!ok) {
+        GGML_LOG_WARN("%s: reserve sizing failed (insufficient contiguous memory or fragmentation); falling back to best-effort sizes\n", __func__);
+    }
+
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
+        if (galloc->buf_tallocs[i] == NULL) {
+            continue;
+        }
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }

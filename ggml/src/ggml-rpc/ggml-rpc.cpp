@@ -851,14 +851,34 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             LOG_DBG("GET_ALLOC_SIZE failed, attempting reconnect and retry\n");
             auto sock2 = reconnect_socket(buft_ctx->endpoint);
             if (sock2) {
-                bool status2 = send_rpc_cmd(sock2, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-                if (status2) return response.alloc_size;
+                status = send_rpc_cmd(sock2, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
             }
-            GGML_LOG_WARN("Failed to query remote alloc size; falling back to local buft allocation size\n");
-            return ggml_backend_buft_get_alloc_size(buft, tensor);
+            if (!status) {
+                GGML_LOG_WARN("Failed to query remote alloc size; falling back to local buft allocation size\n");
+                return ggml_backend_buft_get_alloc_size(buft, tensor);
+            }
         }
 
-        return response.alloc_size;
+        // Sanity-check and clamp the returned alloc_size before using it
+        {
+            size_t alloc = (size_t) response.alloc_size;
+            size_t min_expected = ggml_nbytes(tensor);
+            size_t buft_max = buft_ctx->max_size;
+
+            if (alloc < min_expected) {
+                GGML_LOG_WARN("Remote alloc size %" PRIu64 " < ggml_nbytes %zu; clamping to %zu\n",
+                              (uint64_t) response.alloc_size, min_expected, min_expected);
+                alloc = min_expected;
+            }
+
+            if (buft_max != 0 && alloc > buft_max) {
+                GGML_LOG_WARN("Remote alloc size %" PRIu64 " > buft max %zu; clamping to %zu\n",
+                              (uint64_t) response.alloc_size, buft_max, buft_max);
+                alloc = buft_max;
+            }
+
+            return alloc;
+        }
     }
 
     return ggml_nbytes(tensor);
