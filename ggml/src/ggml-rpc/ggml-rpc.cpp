@@ -437,7 +437,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
-            return sock;
+#ifdef _WIN32
+            if (sock->fd != INVALID_SOCKET) {
+#else
+            if (sock->fd >= 0) {
+#endif
+                return sock;
+            } else {
+                // cached socket is invalid (closed); erase it so we can reconnect
+                sockets.erase(it);
+            }
         }
     }
     std::string scheme;
@@ -799,6 +808,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         if (!status) {
+            // Try to reconnect and retry once — cached socket may be stale or closed
+            LOG_DBG("GET_ALLOC_SIZE failed, attempting reconnect and retry\n");
+            auto sock2 = get_socket(buft_ctx->endpoint);
+            if (sock2 && sock2 != sock) {
+                bool status2 = send_rpc_cmd(sock2, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+                if (status2) return response.alloc_size;
+            }
             GGML_LOG_ERROR("Failed to query remote alloc size; falling back to local buft allocation size\n");
             return ggml_backend_buft_get_alloc_size(buft, tensor);
         }
