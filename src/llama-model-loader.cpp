@@ -6,6 +6,8 @@
 #include <cinttypes>
 #include <cstring>
 #include <future>
+#include <algorithm>
+#include <cctype>
 
 // Local helper to query RPC configuration when streaming to RPC backends.
 #include <cstdlib>
