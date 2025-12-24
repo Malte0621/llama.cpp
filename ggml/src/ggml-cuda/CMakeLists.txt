@@ -194,6 +194,15 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
 
+    # Force nvcc's host compiler to use a modern C++ standard (C++17).
+    # This ensures standard library components like std::function work correctly when nvcc compiles
+    # host-side code (avoid parameter-pack and other template errors).
+    if (NOT MSVC)
+        list(APPEND CUDA_FLAGS -Xcompiler -std=c++17)
+    else()
+        list(APPEND CUDA_FLAGS -Xcompiler /std:c++17)
+    endif()
+
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
