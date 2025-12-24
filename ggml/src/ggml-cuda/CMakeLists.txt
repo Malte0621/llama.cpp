@@ -76,10 +76,6 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    # Ensure CUDA files are compiled with a modern C++ standard (C++17) so nvcc's host compiler
-    # side supports variadic templates and other modern C++ features used in the standard library.
-    set_target_properties(ggml-cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
@@ -194,24 +190,10 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
 
-    # Force nvcc's host compiler to use a modern C++ standard (C++17).
-    # This ensures standard library components like std::function work correctly when nvcc compiles
-    # host-side code (avoid parameter-pack and other template errors).
     # Prefer using the same C++ compiler that the project uses for the nvcc host compiler.
     if (NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
         set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
         message(STATUS "Setting CMAKE_CUDA_HOST_COMPILER=${CMAKE_CUDA_HOST_COMPILER}")
-    endif()
-
-    if (NOT MSVC)
-        # Ensure nvcc and the host compiler both use C++17. nvcc doesn't accept 'gnu++17', so use 'c++17' for nvcc
-        # and pass the same standard to the host compiler (via -Xcompiler).
-        list(APPEND CUDA_FLAGS -std=c++17)
-        list(APPEND CUDA_FLAGS -Xcompiler -std=c++17)
-        # Suppress deprecation warnings for old target architectures (e.g. compute_35, sm_50)
-        list(APPEND CUDA_FLAGS -Wno-deprecated-gpu-targets)
-    else()
-        list(APPEND CUDA_FLAGS -Xcompiler /std:c++17)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
