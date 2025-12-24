@@ -204,10 +204,10 @@ if (CUDAToolkit_FOUND)
     endif()
 
     if (NOT MSVC)
-        # Ensure nvcc and the host compiler both use GNU C++17. Passing -std=gnu++17 directly to nvcc
-        # avoids certain template parsing issues (e.g. parameter packs in std::function) on some toolchains.
-        list(APPEND CUDA_FLAGS -std=gnu++17)
-        list(APPEND CUDA_FLAGS -Xcompiler -std=gnu++17)
+        # Ensure nvcc and the host compiler both use C++17. nvcc doesn't accept 'gnu++17', so use 'c++17' for nvcc
+        # and pass the same standard to the host compiler (via -Xcompiler).
+        list(APPEND CUDA_FLAGS -std=c++17)
+        list(APPEND CUDA_FLAGS -Xcompiler -std=c++17)
         # Suppress deprecation warnings for old target architectures (e.g. compute_35, sm_50)
         list(APPEND CUDA_FLAGS -Wno-deprecated-gpu-targets)
     else()
