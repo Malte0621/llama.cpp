@@ -198,7 +198,12 @@ if (CUDAToolkit_FOUND)
     # This ensures standard library components like std::function work correctly when nvcc compiles
     # host-side code (avoid parameter-pack and other template errors).
     if (NOT MSVC)
+        # Ensure nvcc and the host compiler both use C++17. Passing -std=c++17 directly to nvcc
+        # avoids certain template parsing issues (e.g. parameter packs in std::function) on some toolchains.
+        list(APPEND CUDA_FLAGS -std=c++17)
         list(APPEND CUDA_FLAGS -Xcompiler -std=c++17)
+        # Suppress deprecation warnings for old target architectures (e.g. compute_35, sm_50)
+        list(APPEND CUDA_FLAGS -Wno-deprecated-gpu-targets)
     else()
         list(APPEND CUDA_FLAGS -Xcompiler /std:c++17)
     endif()
