@@ -428,14 +428,16 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    static bool initialized = false;
+// socket cache for client connections shared across helpers
+static std::mutex g_sock_cache_mutex;
+static std::unordered_map<std::string, std::weak_ptr<socket_t>> g_sock_cache;
+static bool g_sock_cache_initialized = false;
 
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_sock_cache_mutex);
+
+    auto it = g_sock_cache.find(endpoint);
+    if (it != g_sock_cache.end()) {
         if (auto sock = it->second.lock()) {
 #ifdef _WIN32
             if (sock->fd != INVALID_SOCKET) {
@@ -445,7 +447,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
                 return sock;
             } else {
                 // cached socket is invalid (closed); erase it so we can reconnect
-                sockets.erase(it);
+                g_sock_cache.erase(it);
             }
         }
     }
@@ -456,16 +458,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
 #ifdef _WIN32
-    if (!initialized) {
+    if (!g_sock_cache_initialized) {
         WSADATA wsaData;
         int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
         if (res != 0) {
             return nullptr;
         }
-        initialized = true;
+        g_sock_cache_initialized = true;
     }
 #else
-    GGML_UNUSED(initialized);
+    GGML_UNUSED(g_sock_cache_initialized);
 #endif
     auto sock = transport_connect(scheme, host.c_str(), port);
     if (sock == nullptr) {
@@ -475,7 +477,44 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
-    sockets[endpoint] = sock;
+    g_sock_cache[endpoint] = sock;
+    return sock;
+}
+
+// Force reconnect: drop any cached socket for `endpoint` and try to create a fresh connection.
+static std::shared_ptr<socket_t> reconnect_socket(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_sock_cache_mutex);
+    // erase cached entry if present
+    auto it = g_sock_cache.find(endpoint);
+    if (it != g_sock_cache.end()) g_sock_cache.erase(it);
+
+    std::string scheme;
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, scheme, host, port)) {
+        return nullptr;
+    }
+#ifdef _WIN32
+    if (!g_sock_cache_initialized) {
+        WSADATA wsaData;
+        int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
+        if (res != 0) {
+            return nullptr;
+        }
+        g_sock_cache_initialized = true;
+    }
+#else
+    GGML_UNUSED(g_sock_cache_initialized);
+#endif
+    auto sock = transport_connect(scheme, host.c_str(), port);
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    if (!check_server_version(sock)) {
+        return nullptr;
+    }
+    LOG_DBG("[%s] reconnected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
+    g_sock_cache[endpoint] = sock;
     return sock;
 }
 
@@ -810,12 +849,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         if (!status) {
             // Try to reconnect and retry once — cached socket may be stale or closed
             LOG_DBG("GET_ALLOC_SIZE failed, attempting reconnect and retry\n");
-            auto sock2 = get_socket(buft_ctx->endpoint);
-            if (sock2 && sock2 != sock) {
+            auto sock2 = reconnect_socket(buft_ctx->endpoint);
+            if (sock2) {
                 bool status2 = send_rpc_cmd(sock2, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
                 if (status2) return response.alloc_size;
             }
-            GGML_LOG_ERROR("Failed to query remote alloc size; falling back to local buft allocation size\n");
+            GGML_LOG_WARN("Failed to query remote alloc size; falling back to local buft allocation size\n");
             return ggml_backend_buft_get_alloc_size(buft, tensor);
         }
 
