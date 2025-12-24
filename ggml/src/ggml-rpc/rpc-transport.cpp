@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <cinttypes>
 
+#ifndef _WIN32
+# include <unistd.h>
+#endif
+
 // socket_t destructor implementation (defined in header)
 socket_t::~socket_t() {
 #ifdef _WIN32
