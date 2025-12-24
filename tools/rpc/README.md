@@ -115,3 +115,23 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc
 $ GGML_RPC_DEBUG=1 bin/rpc-server
 ```
 
+### Performance tuning (network / transport)
+
+The RPC server exposes several environment variables that allow tuning socket-level and worker parameters for high-throughput and low-latency Ethernet deployments. These are optional and safe to change per-host.
+
+- `GGML_RPC_SNDBUF` / `GGML_RPC_RCVBUF` — set send/receive buffer sizes (bytes). Default: OS default. Example: `GGML_RPC_SNDBUF=262144 GGML_RPC_RCVBUF=262144`
+- `GGML_RPC_REUSEPORT` — enable `SO_REUSEPORT` (Linux) to allow multiple processes or threads to accept on the same port for better scaling. Default: 0 (disabled).
+- `GGML_RPC_NO_DELAY` — set to `0` to disable `TCP_NODELAY` (Nagle) if you prefer coalesced packets for throughput. Default: `1` (no delay).
+- `GGML_RPC_QUICKACK` — enable `TCP_QUICKACK` (Linux) to request immediate ACKs; use with care. Default: 0 (disabled).
+- `GGML_RPC_N_WORKERS` — number of worker threads that handle accepted client connections (default: CPU cores - 1). Use this to proportion how many connections are handled concurrently without spawning/detaching new threads.
+- `GGML_RPC_COMPRESSION` — enable on-the-wire compression for RPC messages. Supported values: `none` (default), `zstd` (if zstd is available at build time). Example: `GGML_RPC_COMPRESSION=zstd`.
+- `GGML_RPC_COMPRESSION_MIN_SIZE` — minimum size in bytes before attempting compression. Default: `4096` (4 KiB). This prevents compressing small messages where overhead outweighs gain.
+
+Start with conservative values and profile throughput/latency using the `tools/server/bench` scripts or custom RPC tests (see `tools/server/bench/`).
+
+Example: use the included micro-benchmark to measure RPC round-trip latency:
+
+```bash
+python tools/rpc/bench/bench_rpc.py 127.0.0.1 50052 1000
+```
+

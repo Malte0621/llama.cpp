@@ -17,6 +17,8 @@ bool transport_recv_data(std::shared_ptr<socket_t> sock, void * data, size_t siz
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -384,35 +386,24 @@ static bool parse_endpoint(const std::string & endpoint, std::string & scheme, s
     return parse_endpoint_scheme(endpoint, scheme, host, port);
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+// RPC request : | rpc_cmd (1 byte) | request framed using transport_send_msg (compression-aware header) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    // Send cmd byte and size in a single header
-    uint8_t header[1 + sizeof(uint64_t)];
-    header[0] = (uint8_t)cmd;
-    uint64_t sz = input_size;
-    memcpy(header + 1, &sz, sizeof(sz));
-    if (!transport_send_data(sock, header, sizeof(header))) return false;
-    if (sz == 0) return true;
-    return transport_send_data(sock, input, input_size);
+    // Send single command byte followed by a framed message using the transport helpers
+    uint8_t c = (uint8_t)cmd;
+    if (!transport_send_data(sock, &c, 1)) return false;
+    // transport_send_msg writes the wire header (comp/orig_size/payload_size) and payload
+    return transport_send_msg(sock, input, input_size);
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
-// RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+// RPC request : | rpc_cmd (1 byte) | request framed using transport_send_msg (compression-aware header) |
+// RPC response: framed using transport_send_msg/transport_recv_msg helpers
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
-    // TODO: currently the output_size is always known, do we need support for commands with variable output size?
-    // even if we do, we can skip sending output_size from the server for commands with known output size
-    uint64_t out_size;
-    if (!transport_recv_data(sock, &out_size, sizeof(out_size))) {
-        return false;
-    }
-    if (out_size != output_size) {
-        return false;
-    }
-    if (!transport_recv_data(sock, output, output_size)) {
+    // Receive framed response using transport_recv_msg (handles compression header)
+    if (!transport_recv_msg(sock, output, output_size)) {
         return false;
     }
     return true;
@@ -1931,9 +1922,41 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket (scheme=%s)\n", scheme.c_str());
         return;
     }
-    // Run server accept loop and spawn a thread per client up to a configured limit
+
+    // Run server accept loop with a bounded worker pool to avoid thread churn
     const int max_clients = rpc_get_max_clients();
     static std::atomic<int> current_clients{0};
+
+    // Accept queue and worker threads
+    std::mutex accept_mtx;
+    std::condition_variable accept_cv;
+    std::deque<std::shared_ptr<socket_t>> accept_queue;
+
+    // [AI] Use a bounded worker pool to reduce thread churn and improve scalability
+    int n_workers = rpc_get_n_workers();
+    if (n_workers < 1) n_workers = 1;
+    printf("Starting RPC worker pool with %d threads\n", n_workers);
+    std::vector<std::thread> workers;
+    workers.reserve(n_workers);
+    for (int i = 0; i < n_workers; ++i) {
+        workers.emplace_back([&]() {
+            while (true) {
+                std::shared_ptr<socket_t> client_socket;
+                {
+                    std::unique_lock<std::mutex> lk(accept_mtx);
+                    accept_cv.wait(lk, [&]() { return !accept_queue.empty(); });
+                    client_socket = accept_queue.front();
+                    accept_queue.pop_front();
+                }
+                if (!client_socket) continue;
+                rpc_serve_client(backends, cache_dir, client_socket);
+                printf("Client connection closed\n");
+                fflush(stdout);
+                current_clients.fetch_sub(1);
+            }
+        });
+    }
+
     while (true) {
         auto client_socket = transport_accept(server_socket);
         if (client_socket == nullptr) {
@@ -1952,14 +1975,12 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         printf("Accepted client connection\n");
         fflush(stdout);
         current_clients.fetch_add(1);
-        // detach thread for now - could be switched to a thread-pool later
-        std::thread([client_socket, backends, cache_dir]() {
-            rpc_serve_client(backends, cache_dir, client_socket);
-            printf("Client connection closed\n");
-            fflush(stdout);
-            // decrement client count
-            current_clients.fetch_sub(1);
-        }).detach();
+
+        {
+            std::unique_lock<std::mutex> lk(accept_mtx);
+            accept_queue.emplace_back(client_socket);
+        }
+        accept_cv.notify_one();
     }
 #ifdef _WIN32
     WSACleanup();

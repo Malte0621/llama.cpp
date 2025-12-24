@@ -115,7 +115,7 @@ option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download model from an URL" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
-
+option(LLAMA_ZSTD       "llama: build bundled zstd compression library" ON)
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
@@ -190,6 +190,21 @@ if (LLAMA_USE_SYSTEM_GGML)
     message(STATUS "Using system-provided libggml, skipping ggml build")
     find_package(ggml REQUIRED)
     add_library(ggml ALIAS ggml::ggml)
+endif()
+
+if (LLAMA_ZSTD)
+    message(STATUS "Building bundled zstd from vendor/zstd")
+    add_subdirectory(vendor/zstd)
+    # provide a compatibility target expected by other CMake scripts
+    if (TARGET libzstd)
+        add_library(ZSTD::zstd ALIAS libzstd)
+    elseif (TARGET libzstd_shared)
+        add_library(ZSTD::zstd ALIAS libzstd_shared)
+    elseif (TARGET libzstd_static)
+        add_library(ZSTD::zstd ALIAS libzstd_static)
+    endif()
+    # indicate zstd is available for downstream find_package checks
+    set(ZSTD_FOUND ON CACHE BOOL "zstd library built from source" FORCE)
 endif()
 
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)

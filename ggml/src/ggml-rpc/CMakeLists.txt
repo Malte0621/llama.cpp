@@ -15,6 +15,18 @@ target_link_libraries(rpc-transport-test PRIVATE ggml-rpc)
 add_executable(rpc-transport-config-test test-rpc-config.cpp)
 target_link_libraries(rpc-transport-config-test PRIVATE ggml-rpc)
 
+# Compression test
+add_executable(rpc-compression-test test-rpc-compression.cpp)
+target_link_libraries(rpc-compression-test PRIVATE ggml-rpc)
+
+# Try to find zstd and enable if available
+find_package(ZSTD QUIET)
+if (ZSTD_FOUND)
+    message(STATUS "Found zstd; enabling RPC zstd compression support")
+    target_link_libraries(ggml-rpc PRIVATE ZSTD::zstd)
+    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_HAVE_ZSTD=1)
+endif()
+
 if (GGML_RPC_RDMA)
     message(STATUS "RPC RDMA transport enabled: will try to link libibverbs and librdmacm")
     if (WIN32)

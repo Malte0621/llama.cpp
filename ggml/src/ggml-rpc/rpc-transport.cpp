@@ -34,6 +34,17 @@ socket_t::~socket_t() {
 
 #include <memory>
 #include <iostream>
+#if defined(__has_include)
+#  if __has_include(<zstd.h>)
+#    include <zstd.h>
+#    define GGML_RPC_HAVE_ZSTD 1
+#  else
+#    define GGML_RPC_HAVE_ZSTD 0
+#  endif
+#else
+#  define GGML_RPC_HAVE_ZSTD 0
+#endif
+#include <vector>
 
 // socket_t is defined in rpc-transport.h
 
@@ -61,8 +72,45 @@ bool set_socket_timeouts(sockfd_t sockfd) {
     return true;
 }
 
+// Compression helpers
+#if GGML_RPC_HAVE_ZSTD
+// Compress `src` into `out` using zstd (fast mode). Return true on success.
+bool rpc_compress_buffer(const void * src, size_t src_size, std::vector<uint8_t> & out) {
+    if (!src || src_size == 0) {
+        out.clear();
+        return true;
+    }
+    size_t bound = ZSTD_compressBound(src_size);
+    out.resize(bound);
+    // Use fast compression level for low CPU/low latency
+    int level = 1; // fast
+    size_t csize = ZSTD_compress(out.data(), bound, src, src_size, level);
+    if (ZSTD_isError(csize)) return false;
+    out.resize(csize);
+    return true;
+}
+
+// Decompress `src` of size `src_size` into `dst` of size `dst_size`.
+bool rpc_decompress_buffer(const void * src, size_t src_size, void * dst, size_t dst_size) {
+    if (!src) return false;
+    size_t res = ZSTD_decompress(dst, dst_size, src, src_size);
+    if (ZSTD_isError(res)) return false;
+    if (res != dst_size) return false; // must match expected size
+    return true;
+}
+#else
+// Stubs when zstd is not available
+bool rpc_compress_buffer(const void * src, size_t src_size, std::vector<uint8_t> & out) {
+    (void)src; (void)src_size; out.clear(); return false;
+}
+bool rpc_decompress_buffer(const void * src, size_t src_size, void * dst, size_t dst_size) {
+    (void)src; (void)src_size; (void)dst; (void)dst_size; return false;
+}
+#endif
+
 
 static bool tcp_set_no_delay(sockfd_t sockfd) {
+    if (!rpc_get_no_delay()) return true; // explicitly disabled
     int flag = 1;
     int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     return ret == 0;
@@ -74,6 +122,38 @@ static bool tcp_set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// [AI] Added socket buffer tuning (GGML_RPC_SNDBUF / GGML_RPC_RCVBUF)
+static bool tcp_set_bufs(sockfd_t sockfd) {
+    int snd = rpc_get_send_buf_size();
+    int rcv = rpc_get_recv_buf_size();
+    bool ok = true;
+    if (snd > 0) {
+        if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&snd, sizeof(int)) != 0) ok = false;
+    }
+    if (rcv > 0) {
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&rcv, sizeof(int)) != 0) ok = false;
+    }
+    return ok;
+}
+
+static void tcp_set_reuse_port_if_requested(sockfd_t sockfd) {
+#ifdef SO_REUSEPORT
+    if (rpc_get_enable_reuseport()) {
+        int flag = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, (char *)&flag, sizeof(int));
+    }
+#endif
+}
+
+static void tcp_set_quickack(sockfd_t sockfd) {
+#ifdef TCP_QUICKACK
+    if (rpc_get_quickack()) {
+        int flag = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, (char *)&flag, sizeof(int));
+    }
+#endif
+}
+
 static std::shared_ptr<socket_t> tcp_socket_connect(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) return nullptr;
@@ -81,6 +161,10 @@ static std::shared_ptr<socket_t> tcp_socket_connect(const char * host, int port)
     sock_ptr->scheme = "tcp";
     sock_ptr->transport_ctx = nullptr;
     if (!tcp_set_no_delay(sockfd)) return nullptr;
+
+    // apply buffer tunings for the socket if requested
+    tcp_set_bufs(sockfd);
+
     // Resolve host via getaddrinfo (reentrant and protocol-agnostic)
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
@@ -105,6 +189,7 @@ static std::shared_ptr<socket_t> tcp_socket_connect(const char * host, int port)
     set_socket_timeouts(sock_ptr->fd);
     int ka = 1;
     setsockopt(sock_ptr->fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&ka, sizeof(ka));
+    tcp_set_quickack(sock_ptr->fd);
     return sock_ptr;
 }
 
@@ -115,9 +200,12 @@ static std::shared_ptr<socket_t> tcp_socket_accept(sockfd_t srv_sockfd) {
     client_socket->scheme = "tcp";
     client_socket->transport_ctx = nullptr;
     if (!tcp_set_no_delay(client_socket_fd)) return nullptr;
+    // tune buffers and quick ack if requested
+    tcp_set_bufs(client_socket_fd);
     set_socket_timeouts(client_socket_fd);
     int ka = 1;
     setsockopt(client_socket_fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&ka, sizeof(ka));
+    tcp_set_quickack(client_socket_fd);
     return client_socket;
 }
 
@@ -146,10 +234,15 @@ static std::shared_ptr<socket_t> tcp_create_server(const char * host, int port) 
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
         int sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (sockfd < 0) continue;
+        // allow address reuse
         if (!tcp_set_reuse_addr(sockfd)) {
             close_socket(sockfd);
             continue;
         }
+        // optionally enable reuseport for better scaling on Linux
+        tcp_set_reuse_port_if_requested(sockfd);
+        // tune buffers if requested
+        tcp_set_bufs(sockfd);
         if (bind(sockfd, p->ai_addr, (int)p->ai_addrlen) < 0) {
             close_socket(sockfd);
             continue;
@@ -388,26 +481,78 @@ std::shared_ptr<socket_t> transport_connect(const std::string & scheme, const ch
     return tcp_socket_connect(host, port);
 }
 
+// Wire format: [uint8_t comp_flag][uint64_t orig_size][uint64_t payload_size][payload bytes...]
+#pragma pack(push, 1)
+struct rpc_wire_header_packed {
+    uint8_t  comp;        // 0 = none, 1 = zstd
+    uint64_t orig_size;   // original uncompressed size
+    uint64_t payload_size; // size of payload following the header
+};
+#pragma pack(pop)
+
 bool transport_send_msg(std::shared_ptr<socket_t> sock, const void * msg, size_t msg_size) {
     if (!sock) return false;
+
+    uint8_t comp_flag = 0;
+    const void * payload_ptr = msg;
+    size_t payload_size = msg_size;
+    std::vector<uint8_t> compressed_buf;
+
+    // Attempt compression if enabled and beneficial
+    if (msg_size > 0 && rpc_compression_enabled() && msg_size >= rpc_get_compression_min_size()) {
+        if (rpc_get_compression() == "zstd") {
+#if GGML_RPC_HAVE_ZSTD
+            if (rpc_compress_buffer(msg, msg_size, compressed_buf)) {
+                if (compressed_buf.size() < msg_size) {
+                    comp_flag = 1;
+                    payload_ptr = compressed_buf.data();
+                    payload_size = compressed_buf.size();
+                }
+            }
+#endif
+        }
+    }
+
+    rpc_wire_header_packed hdr{};
+    hdr.comp = comp_flag;
+    hdr.orig_size = (uint64_t)msg_size;
+    hdr.payload_size = (uint64_t)payload_size;
+
 #if defined(__unix__) || defined(__APPLE__)
-    // Use writev to send size+msg in a single syscall on POSIX
     struct iovec iov[2];
-    iov[0].iov_base = &msg_size;
-    iov[0].iov_len = sizeof(msg_size);
-    iov[1].iov_base = const_cast<void*>(msg);
-    iov[1].iov_len = msg_size;
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len = sizeof(hdr);
+    iov[1].iov_base = const_cast<void*>(payload_ptr);
+    iov[1].iov_len = payload_size;
     if (sock->fd < 0) return false;
-    ssize_t n = writev(sock->fd, iov, 2);
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 2;
+#if defined(MSG_NOSIGNAL)
+    ssize_t n = sendmsg(sock->fd, &mh, MSG_NOSIGNAL);
+#else
+    ssize_t n = sendmsg(sock->fd, &mh, 0);
+#endif
     if (n < 0) return false;
     return true;
 #else
 #ifdef _WIN32
     if (sock->fd == INVALID_SOCKET) return false;
+    WSABUF bufs[2];
+    DWORD sent = 0;
+    bufs[0].buf = (CHAR *)&hdr;
+    bufs[0].len = (ULONG)sizeof(hdr);
+    bufs[1].buf = (CHAR *)payload_ptr;
+    bufs[1].len = (ULONG)payload_size;
+    int ret = WSASend(sock->fd, bufs, 2, &sent, 0, NULL, NULL);
+    return ret == 0;
+#else
+    // Fallback: send header then data
+    if (!tcp_send_data(sock, &hdr, sizeof(hdr))) return false;
+    if (payload_size == 0) return true;
+    return tcp_send_data(sock, payload_ptr, payload_size);
 #endif
-    if (!tcp_send_data(sock, &msg_size, sizeof(msg_size))) return false;
-    if (msg_size == 0) return true;
-    return tcp_send_data(sock, msg, msg_size);
 #endif
 } 
 
@@ -418,16 +563,30 @@ bool transport_recv_msg(std::shared_ptr<socket_t> sock, void * msg, size_t msg_s
 #else
     if (sock->fd < 0) return false;
 #endif
-    uint64_t size;
-    if (!tcp_recv_data(sock, &size, sizeof(size))) return false;
+    // Read header
+    rpc_wire_header_packed hdr;
+    if (!tcp_recv_data(sock, &hdr, sizeof(hdr))) return false;
     uint64_t max_size = rpc_get_max_msg_size();
-    if (size > max_size) {
-        fprintf(stderr, "Rejected message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", size, max_size);
+    if (hdr.orig_size > max_size) {
+        fprintf(stderr, "Rejected message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", hdr.orig_size, max_size);
         return false;
     }
-    if (size != msg_size) return false;
-    if (size == 0) return true;
-    return tcp_recv_data(sock, msg, msg_size);
+    if (hdr.orig_size != msg_size) return false;
+    if (hdr.payload_size == 0) return true;
+    // read payload
+    std::vector<uint8_t> tmp;
+    if (hdr.comp == 0) {
+        // uncompressed: read directly into msg
+        return tcp_recv_data(sock, msg, hdr.payload_size);
+    } else if (hdr.comp == 1) {
+        // compressed: read into tmp and decompress
+        try { tmp.resize(hdr.payload_size); } catch (...) { return false; }
+        if (!tcp_recv_data(sock, tmp.data(), tmp.size())) return false;
+        // decompress into msg buffer (msg_size bytes)
+        if (!rpc_decompress_buffer(tmp.data(), tmp.size(), msg, msg_size)) return false;
+        return true;
+    }
+    return false;
 }
 
 bool transport_recv_vector(std::shared_ptr<socket_t> sock, std::vector<uint8_t> & input) {
@@ -437,21 +596,30 @@ bool transport_recv_vector(std::shared_ptr<socket_t> sock, std::vector<uint8_t> 
 #else
     if (sock->fd < 0) return false;
 #endif
-    uint64_t size;
-    if (!tcp_recv_data(sock, &size, sizeof(size))) return false;
+    rpc_wire_header_packed hdr;
+    if (!tcp_recv_data(sock, &hdr, sizeof(hdr))) return false;
     uint64_t max_size = rpc_get_max_msg_size();
-    if (size > max_size) {
-        fprintf(stderr, "Rejected vector message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", size, max_size);
+    if (hdr.orig_size > max_size) {
+        fprintf(stderr, "Rejected vector message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", hdr.orig_size, max_size);
         return false;
     }
     try {
-        input.resize(size);
+        input.resize(hdr.orig_size);
     } catch (const std::bad_alloc & e) {
-        fprintf(stderr, "Failed to allocate input buffer of size %" PRIu64 "\n", size);
+        fprintf(stderr, "Failed to allocate input buffer of size %" PRIu64 "\n", hdr.orig_size);
         return false;
     }
-    if (size == 0) return true;
-    return tcp_recv_data(sock, input.data(), size);
+    if (hdr.payload_size == 0) return true;
+    if (hdr.comp == 0) {
+        return tcp_recv_data(sock, input.data(), hdr.payload_size);
+    } else if (hdr.comp == 1) {
+        std::vector<uint8_t> tmp;
+        try { tmp.resize(hdr.payload_size); } catch (...) { return false; }
+        if (!tcp_recv_data(sock, tmp.data(), tmp.size())) return false;
+        if (!rpc_decompress_buffer(tmp.data(), tmp.size(), input.data(), hdr.orig_size)) return false;
+        return true;
+    }
+    return false;
 }
 
 // Raw data

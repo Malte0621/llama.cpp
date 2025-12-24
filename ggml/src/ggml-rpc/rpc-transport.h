@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <thread>
 
 #ifdef _WIN32
 # include <winsock2.h>
@@ -80,6 +81,72 @@ inline int rpc_get_max_clients() {
     const char * v = std::getenv("GGML_RPC_MAX_CLIENTS");
     if (!v) return 32;
     try { return std::stoi(v); } catch (...) { return 32; }
+}
+// Compression: none|zstd
+inline std::string rpc_get_compression() {
+    const char * v = std::getenv("GGML_RPC_COMPRESSION");
+    if (!v) return std::string("none");
+    return std::string(v);
+}
+inline uint64_t rpc_get_compression_min_size() {
+    const char * v = std::getenv("GGML_RPC_COMPRESSION_MIN_SIZE");
+    if (!v) return 4096; // default: 4 KiB
+    try { return std::stoull(v); } catch (...) { return 4096; }
+}
+
+// Utility to set timeouts on a socket (internal)
+bool set_socket_timeouts(sockfd_t sockfd);
+
+// Compression helpers (implemented in rpc-transport.cpp)
+// Returns true and fills `out` with compressed payload if successful
+bool rpc_compress_buffer(const void * src, size_t src_size, std::vector<uint8_t> & out);
+// Decompress payload to `dst` of size dst_size. Returns true on success.
+bool rpc_decompress_buffer(const void * src, size_t src_size, void * dst, size_t dst_size);
+
+// Prefer internal helper that checks whether compression is enabled
+inline bool rpc_compression_enabled() { return rpc_get_compression() != "none"; }// socket buffer sizes (0 = leave default)
+inline int rpc_get_send_buf_size() {
+    const char * v = std::getenv("GGML_RPC_SNDBUF");
+    if (!v) return 0;
+    try { return std::stoi(v); } catch (...) { return 0; }
+}
+inline int rpc_get_recv_buf_size() {
+    const char * v = std::getenv("GGML_RPC_RCVBUF");
+    if (!v) return 0;
+    try { return std::stoi(v); } catch (...) { return 0; }
+}
+
+// reuse port (SO_REUSEPORT) - 0 = disabled, 1 = enabled
+inline bool rpc_get_enable_reuseport() {
+    const char * v = std::getenv("GGML_RPC_REUSEPORT");
+    if (!v) return false;
+    try { return std::stoi(v) != 0; } catch (...) { return false; }
+}
+
+// toggle TCP_NODELAY - default enabled
+inline bool rpc_get_no_delay() {
+    const char * v = std::getenv("GGML_RPC_NO_DELAY");
+    if (!v) return true;
+    try { return std::stoi(v) != 0; } catch (...) { return true; }
+}
+
+// toggle TCP_QUICKACK if available - default disabled
+inline bool rpc_get_quickack() {
+    const char * v = std::getenv("GGML_RPC_QUICKACK");
+    if (!v) return false;
+    try { return std::stoi(v) != 0; } catch (...) { return false; }
+}
+
+// number of worker threads for RPC server accept-queue
+inline int rpc_get_n_workers() {
+    const char * v = std::getenv("GGML_RPC_N_WORKERS");
+    if (v) {
+        try { return std::stoi(v); } catch (...) { return 0; }
+    }
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) return 4;
+    // avoid std::max to bypass possible Windows macros (NOMINMAX not always respected)
+    return (hw > 1) ? (int)(hw - 1) : 1;
 }
 
 // Utility to set timeouts on a socket (internal)
