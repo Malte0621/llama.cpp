@@ -76,6 +76,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # Ensure CUDA files are compiled with a modern C++ standard (C++17) so nvcc's host compiler
+    # side supports variadic templates and other modern C++ features used in the standard library.
+    set_target_properties(ggml-cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
