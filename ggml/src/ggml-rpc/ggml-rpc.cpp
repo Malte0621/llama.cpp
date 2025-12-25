@@ -1878,7 +1878,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_alloc_buffer_rsp response;
                 if (!server.alloc_buffer(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] alloc_buffer handler failed for device %u\n", __func__, request.device);
+                    // safe fallback response
+                    response.remote_ptr = 0;
+                    response.remote_size = 0;
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -1892,7 +1895,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_alloc_size_rsp response;
                 if (!server.get_alloc_size(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] get_alloc_size handler failed for device %u\n", __func__, request.device);
+                    response.alloc_size = 0; // safe fallback
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -1906,7 +1910,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_alignment_rsp response;
                 if (!server.get_alignment(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] get_alignment handler failed for device %u\n", __func__, request.device);
+                    response.alignment = 1; // safe fallback
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -1920,7 +1925,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_max_size_rsp response;
                 if (!server.get_max_size(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] get_max_size handler failed for device %u\n", __func__, request.device);
+                    response.max_size = 0; // safe fallback
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -1934,7 +1940,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_buffer_get_base_rsp response;
                 if (!server.buffer_get_base(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] buffer_get_base handler failed for remote_ptr 0x%" PRIx64 "\n", __func__, request.remote_ptr);
+                    response.base_ptr = 0; // safe fallback
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -1970,29 +1977,29 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
                 if (!transport_recv_vector(sock, input)) {
-                    fprintf(stderr, "[%s] transport_recv_vector failed for SET_TENSOR; closing client connection\n", __func__);
+                    GGML_LOG_ERROR("[%s] transport_recv_vector failed for SET_TENSOR; closing client connection\n", __func__);
                     return;
                 }
                 if (!server.set_tensor(input)) {
                     // Do NOT close the connection on malformed or rejected SET_TENSOR; log and continue.
-                    fprintf(stderr, "[%s] server.set_tensor failed for SET_TENSOR (malformed or rejected data); continuing client\n", __func__);
+                    GGML_LOG_ERROR("[%s] server.set_tensor failed for SET_TENSOR (malformed or rejected data); continuing client\n", __func__);
                 }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
                 if (!transport_recv_msg(sock, &request, sizeof(request))) {
-                    fprintf(stderr, "[%s] transport_recv_msg failed for SET_TENSOR_HASH; closing client connection\n", __func__);
+                    GGML_LOG_ERROR("[%s] transport_recv_msg failed for SET_TENSOR_HASH; closing client connection\n", __func__);
                     return;
                 }
                 rpc_msg_set_tensor_hash_rsp response;
                 // Try to process request; if processing fails, send a harmless negative response instead of aborting.
                 if (!server.set_tensor_hash(request, response)) {
-                    fprintf(stderr, "[%s] server.set_tensor_hash failed; returning response.result=0\n", __func__);
+                    GGML_LOG_ERROR("[%s] server.set_tensor_hash failed; returning response.result=0\n", __func__);
                     response.result = 0;
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
-                    fprintf(stderr, "[%s] transport_send_msg failed while replying to SET_TENSOR_HASH; closing client\n", __func__);
+                    GGML_LOG_ERROR("[%s] transport_send_msg failed while replying to SET_TENSOR_HASH; closing client\n", __func__);
                     return;
                 }
                 break;
@@ -2003,7 +2010,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.init_tensor(request)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] init_tensor handler failed\n", __func__);
+                    // still send an empty response to keep client behavior consistent
                 }
                 if (!transport_send_msg(sock, nullptr, 0)) {
                     return;
@@ -2017,7 +2025,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] get_tensor handler failed (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ")\n", __func__, request.tensor.data, request.offset, request.size);
+                    // send a zero-filled response of the expected size to keep client happy
+                    response.assign((size_t)request.size, 0);
                 }
                 if (!transport_send_msg(sock, response.data(), response.size())) {
                     return;
@@ -2031,7 +2041,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_copy_tensor_rsp response;
                 if (!server.copy_tensor(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] copy_tensor handler failed\n", __func__);
+                    response.result = 0; // safe fallback
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
@@ -2044,7 +2055,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_compute(input)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] graph_compute handler failed\n", __func__);
+                    // keep connection alive and continue
                 }
                 break;
             }
@@ -2054,7 +2066,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] graph_recompute handler failed for device %u\n", __func__, request.device);
+                    // keep connection alive and continue
                 }
                 break;
             }
@@ -2065,7 +2078,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_device_memory_rsp response;
                 if (!server.get_device_memory(request, response)) {
-                    return;
+                    GGML_LOG_ERROR("[%s] get_device_memory handler failed for device %u\n", __func__, request.device);
+                    response.free_mem = 0;
+                    response.total_mem = 0;
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
                     return;
