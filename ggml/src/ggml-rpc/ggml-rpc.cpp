@@ -911,18 +911,53 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+    // Iterative post-order traversal to avoid deep recursion and possible stack overflow.
     if (tensor == nullptr) {
         return;
     }
-    if (visited.find(tensor) != visited.end()) {
-        return;
+
+    // Stack stores pairs of (tensor, processed_flag). processed_flag==false means the node was
+    // first encountered; processed_flag==true means all its children have been handled and
+    // the node should be serialized now.
+    std::vector<std::pair<ggml_tensor*, bool>> stack;
+    stack.reserve(64);
+    stack.emplace_back(tensor, false);
+
+    while (!stack.empty()) {
+        auto [t, processed] = stack.back();
+        stack.pop_back();
+
+        if (t == nullptr) {
+            continue;
+        }
+
+        if (!processed) {
+            // If we've already seen this tensor, skip to avoid cycles/sharing duplication
+            if (visited.find(t) != visited.end()) {
+                continue;
+            }
+
+            // Mark visited immediately to prevent pushing the same tensor multiple times
+            visited.insert(t);
+
+            // Push the node again as processed so it will be serialized after its children
+            stack.emplace_back(t, true);
+
+            // To preserve original recursive ordering (src[0] .. src[N-1], view_src), push
+            // children onto the stack in reverse order (LIFO semantics).
+            if (t->view_src) {
+                stack.emplace_back(t->view_src, false);
+            }
+            for (int i = GGML_MAX_SRC - 1; i >= 0; --i) {
+                if (t->src[i]) {
+                    stack.emplace_back(t->src[i], false);
+                }
+            }
+        } else {
+            // All children processed: serialize this tensor
+            tensors.push_back(serialize_tensor(t));
+        }
     }
-    visited.insert(tensor);
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        add_tensor(tensor->src[i], tensors, visited);
-    }
-    add_tensor(tensor->view_src, tensors, visited);
-    tensors.push_back(serialize_tensor(tensor));
 }
 
 static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
@@ -991,6 +1026,9 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_optimize          = */ NULL,
 };
 
+// Forward declare helper used below (defined later) to avoid C3861 on MSVC
+static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total);
+
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -1008,15 +1046,21 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t alignment = get_alignment(sock, device);
     size_t max_size = get_max_size(sock, device);
-    // Clamp or default remote max size to the RPC message limit to avoid
-    // allocating buffers the server will reject. If the server reports
-    // max_size == 0 (unknown), use a conservative default equal to the
-    // configured RPC max message size.
-    uint64_t rpc_max = rpc_get_max_msg_size();
+
+    // If the server reports an explicit max size, use it. If it reports 0 (unknown),
+    // try to derive a sensible default from the device free memory. Avoid clamping
+    // the size to the RPC transport max message size — data transfers are chunked and
+    // allocations larger than the transport message size are valid.
     if (max_size == 0) {
-        max_size = (size_t) std::min<uint64_t>(rpc_max, 256ull * 1024ull * 1024ull);
-    } else if ((uint64_t)max_size > rpc_max) {
-        max_size = (size_t) rpc_max;
+        size_t free_mem = 0, total_mem = 0;
+        get_device_memory(sock, device, &free_mem, &total_mem);
+        if (free_mem > 0) {
+            LOG_DBG("[ggml_backend_rpc_buffer_type] endpoint=%s device=%u: reported max_size=0, using free_mem=%zu, total_mem=%zu\n", endpoint, (unsigned)device, free_mem, total_mem);
+            max_size = free_mem;
+        } else {
+            // Fallback to a conservative but larger default (4 GiB) if we can't determine free memory
+            max_size = (size_t) std::min<uint64_t>((uint64_t)4ull * 1024ull * 1024ull * 1024ull, rpc_get_max_msg_size() * 16ull);
+        }
     }
 
     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
@@ -1085,6 +1129,7 @@ public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
+        cached_max_contig.resize(backends.size());
     }
     ~rpc_server();
 
@@ -1124,6 +1169,9 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+    // cache of last measured largest contiguous allocation per device (0 = unknown)
+    std::vector<size_t> cached_max_contig;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1180,13 +1228,13 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
     size_t buft_max = ggml_backend_buft_get_max_size(buft);
-    uint64_t max_allowed = rpc_get_max_msg_size();
-    if (request.size > buft_max) {
+    // Do not enforce an arbitrary RPC message-size limit on buffer allocations. The transport
+    // layer supports chunked SET_TENSOR/GET_TENSOR operations, so allocations can legitimately
+    // be larger than the transport max message size. If the backend provides a non-zero buft_max
+    // (max contiguous allocation), honour it; otherwise allow the allocation request to proceed
+    // and let ggml_backend_buft_alloc_buffer accept/reject it according to the device capabilities.
+    if (buft_max != 0 && request.size > buft_max) {
         GGML_LOG_ERROR("Requested buffer size %" PRIu64 " exceeds device max %zu\n", request.size, buft_max);
-        return false;
-    }
-    if (request.size > max_allowed) {
-        GGML_LOG_ERROR("Requested buffer size %" PRIu64 " exceeds server max %" PRIu64 "\n", request.size, max_allowed);
         return false;
     }
 
@@ -1200,7 +1248,12 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
         buffers.insert(buffer);
     } else {
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+        // Allocation failed; invalidate any cached contiguous estimate for this device so future
+        // calls will re-probe the true largest contiguous allocation.
+        if (cached_max_contig.size() == backends.size()) {
+            cached_max_contig[dev_id] = 0;
+        }
+        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed (invalidated cached_max_contig)\n", __func__, dev_id, request.size);
     }
     return true;
 }

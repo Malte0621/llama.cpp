@@ -280,7 +280,7 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -391,21 +391,74 @@ llama_context::llama_context(
 
         // reserve pp (prompt processing) graph first so that buffers are only allocated once
         {
-            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
-            if (!gf) {
-                if (pipeline_parallel) {
-                    LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                    gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
-                }
+            // try to reserve with the requested number of sequences, but if the allocation fails
+            // then reduce the number of sequences (halve each attempt) until it fits
+            uint32_t n_seqs_try = n_seqs;
+            bool reserved = false;
+            for (;;) {
+                auto * gf = graph_reserve(n_tokens, n_seqs_try, n_tokens, mctx.get(), model.hparams.no_alloc,
+                    model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
                 if (!gf) {
-                    throw std::runtime_error("failed to allocate compute pp buffers");
+                    if (pipeline_parallel) {
+                        LLAMA_LOG_WARN("%s: compute buffer allocation failed for n_seqs=%u, retrying without pipeline parallelism\n", __func__, n_seqs_try);
+                        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                        gf = graph_reserve(n_tokens, n_seqs_try, n_tokens, mctx.get());
+                    }
+                }
+
+                if (gf) {
+                    n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+                    n_nodes_pp  = ggml_graph_n_nodes(gf);
+                    reserved = true;
+                    break;
+                }
+
+                // allocation failed for this n_seqs_try; try to reduce
+                if (n_seqs_try == 1) {
+                    break; // cannot reduce further
+                }
+
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed for n_seqs=%u, trying with fewer sequences\n", __func__, n_seqs_try);
+                n_seqs_try = std::max<uint32_t>(1, n_seqs_try / 2);
+
+                // when we change the number of sequences, make sure the output buffer can be resized
+                if (output_reserve((int32_t)n_seqs_try) < (int32_t)n_seqs_try) {
+                    // if we cannot reserve outputs for the smaller n_seqs_try then there's no point in continuing
+                    break;
                 }
             }
 
-            n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
-            n_nodes_pp  = ggml_graph_n_nodes(gf);
+            if (!reserved) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+
+            // if we had to reduce n_seqs, adjust cparams and related sizes
+            if (n_seqs_try != n_seqs) {
+                LLAMA_LOG_WARN("%s: reducing n_seq_max from %u to %u to fit compute buffers\n", __func__, n_seqs, n_seqs_try);
+                cparams.n_seq_max = n_seqs_try;
+
+                if (cparams.kv_unified) {
+                    cparams.n_ctx_seq = cparams.n_ctx;
+                } else {
+                    cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+                    cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+                    if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+                        cparams.n_ctx = cparams.n_ctx_seq * cparams.n_seq_max;
+                        LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+                    }
+                }
+
+                // re-reserve output buffer to match the new n_seq_max
+                if (output_reserve((int32_t)cparams.n_seq_max) < (int32_t)cparams.n_seq_max) {
+                    throw std::runtime_error("failed to reserve output buffer after adjusting n_seq_max");
+                }
+
+                LLAMA_LOG_INFO("%s: adjusted n_seq_max = %u, n_ctx = %u, n_ctx_seq = %u\n", __func__, cparams.n_seq_max, cparams.n_ctx, cparams.n_ctx_seq);
+
+                // also update local copy for subsequent usage in this function
+                n_seqs = cparams.n_seq_max;
+                n_outputs = n_seqs;
+            }
         }
 
         // reserve with tg (token generation) graph to get the number of splits and nodes
