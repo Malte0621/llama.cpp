@@ -1397,6 +1397,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+        GGML_LOG_ERROR("[%s] malformed SET_TENSOR request (too small)\n", __func__);
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
@@ -1417,9 +1418,30 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
 
-    // sanitize tensor->data
+    // No-op for empty payload
+    if (size == 0) {
+        GGML_LOG_INFO("[%s] SET_TENSOR noop (size=0)\n", __func__);
+        return true;
+    }
+
+    // Additional defensive checks to avoid hitting GGML_ASSERT/ggml_abort
+    if (tensor->data == nullptr) {
+        GGML_LOG_ERROR("[%s] tensor data pointer is NULL; rejecting SET_TENSOR\n", __func__);
+        return false;
+    }
+
+    const size_t nbytes = (size_t) ggml_nbytes(tensor);
+    if (offset > (uint64_t)nbytes) {
+        GGML_LOG_ERROR("[%s] offset (%" PRIu64 ") outside tensor size (%zu); rejecting SET_TENSOR\n", __func__, offset, nbytes);
+        return false;
+    }
+    if (offset + size > nbytes) {
+        GGML_LOG_ERROR("[%s] write range (offset=%" PRIu64 ", size=%zu) exceeds tensor size (%zu); rejecting SET_TENSOR\n", __func__, offset, size, nbytes);
+        return false;
+    }
+
+    // sanitize tensor->data against buffer bounds (existing check)
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
@@ -1442,6 +1464,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.c_str());
     }
+
+    // Finally, perform the write. If the backend misbehaves it should handle errors internally,
+    // but we prevent obvious client-caused assertions above to avoid process abort.
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
 }
@@ -1498,7 +1523,22 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
 
-    // sanitize tensor->data
+    // defensive checks to avoid GGML_ASSERT/ggml_abort
+    if (tensor->data == nullptr) {
+        GGML_LOG_ERROR("[%s] tensor data pointer is NULL; rejecting SET_TENSOR_HASH (hash=0x%" PRIx64 ")\n", __func__, request.hash);
+        return false;
+    }
+    const size_t nbytes = (size_t) ggml_nbytes(tensor);
+    if (request.offset > (uint64_t)nbytes) {
+        GGML_LOG_ERROR("[%s] offset (%" PRIu64 ") outside tensor size (%zu); rejecting SET_TENSOR_HASH (hash=0x%" PRIx64 ")\n", __func__, request.offset, nbytes, request.hash);
+        return false;
+    }
+    if (request.offset + size > nbytes) {
+        GGML_LOG_ERROR("[%s] write range (offset=%" PRIu64 ", size=%zu) exceeds tensor size (%zu); rejecting SET_TENSOR_HASH (hash=0x%" PRIx64 ")\n", __func__, request.offset, size, nbytes, request.hash);
+        return false;
+    }
+
+    // sanitize tensor->data against buffer bounds (existing check)
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
@@ -1511,6 +1551,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
+
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
     response.result = 1;
     return true;
