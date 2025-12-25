@@ -855,6 +855,7 @@ static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+    return true;
 }
 
 static bool ggml_gallocr_reserve_n_impl(

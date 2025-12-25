@@ -306,10 +306,14 @@ static bool tcp_recv_data(std::shared_ptr<socket_t> sock, void * data, size_t si
         if (n < 0) {
 #ifndef _WIN32
             if (errno == EINTR) continue; // retry on signal
+            fprintf(stderr, "tcp_recv_data: recv failed (bytes_recv=%zu, size_to_recv=%zu): %s\n", bytes_recv, size - bytes_recv, strerror(errno));
+#else
+            fprintf(stderr, "tcp_recv_data: recv failed (bytes_recv=%zu, size_to_recv=%zu)\n", bytes_recv, size - bytes_recv);
 #endif
             return false;
         }
         if (n == 0) {
+            fprintf(stderr, "tcp_recv_data: peer closed connection\n");
             return false; // peer closed
         }
         bytes_recv += (size_t)n;
@@ -538,7 +542,14 @@ bool transport_send_msg(std::shared_ptr<socket_t> sock, const void * msg, size_t
 #else
     ssize_t n = sendmsg(sock->fd, &mh, 0);
 #endif
-    if (n < 0) return false;
+    if (n < 0) {
+#if defined(_WIN32)
+        fprintf(stderr, "transport_send_msg: sendmsg failed, WSAGetLastError=%d\n", WSAGetLastError());
+#else
+        fprintf(stderr, "transport_send_msg: sendmsg failed: %s\n", strerror(errno));
+#endif
+        return false;
+    }
     return true;
 #else
 #ifdef _WIN32
@@ -550,7 +561,11 @@ bool transport_send_msg(std::shared_ptr<socket_t> sock, const void * msg, size_t
     bufs[1].buf = (CHAR *)payload_ptr;
     bufs[1].len = (ULONG)payload_size;
     int ret = WSASend(sock->fd, bufs, 2, &sent, 0, NULL, NULL);
-    return ret == 0;
+    if (ret != 0) {
+        fprintf(stderr, "transport_send_msg: WSASend failed, WSAGetLastError=%d\n", WSAGetLastError());
+        return false;
+    }
+    return true;
 #else
     // Fallback: send header then data
     if (!tcp_send_data(sock, &hdr, sizeof(hdr))) return false;

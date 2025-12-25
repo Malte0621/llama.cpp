@@ -45,10 +45,8 @@ bool transport_recv_data(std::shared_ptr<socket_t> sock, void * data, size_t siz
 #include <filesystem>
 #include <algorithm>
 
-static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
-
-#define LOG_DBG(...) \
-    do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+// Disable RPC-level debug macro (no-op)
+#define LOG_DBG(...)
 
 
 namespace fs = std::filesystem;
@@ -268,6 +266,7 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    std::string endpoint; // endpoint used to reconnect on failures
 };
 
 // RPC helper functions
@@ -296,6 +295,9 @@ static std::shared_ptr<socket_t> make_socket(sockfd_t fd) {
 #endif
     return std::make_shared<socket_t>(fd);
 }
+
+// forward-declare reconnect helper so retry helper can call it
+static std::shared_ptr<socket_t> reconnect_socket(const std::string & endpoint);
 
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
@@ -409,6 +411,35 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     return true;
 }
 
+// Helper that attempts to reconnect and resend once on failure.
+static bool send_rpc_cmd_with_retry(std::shared_ptr<socket_t> & sock, const std::string & endpoint, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    if (send_rpc_cmd(sock, cmd, input, input_size)) {
+        return true;
+    }
+    LOG_DBG("%s: send_rpc_cmd failed, attempting reconnect to %s\n", __func__, endpoint.c_str());
+    auto nsock = reconnect_socket(endpoint);
+    if (!nsock) {
+        LOG_DBG("%s: reconnect to %s failed\n", __func__, endpoint.c_str());
+        return false;
+    }
+    sock = nsock;
+    return send_rpc_cmd(sock, cmd, input, input_size);
+}
+
+static bool send_rpc_cmd_with_retry(std::shared_ptr<socket_t> & sock, const std::string & endpoint, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    if (send_rpc_cmd(sock, cmd, input, input_size, output, output_size)) {
+        return true;
+    }
+    LOG_DBG("%s: send_rpc_cmd (with response) failed, attempting reconnect to %s\n", __func__, endpoint.c_str());
+    auto nsock = reconnect_socket(endpoint);
+    if (!nsock) {
+        LOG_DBG("%s: reconnect to %s failed\n", __func__, endpoint.c_str());
+        return false;
+    }
+    sock = nsock;
+    return send_rpc_cmd(sock, cmd, input, input_size, output, output_size);
+}
+
 // RPC client-side implementation
 
 static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
@@ -451,6 +482,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
             }
         }
     }
+
+
     std::string scheme;
     std::string host;
     int port;
@@ -638,7 +671,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             request.offset = offset + sent;
             request.hash = fnv_hash(ptr + sent, chunk);
             rpc_msg_set_tensor_hash_rsp response;
-            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+            bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
             if (!status) {
                 GGML_LOG_ERROR("Failed to send SET_TENSOR_HASH to RPC server\n");
             } else if (response.result) {
@@ -656,7 +689,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         memcpy(input.data() + sizeof(rpc_tensor), &off64, sizeof(off64));
         memcpy(input.data() + header_overhead, ptr + sent, chunk);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_SET_TENSOR, input.data(), input.size());
         if (!status) {
             GGML_LOG_ERROR("Failed to send SET_TENSOR to RPC server\n");
             return;
@@ -687,7 +720,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         // receive chunk into temporary buffer
         std::vector<uint8_t> tmp(chunk);
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
+        bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
         if (!status) {
             GGML_LOG_ERROR("Failed to GET_TENSOR from RPC server; zeroing remainder to avoid uninitialized data\n");
             memset(out_ptr + fetched, 0, size - fetched);
@@ -713,7 +746,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         request.src = serialize_tensor(src);
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
         if (!status) {
             GGML_LOG_ERROR("Failed to COPY_TENSOR via RPC server\n");
             return false;
@@ -787,7 +820,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, buft_ctx->endpoint},
             response.remote_size);
         return buffer;
     } else {
@@ -1705,7 +1738,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] ggml_backend_graph_compute failed with status %d\n", __func__, status);
+        return false;
+    }
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
     stored_graphs[device].graph = graph;
     return true;
@@ -1722,7 +1758,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] ggml_backend_graph_compute failed with status %d\n", __func__, status);
+        return false;
+    }
     return true;
 }
 
@@ -1890,23 +1929,29 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
                 if (!transport_recv_vector(sock, input)) {
+                    fprintf(stderr, "[%s] transport_recv_vector failed for SET_TENSOR; closing client connection\n", __func__);
                     return;
                 }
                 if (!server.set_tensor(input)) {
-                    return;
+                    // Do NOT close the connection on malformed or rejected SET_TENSOR; log and continue.
+                    fprintf(stderr, "[%s] server.set_tensor failed for SET_TENSOR (malformed or rejected data); continuing client\n", __func__);
                 }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
                 if (!transport_recv_msg(sock, &request, sizeof(request))) {
+                    fprintf(stderr, "[%s] transport_recv_msg failed for SET_TENSOR_HASH; closing client connection\n", __func__);
                     return;
                 }
                 rpc_msg_set_tensor_hash_rsp response;
+                // Try to process request; if processing fails, send a harmless negative response instead of aborting.
                 if (!server.set_tensor_hash(request, response)) {
-                    return;
+                    fprintf(stderr, "[%s] server.set_tensor_hash failed; returning response.result=0\n", __func__);
+                    response.result = 0;
                 }
                 if (!transport_send_msg(sock, &response, sizeof(response))) {
+                    fprintf(stderr, "[%s] transport_send_msg failed while replying to SET_TENSOR_HASH; closing client\n", __func__);
                     return;
                 }
                 break;
