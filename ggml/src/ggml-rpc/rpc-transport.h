@@ -82,6 +82,17 @@ inline int rpc_get_max_clients() {
     if (!v) return 32;
     try { return std::stoi(v); } catch (...) { return 32; }
 }
+// Retry/backoff config
+inline int rpc_get_retry_count() {
+    const char * v = std::getenv("GGML_RPC_RETRY_COUNT");
+    if (!v) return 3;
+    try { return std::stoi(v); } catch (...) { return 3; }
+}
+inline int rpc_get_retry_backoff_ms() {
+    const char * v = std::getenv("GGML_RPC_RETRY_BACKOFF_MS");
+    if (!v) return 200; // default 200ms
+    try { return std::stoi(v); } catch (...) { return 200; }
+}
 // Compression: none|zstd
 inline std::string rpc_get_compression() {
     const char * v = std::getenv("GGML_RPC_COMPRESSION");

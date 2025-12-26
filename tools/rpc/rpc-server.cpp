@@ -23,6 +23,24 @@
 #include <algorithm>
 #include <thread>
 #include <regex>
+#include <atomic>
+#include <signal.h>
+#include <functional>
+
+// forward declaration for graceful shutdown
+extern "C" void ggml_backend_rpc_stop_server(void);
+
+// signal handling for graceful shutdown (file scope)
+static std::function<void(int)> shutdown_handler;
+static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+static inline void signal_handler(int signal) {
+    if (is_terminating.test_and_set()) {
+        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
+        exit(1);
+    }
+
+    if (shutdown_handler) shutdown_handler(signal);
+}
 
 namespace fs = std::filesystem;
 
@@ -297,6 +315,23 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    // install signal handlers (use file-scope signal_handler/shutdown_handler)
+    shutdown_handler = [](int){
+        fprintf(stderr, "Shutting down rpc-server...\n");
+        ggml_backend_rpc_stop_server();
+    };
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    try {
+        start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    } catch (const std::exception & e) {
+        fprintf(stderr, "rpc-server crashed with exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "rpc-server crashed with unknown exception\n");
+        return 1;
+    }
+
     return 0;
 }

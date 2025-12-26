@@ -57,7 +57,8 @@ static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 
 
 // macro for nicer error messages on server crash
-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+// previously this would abort the process; make it non-fatal and just log the error
+#define RPC_STATUS_ASSERT(x) do { if (!(x)) { GGML_LOG_ERROR("RPC_STATUS_ASSERT failed: %s\n", #x); } } while(0)
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
@@ -411,33 +412,45 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     return true;
 }
 
-// Helper that attempts to reconnect and resend once on failure.
+// Helper that attempts to reconnect and resend several times on failure with exponential backoff.
 static bool send_rpc_cmd_with_retry(std::shared_ptr<socket_t> & sock, const std::string & endpoint, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    if (send_rpc_cmd(sock, cmd, input, input_size)) {
-        return true;
+    int retries = rpc_get_retry_count();
+    int backoff_ms = rpc_get_retry_backoff_ms();
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        if (send_rpc_cmd(sock, cmd, input, input_size)) {
+            return true;
+        }
+        LOG_DBG("%s: send_rpc_cmd failed (attempt %d/%d) for %s\n", __func__, attempt+1, retries+1, endpoint.c_str());
+        auto nsock = reconnect_socket(endpoint);
+        if (!nsock) {
+            LOG_DBG("%s: reconnect to %s failed (attempt %d/%d)\n", __func__, endpoint.c_str(), attempt+1, retries+1);
+        } else {
+            sock = nsock;
+            if (send_rpc_cmd(sock, cmd, input, input_size)) return true;
+        }
+        if (attempt < retries) std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms * (1ULL << attempt)));
     }
-    LOG_DBG("%s: send_rpc_cmd failed, attempting reconnect to %s\n", __func__, endpoint.c_str());
-    auto nsock = reconnect_socket(endpoint);
-    if (!nsock) {
-        LOG_DBG("%s: reconnect to %s failed\n", __func__, endpoint.c_str());
-        return false;
-    }
-    sock = nsock;
-    return send_rpc_cmd(sock, cmd, input, input_size);
+    return false;
 }
 
 static bool send_rpc_cmd_with_retry(std::shared_ptr<socket_t> & sock, const std::string & endpoint, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (send_rpc_cmd(sock, cmd, input, input_size, output, output_size)) {
-        return true;
+    int retries = rpc_get_retry_count();
+    int backoff_ms = rpc_get_retry_backoff_ms();
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        if (send_rpc_cmd(sock, cmd, input, input_size, output, output_size)) {
+            return true;
+        }
+        LOG_DBG("%s: send_rpc_cmd (with response) failed (attempt %d/%d) for %s\n", __func__, attempt+1, retries+1, endpoint.c_str());
+        auto nsock = reconnect_socket(endpoint);
+        if (!nsock) {
+            LOG_DBG("%s: reconnect to %s failed (attempt %d/%d)\n", __func__, endpoint.c_str(), attempt+1, retries+1);
+        } else {
+            sock = nsock;
+            if (send_rpc_cmd(sock, cmd, input, input_size, output, output_size)) return true;
+        }
+        if (attempt < retries) std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms * (1ULL << attempt)));
     }
-    LOG_DBG("%s: send_rpc_cmd (with response) failed, attempting reconnect to %s\n", __func__, endpoint.c_str());
-    auto nsock = reconnect_socket(endpoint);
-    if (!nsock) {
-        LOG_DBG("%s: reconnect to %s failed\n", __func__, endpoint.c_str());
-        return false;
-    }
-    sock = nsock;
-    return send_rpc_cmd(sock, cmd, input, input_size, output, output_size);
+    return false;
 }
 
 // RPC client-side implementation
@@ -463,6 +476,18 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
 static std::mutex g_sock_cache_mutex;
 static std::unordered_map<std::string, std::weak_ptr<socket_t>> g_sock_cache;
 static bool g_sock_cache_initialized = false;
+
+// global stop flag and server socket for graceful shutdown
+static std::atomic<bool> g_rpc_stop_flag{false};
+static std::shared_ptr<socket_t> g_server_socket = nullptr;
+
+// C-callable stop function to request server shutdown
+extern "C" GGML_BACKEND_API void ggml_backend_rpc_stop_server(void) {
+    g_rpc_stop_flag.store(true);
+    if (g_server_socket) {
+        g_server_socket.reset();
+    }
+}
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(g_sock_cache_mutex);
@@ -539,24 +564,32 @@ static std::shared_ptr<socket_t> reconnect_socket(const std::string & endpoint) 
 #else
     GGML_UNUSED(g_sock_cache_initialized);
 #endif
-    auto sock = transport_connect(scheme, host.c_str(), port);
-    if (sock == nullptr) {
-        return nullptr;
+
+    int retries = rpc_get_retry_count();
+    int backoff_ms = rpc_get_retry_backoff_ms();
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        auto sock = transport_connect(scheme, host.c_str(), port);
+        if (sock != nullptr) {
+            if (!check_server_version(sock)) {
+                LOG_DBG("[%s] server version check failed for %s\n", __func__, endpoint.c_str());
+                return nullptr;
+            }
+            LOG_DBG("[%s] reconnected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
+            g_sock_cache[endpoint] = sock;
+            return sock;
+        }
+        LOG_DBG("[%s] transport_connect failed to %s (attempt %d/%d)\n", __func__, endpoint.c_str(), attempt+1, retries+1);
+        if (attempt < retries) std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms * (1ULL << attempt)));
     }
-    if (!check_server_version(sock)) {
-        return nullptr;
-    }
-    LOG_DBG("[%s] reconnected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
-    g_sock_cache[endpoint] = sock;
-    return sock;
+    return nullptr;
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     if (!status) {
-        GGML_LOG_ERROR("Failed to send FREE_BUFFER to RPC server (endpoint=%s)\n", ctx->sock ? "<socket>" : "<null>");
+        GGML_LOG_ERROR("Failed to send FREE_BUFFER to RPC server (endpoint=%s)\n", ctx->endpoint.c_str());
     }
     delete ctx; 
 }
@@ -568,9 +601,9 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
-        GGML_LOG_ERROR("Failed to get remote buffer base from RPC server\n");
+        GGML_LOG_ERROR("Failed to get remote buffer base from RPC server (endpoint=%s)\n", ctx->endpoint.c_str());
         return nullptr;
     }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
@@ -632,9 +665,9 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         if (!status) {
-            GGML_LOG_ERROR("Failed to request remote tensor init\n");
+            GGML_LOG_ERROR("Failed to request remote tensor init (endpoint=%s)\n", ctx->endpoint.c_str());
         }
     }
     return GGML_STATUS_SUCCESS; 
@@ -759,10 +792,10 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     if (!status) {
-        GGML_LOG_ERROR("Failed to send BUFFER_CLEAR to RPC server\n");
-    } 
+        GGML_LOG_ERROR("Failed to send BUFFER_CLEAR to RPC server (endpoint=%s)\n", ctx->endpoint.c_str());
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
@@ -782,12 +815,12 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
     return buft_ctx->name.c_str();
 }
 
-static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t device) {
+static size_t get_max_size(const std::shared_ptr<socket_t> & sock, const std::string & endpoint, uint32_t device) {
     rpc_msg_get_max_size_req request = { device };
     rpc_msg_get_max_size_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd_with_retry(const_cast<std::shared_ptr<socket_t>&>(sock), endpoint, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
-        GGML_LOG_ERROR("Failed to query remote max_size; falling back to max_size=0\n");
+        GGML_LOG_ERROR("Failed to query remote max_size from %s; falling back to max_size=0\n", endpoint.c_str());
         return 0;
     }
     return response.max_size;
@@ -803,7 +836,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     }
 
     // Query remote max size and fail early if requested size exceeds remote capability
-    size_t remote_max = get_max_size(sock, buft_ctx->device);
+    size_t remote_max = get_max_size(sock, buft_ctx->endpoint, buft_ctx->device);
     if (remote_max != 0 && size > remote_max) {
         GGML_LOG_ERROR("Requested buffer size %zu exceeds remote max %zu on %s\n", size, remote_max, buft_ctx->endpoint.c_str());
         return nullptr;
@@ -812,7 +845,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
 
-    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd_with_retry(sock, buft_ctx->endpoint, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
         GGML_LOG_ERROR("Failed to allocate remote buffer on %s (maybe server rejected the request)\n", buft_ctx->endpoint.c_str());
         return nullptr;
@@ -828,12 +861,12 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     } 
 }
 
-static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t device) {
+static size_t get_alignment(const std::shared_ptr<socket_t> & sock, const std::string & endpoint, uint32_t device) {
     rpc_msg_get_alignment_req request = {device};
     rpc_msg_get_alignment_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd_with_retry(const_cast<std::shared_ptr<socket_t>&>(sock), endpoint, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
-        GGML_LOG_ERROR("Failed to query remote alignment; falling back to alignment=1\n");
+        GGML_LOG_ERROR("Failed to query remote alignment from %s; falling back to alignment=1\n", endpoint.c_str());
         return 1;
     }
     return response.alignment;
@@ -878,18 +911,10 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
-        bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd_with_retry(sock, buft_ctx->endpoint, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         if (!status) {
-            // Try to reconnect and retry once — cached socket may be stale or closed
-            LOG_DBG("GET_ALLOC_SIZE failed, attempting reconnect and retry\n");
-            auto sock2 = reconnect_socket(buft_ctx->endpoint);
-            if (sock2) {
-                status = send_rpc_cmd(sock2, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-            }
-            if (!status) {
-                GGML_LOG_WARN("Failed to query remote alloc size; falling back to local buft allocation size\n");
-                return ggml_backend_buft_get_alloc_size(buft, tensor);
-            }
+            GGML_LOG_WARN("Failed to query remote alloc size from %s; falling back to local buft allocation size\n", buft_ctx->endpoint.c_str());
+            return ggml_backend_buft_get_alloc_size(buft, tensor);
         }
 
         // Sanity-check and clamp the returned alloc_size before using it
@@ -1029,15 +1054,21 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        RPC_STATUS_ASSERT(status);
+        bool status = send_rpc_cmd_with_retry(sock, rpc_ctx->endpoint, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        if (!status) {
+            GGML_LOG_ERROR("Failed to send GRAPH_RECOMPUTE to %s\n", rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
     } else {
         rpc_ctx->gc.add(cgraph);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        bool status = send_rpc_cmd_with_retry(sock, rpc_ctx->endpoint, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        if (!status) {
+            GGML_LOG_ERROR("Failed to send GRAPH_COMPUTE to %s\n", rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -1060,7 +1091,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
 };
 
 // Forward declare helper used below (defined later) to avoid C3861 on MSVC
-static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total);
+static void get_device_memory(const std::shared_ptr<socket_t> & sock, const std::string & endpoint, uint32_t device, size_t * free, size_t * total);
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
     static std::mutex mutex;
@@ -1077,8 +1108,8 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return nullptr;
     }
-    size_t alignment = get_alignment(sock, device);
-    size_t max_size = get_max_size(sock, device);
+    size_t alignment = get_alignment(sock, endpoint, device);
+    size_t max_size = get_max_size(sock, endpoint, device);
 
     // If the server reports an explicit max size, use it. If it reports 0 (unknown),
     // try to derive a sensible default from the device free memory. Avoid clamping
@@ -1086,7 +1117,7 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     // allocations larger than the transport message size are valid.
     if (max_size == 0) {
         size_t free_mem = 0, total_mem = 0;
-        get_device_memory(sock, device, &free_mem, &total_mem);
+        get_device_memory(sock, endpoint, device, &free_mem, &total_mem);
         if (free_mem > 0) {
             LOG_DBG("[ggml_backend_rpc_buffer_type] endpoint=%s device=%u: reported max_size=0, using free_mem=%zu, total_mem=%zu\n", endpoint, (unsigned)device, free_mem, total_mem);
             max_size = free_mem;
@@ -1135,12 +1166,17 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
 }
 
-static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
+static void get_device_memory(const std::shared_ptr<socket_t> & sock, const std::string & endpoint, uint32_t device, size_t * free, size_t * total) {
     rpc_msg_get_device_memory_req request;
     request.device = device;
     rpc_msg_get_device_memory_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    bool status = send_rpc_cmd_with_retry(const_cast<std::shared_ptr<socket_t>&>(sock), endpoint, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
+    if (!status) {
+        GGML_LOG_ERROR("Failed to get device memory from RPC server %s (device=%u)\n", endpoint.c_str(), (unsigned)device);
+        *free = 0;
+        *total = 0;
+        return;
+    }
     *free = response.free_mem;
     *total = response.total_mem;
 }
@@ -1152,7 +1188,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
         *total = 0;
         return;
     }
-    get_device_memory(sock, device, free, total);
+    get_device_memory(sock, std::string(endpoint), device, free, total);
 }
 
 // RPC server-side implementation
@@ -2151,10 +2187,14 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket (scheme=%s)\n", scheme.c_str());
         return;
     }
+    // store the server socket (global) so external stop can close it
+    g_server_socket = server_socket;
+
 
     // Run server accept loop with a bounded worker pool to avoid thread churn
     const int max_clients = rpc_get_max_clients();
     static std::atomic<int> current_clients{0};
+
 
     // Accept queue and worker threads
     std::mutex accept_mtx;
@@ -2186,9 +2226,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         });
     }
 
-    while (true) {
+    while (!g_rpc_stop_flag.load()) {
         auto client_socket = transport_accept(server_socket);
         if (client_socket == nullptr) {
+            if (g_rpc_stop_flag.load()) break;
             fprintf(stderr, "Failed to accept client connection\n");
             // don't return here - keep server running
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2375,8 +2416,15 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
 static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
     auto sock = get_socket(endpoint);
     rpc_msg_device_count_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to RPC server %s to query device count\n", endpoint);
+        return 0;
+    }
+    bool status = send_rpc_cmd_with_retry(const_cast<std::shared_ptr<socket_t>&>(sock), std::string(endpoint), RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
+    if (!status) {
+        GGML_LOG_ERROR("Failed to query device count from RPC server %s\n", endpoint);
+        return 0;
+    }
     return response.device_count;
 }
 

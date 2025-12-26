@@ -115,6 +115,14 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc
 $ GGML_RPC_DEBUG=1 bin/rpc-server
 ```
 
+Reliability & shutdown
+
+- Retry configuration (client-side):
+  - `GGML_RPC_RETRY_COUNT` (default: 3) — number of reconnect attempts on transient failures
+  - `GGML_RPC_RETRY_BACKOFF_MS` (default: 200) — base backoff in milliseconds (exponential backoff is applied)
+
+- Graceful shutdown: `rpc-server` now supports SIGINT/SIGTERM (Ctrl+C) and will attempt a clean shutdown (stop accepting new connections and finish serving existing ones) instead of unconditionally aborting.
+
 ### Performance tuning (network / transport)
 
 The RPC server exposes several environment variables that allow tuning socket-level and worker parameters for high-throughput and low-latency Ethernet deployments. These are optional and safe to change per-host.
