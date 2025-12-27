@@ -392,25 +392,30 @@ static bool parse_endpoint(const std::string & endpoint, std::string & scheme, s
 // RPC request : | rpc_cmd (1 byte) | request framed using transport_send_msg (compression-aware header) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    // Serialize access to socket I/O so different threads don't interleave messages
+    std::lock_guard<std::mutex> lk(sock->io_mutex);
     // Send single command byte followed by a framed message using the transport helpers
     uint8_t c = (uint8_t)cmd;
     if (!transport_send_data(sock, &c, 1)) return false;
     // transport_send_msg writes the wire header (comp/orig_size/payload_size) and payload
-    return transport_send_msg(sock, input, input_size);
-}
+    if (!transport_send_msg(sock, input, input_size)) return false;
+    return true;
+} 
 
 // RPC request : | rpc_cmd (1 byte) | request framed using transport_send_msg (compression-aware header) |
 // RPC response: framed using transport_send_msg/transport_recv_msg helpers
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
-        return false;
-    }
+    // Serialize the whole request/response sequence
+    std::lock_guard<std::mutex> lk(sock->io_mutex);
+    uint8_t c = (uint8_t)cmd;
+    if (!transport_send_data(sock, &c, 1)) return false;
+    if (!transport_send_msg(sock, input, input_size)) return false;
     // Receive framed response using transport_recv_msg (handles compression header)
     if (!transport_recv_msg(sock, output, output_size)) {
         return false;
     }
     return true;
-}
+} 
 
 // Helper that attempts to reconnect and resend several times on failure with exponential backoff.
 static bool send_rpc_cmd_with_retry(std::shared_ptr<socket_t> & sock, const std::string & endpoint, enum rpc_cmd cmd, const void * input, size_t input_size) {
@@ -2134,6 +2139,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+
+// Simple helper for tests / diagnostics: send DEVICE_COUNT to an endpoint and return device count
+extern "C" GGML_BACKEND_API bool ggml_rpc_send_device_count(const char * endpoint, uint32_t * device_count) {
+    auto sock = get_socket(endpoint);
+    if (!sock) return false;
+    rpc_msg_device_count_rsp response;
+    bool status = send_rpc_cmd_with_retry(sock, std::string(endpoint), RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
+    if (!status) return false;
+    if (device_count) *device_count = response.device_count;
+    return true;
+}
+
+// (original ggml_backend_rpc_start_server implementation continues below)
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {

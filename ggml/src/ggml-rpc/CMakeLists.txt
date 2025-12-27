@@ -19,6 +19,14 @@ target_link_libraries(rpc-transport-config-test PRIVATE ggml-rpc)
 add_executable(rpc-compression-test test-rpc-compression.cpp)
 target_link_libraries(rpc-compression-test PRIVATE ggml-rpc)
 
+# Concurrency test to detect interleaving/malformed RPC when using shared sockets
+add_executable(rpc-concurrency-test test-rpc-concurrency.cpp)
+target_link_libraries(rpc-concurrency-test PRIVATE ggml-rpc)
+
+if (WIN32)
+    target_link_libraries(rpc-concurrency-test PRIVATE ws2_32)
+endif()
+
 # Try to find zstd and enable if available
 find_package(ZSTD QUIET)
 if (ZSTD_FOUND)

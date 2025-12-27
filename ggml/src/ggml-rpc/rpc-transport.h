@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <mutex>
 
 #ifdef _WIN32
 # include <winsock2.h>
@@ -27,6 +28,9 @@ struct socket_t {
     std::string scheme;
     // opaque transport-specific context (e.g., rdma_cm_id*)
     void * transport_ctx = nullptr;
+
+    // Protects concurrent I/O on this socket (send/recv must not interleave)
+    std::mutex io_mutex;
 
     socket_t(sockfd_t fd) : fd(fd) {}
     ~socket_t();
