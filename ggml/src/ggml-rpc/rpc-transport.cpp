@@ -321,6 +321,21 @@ static bool tcp_recv_data(std::shared_ptr<socket_t> sock, void * data, size_t si
     return true;
 } 
 
+// Attempt to read and discard `size` bytes from the socket to keep the stream aligned.
+static bool tcp_drain_data(std::shared_ptr<socket_t> sock, size_t size) {
+    if (!sock) return false;
+    const size_t chunk = 64 * 1024;
+    std::vector<uint8_t> tmp;
+    try { tmp.resize((size_t)std::min(chunk, size)); } catch (...) { return false; }
+    size_t drained = 0;
+    while (drained < size) {
+        size_t to_read = std::min(chunk, size - drained);
+        if (!tcp_recv_data(sock, tmp.data(), to_read)) return false;
+        drained += to_read;
+    }
+    return true;
+}
+
 std::shared_ptr<socket_t> transport_create_server(const std::string & scheme, const char * host, int port) {
     if (scheme == "rdma") {
 #ifdef GGML_RPC_RDMA
@@ -565,18 +580,34 @@ bool transport_recv_msg(std::shared_ptr<socket_t> sock, void * msg, size_t msg_s
     uint64_t max_size = rpc_get_max_msg_size();
     if (hdr.orig_size > max_size) {
         fprintf(stderr, "Rejected message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", hdr.orig_size, max_size);
+        // drain payload if present to keep stream aligned
+        if (hdr.payload_size > 0) {
+            tcp_drain_data(sock, (size_t)hdr.payload_size);
+        }
         return false;
     }
-    if (hdr.orig_size != msg_size) return false;
+    if (hdr.orig_size != msg_size) {
+        fprintf(stderr, "Mismatched expected message size (%zu) != hdr.orig_size (%" PRIu64 ")\n", msg_size, hdr.orig_size);
+        // drain payload to keep stream aligned
+        if (hdr.payload_size > 0) {
+            tcp_drain_data(sock, (size_t)hdr.payload_size);
+        }
+        return false;
+    }
     if (hdr.payload_size == 0) return true;
     // read payload
     std::vector<uint8_t> tmp;
     if (hdr.comp == 0) {
         // uncompressed: read directly into msg
-        return tcp_recv_data(sock, msg, hdr.payload_size);
+        if (hdr.payload_size > msg_size) {
+            fprintf(stderr, "Payload size (%" PRIu64 ") exceeds expected buffer size (%zu)\n", hdr.payload_size, msg_size);
+            tcp_drain_data(sock, (size_t)hdr.payload_size);
+            return false;
+        }
+        return tcp_recv_data(sock, msg, (size_t)hdr.payload_size);
     } else if (hdr.comp == 1) {
         // compressed: read into tmp and decompress
-        try { tmp.resize(hdr.payload_size); } catch (...) { return false; }
+        try { tmp.resize((size_t)hdr.payload_size); } catch (...) { return false; }
         if (!tcp_recv_data(sock, tmp.data(), tmp.size())) return false;
         // decompress into msg buffer (msg_size bytes)
         if (!rpc_decompress_buffer(tmp.data(), tmp.size(), msg, msg_size)) return false;
@@ -597,20 +628,27 @@ bool transport_recv_vector(std::shared_ptr<socket_t> sock, std::vector<uint8_t> 
     uint64_t max_size = rpc_get_max_msg_size();
     if (hdr.orig_size > max_size) {
         fprintf(stderr, "Rejected vector message larger than max allowed (%" PRIu64 " > %" PRIu64 ")\n", hdr.orig_size, max_size);
+        if (hdr.payload_size > 0) tcp_drain_data(sock, (size_t)hdr.payload_size);
         return false;
     }
     try {
-        input.resize(hdr.orig_size);
+        input.resize((size_t)hdr.orig_size);
     } catch (const std::bad_alloc & e) {
         fprintf(stderr, "Failed to allocate input buffer of size %" PRIu64 "\n", hdr.orig_size);
+        if (hdr.payload_size > 0) tcp_drain_data(sock, (size_t)hdr.payload_size);
         return false;
     }
     if (hdr.payload_size == 0) return true;
     if (hdr.comp == 0) {
-        return tcp_recv_data(sock, input.data(), hdr.payload_size);
+        if (hdr.payload_size > hdr.orig_size) {
+            fprintf(stderr, "Uncompressed payload_size (%" PRIu64 ") > orig_size (%" PRIu64 ")\n", hdr.payload_size, hdr.orig_size);
+            tcp_drain_data(sock, (size_t)hdr.payload_size);
+            return false;
+        }
+        return tcp_recv_data(sock, input.data(), (size_t)hdr.payload_size);
     } else if (hdr.comp == 1) {
         std::vector<uint8_t> tmp;
-        try { tmp.resize(hdr.payload_size); } catch (...) { return false; }
+        try { tmp.resize((size_t)hdr.payload_size); } catch (...) { return false; }
         if (!tcp_recv_data(sock, tmp.data(), tmp.size())) return false;
         if (!rpc_decompress_buffer(tmp.data(), tmp.size(), input.data(), hdr.orig_size)) return false;
         return true;

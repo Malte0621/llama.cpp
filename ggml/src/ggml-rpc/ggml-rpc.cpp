@@ -1392,18 +1392,33 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
-    // Validate tensor type before using it
+    // Basic validation
+    if (!tensor) return nullptr;
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
+        GGML_LOG_ERROR("  tensor id=0x%" PRIx64 " name='%s'\n", tensor->id, tensor->name);
         return nullptr;
+    }
+
+    // defensive dimension checks to avoid creating absurd tensors
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        uint32_t dim = tensor->ne[i];
+        if (dim > (1u << 28)) {
+            GGML_LOG_ERROR("[%s] suspicious tensor dimension ne[%u]=%u\n", __func__, i, dim);
+            GGML_LOG_ERROR("  tensor id=0x%" PRIx64 " name='%s'\n", tensor->id, tensor->name);
+            return nullptr;
+        }
     }
 
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
-    // ggml_new_tensor_4d might fail if dimensions are invalid, although less likely to crash than invalid type
+    // ggml_new_tensor_4d might fail if dimensions are invalid
     if (result == nullptr) {
-        GGML_LOG_ERROR("[%s] ggml_new_tensor_4d failed for type %u\\n", __func__, tensor->type);
+        GGML_LOG_ERROR("[%s] ggml_new_tensor_4d failed for type %u (id=0x%" PRIx64 ")\n", __func__, tensor->type, tensor->id);
+        GGML_LOG_ERROR("  name='%s' ne=[%u,%u,%u,%u] nb=[%u,%u,%u,%u]\n",
+                       tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                       tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
         return nullptr;
     }
 
@@ -1412,6 +1427,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+        // remote buffer pointer not found - indicate to caller via null buffer
+        LOG_DBG("[%s] remote buffer pointer not found in buffers set: %p (id=0x%" PRIx64 ")\n",
+                __func__, (void*)result->buffer, tensor->id);
         result->buffer = nullptr;
     }
 
@@ -1420,8 +1438,11 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        if (!(tensor->data + tensor_size >= tensor->data && tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size)) {
+            GGML_LOG_ERROR("[%s] tensor data out of buffer bounds (data=0x%" PRIx64 ", tensor_size=%" PRIu64 ")\n", __func__, tensor->data, (uint64_t)ggml_nbytes(result));
+            GGML_LOG_ERROR("  buffer=[0x%zx, 0x%zx)\n", buffer_start, buffer_start + buffer_size);
+            return nullptr;
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1456,7 +1477,8 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     ggml_context * ctx = ctx_ptr.get();
     ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        GGML_LOG_ERROR("[%s] error deserializing tensor (id=0x%" PRIx64 ", name='%s', buffer=0x%" PRIx64 ")\n",
+                       __func__, in_tensor->id, in_tensor->name, in_tensor->buffer);
         return false;
     }
 
@@ -1642,7 +1664,8 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     ggml_context * ctx = ctx_ptr.get();
     ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        GGML_LOG_ERROR("[%s] error deserializing tensor (id=0x%" PRIx64 ", name='%s', buffer=0x%" PRIx64 ")\n",
+                       __func__, request.tensor.id, request.tensor.name, request.tensor.buffer);
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
