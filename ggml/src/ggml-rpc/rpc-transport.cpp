@@ -527,45 +527,22 @@ bool transport_send_msg(std::shared_ptr<socket_t> sock, const void * msg, size_t
     hdr.payload_size = (uint64_t)payload_size;
 
 #if defined(__unix__) || defined(__APPLE__)
-    struct iovec iov[2];
-    iov[0].iov_base = &hdr;
-    iov[0].iov_len = sizeof(hdr);
-    iov[1].iov_base = const_cast<void*>(payload_ptr);
-    iov[1].iov_len = payload_size;
+    // [AI] Fix: Use the reliable tcp_send_data helper which loops until the full buffer is written.
+    // Using sendmsg without handling partial writes could leave the stream in a partially-sent
+    // state which later leads to "malformed" messages on the receiver.
     if (sock->fd < 0) return false;
-    struct msghdr mh;
-    memset(&mh, 0, sizeof(mh));
-    mh.msg_iov = iov;
-    mh.msg_iovlen = 2;
-#if defined(MSG_NOSIGNAL)
-    ssize_t n = sendmsg(sock->fd, &mh, MSG_NOSIGNAL);
-#else
-    ssize_t n = sendmsg(sock->fd, &mh, 0);
-#endif
-    if (n < 0) {
-#if defined(_WIN32)
-        fprintf(stderr, "transport_send_msg: sendmsg failed, WSAGetLastError=%d\n", WSAGetLastError());
-#else
-        fprintf(stderr, "transport_send_msg: sendmsg failed: %s\n", strerror(errno));
-#endif
-        return false;
-    }
-    return true;
+    if (!tcp_send_data(sock, &hdr, sizeof(hdr))) return false;
+    if (payload_size == 0) return true;
+    return tcp_send_data(sock, payload_ptr, payload_size);
 #else
 #ifdef _WIN32
+    // On Windows use the reliable send helper as well. WSASend may succeed but send fewer bytes
+    // than requested - check sent bytes and fall back to looped sending.
     if (sock->fd == INVALID_SOCKET) return false;
-    WSABUF bufs[2];
-    DWORD sent = 0;
-    bufs[0].buf = (CHAR *)&hdr;
-    bufs[0].len = (ULONG)sizeof(hdr);
-    bufs[1].buf = (CHAR *)payload_ptr;
-    bufs[1].len = (ULONG)payload_size;
-    int ret = WSASend(sock->fd, bufs, 2, &sent, 0, NULL, NULL);
-    if (ret != 0) {
-        fprintf(stderr, "transport_send_msg: WSASend failed, WSAGetLastError=%d\n", WSAGetLastError());
-        return false;
-    }
-    return true;
+    // Send header
+    if (!tcp_send_data(sock, &hdr, sizeof(hdr))) return false;
+    if (payload_size == 0) return true;
+    return tcp_send_data(sock, payload_ptr, payload_size);
 #else
     // Fallback: send header then data
     if (!tcp_send_data(sock, &hdr, sizeof(hdr))) return false;
