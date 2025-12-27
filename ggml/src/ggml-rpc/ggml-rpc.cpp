@@ -2017,8 +2017,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
-                    // Do NOT close the connection on malformed or rejected SET_TENSOR; log and continue.
-                    GGML_LOG_ERROR("[%s] server.set_tensor failed for SET_TENSOR (malformed or rejected data); continuing client\n", __func__);
+                    // Malformed or rejected SET_TENSOR indicates an inconsistent or malicious client.
+                    // To avoid leaving the connection in an invalid state (which may lead to crashes),
+                    // close the client connection immediately instead of continuing.
+                    GGML_LOG_ERROR("[%s] server.set_tensor failed for SET_TENSOR (malformed or rejected data); closing client connection\n", __func__);
+                    return;
                 }
                 break;
             }
