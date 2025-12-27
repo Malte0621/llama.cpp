@@ -326,10 +326,10 @@ static bool tcp_drain_data(std::shared_ptr<socket_t> sock, size_t size) {
     if (!sock) return false;
     const size_t chunk = 64 * 1024;
     std::vector<uint8_t> tmp;
-    try { tmp.resize((size_t)std::min(chunk, size)); } catch (...) { return false; }
+    try { tmp.resize((size_t)(std::min)(chunk, size)); } catch (...) { return false; }
     size_t drained = 0;
     while (drained < size) {
-        size_t to_read = std::min(chunk, size - drained);
+        size_t to_read = (std::min)(chunk, size - drained);
         if (!tcp_recv_data(sock, tmp.data(), to_read)) return false;
         drained += to_read;
     }
