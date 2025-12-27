@@ -482,6 +482,56 @@ static std::mutex g_sock_cache_mutex;
 static std::unordered_map<std::string, std::weak_ptr<socket_t>> g_sock_cache;
 static bool g_sock_cache_initialized = false;
 
+// Cache of chunks we sent to the server so we can re-send them if the server later fails to GET them.
+struct sent_chunk_key {
+    std::string endpoint;
+    uint64_t remote_ptr;
+    uint64_t data_ptr;
+    uint64_t offset;
+    size_t   size;
+    bool operator==(const sent_chunk_key & o) const noexcept {
+        return endpoint == o.endpoint && remote_ptr == o.remote_ptr && data_ptr == o.data_ptr && offset == o.offset && size == o.size;
+    }
+};
+struct sent_chunk_key_hash {
+    size_t operator()(const sent_chunk_key & k) const noexcept {
+        size_t h = std::hash<std::string>()(k.endpoint);
+        h ^= std::hash<uint64_t>()(k.remote_ptr + (k.data_ptr<<1)) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        h ^= std::hash<uint64_t>()(k.offset) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        h ^= std::hash<size_t>()(k.size) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        return h;
+    }
+};
+static std::mutex g_sent_chunk_mutex;
+static std::unordered_map<sent_chunk_key, std::vector<uint8_t>, sent_chunk_key_hash> g_sent_chunk_cache;
+
+// Helper: store a sent chunk so we can resend it later if needed
+static void record_sent_chunk(const std::string & endpoint, uint64_t remote_ptr, uint64_t data_ptr, uint64_t offset, size_t size, const uint8_t * data) {
+    if (data == nullptr || size == 0) return;
+    sent_chunk_key key{endpoint, remote_ptr, data_ptr, offset, size};
+    std::lock_guard<std::mutex> lk(g_sent_chunk_mutex);
+    std::vector<uint8_t> v;
+    v.assign(data, data + size);
+    g_sent_chunk_cache[key] = std::move(v);
+}
+
+static bool get_sent_chunk(const std::string & endpoint, uint64_t remote_ptr, uint64_t data_ptr, uint64_t offset, size_t size, std::vector<uint8_t> & out) {
+    sent_chunk_key key{endpoint, remote_ptr, data_ptr, offset, size};
+    std::lock_guard<std::mutex> lk(g_sent_chunk_mutex);
+    auto it = g_sent_chunk_cache.find(key);
+    if (it == g_sent_chunk_cache.end()) return false;
+    out = it->second;
+    return true;
+}
+
+static void erase_sent_chunks_for_buffer(uint64_t remote_ptr) {
+    std::lock_guard<std::mutex> lk(g_sent_chunk_mutex);
+    for (auto it = g_sent_chunk_cache.begin(); it != g_sent_chunk_cache.end(); ) {
+        if (it->first.remote_ptr == remote_ptr) it = g_sent_chunk_cache.erase(it);
+        else ++it;
+    }
+}
+
 // global stop flag and server socket for graceful shutdown
 static std::atomic<bool> g_rpc_stop_flag{false};
 static std::shared_ptr<socket_t> g_server_socket = nullptr;
@@ -707,13 +757,15 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             rpc_msg_set_tensor_hash_req request;
             request.tensor = rpc_tensor;
             request.offset = offset + sent;
-            request.hash = fnv_hash(ptr + sent, chunk);
+            uint64_t chash = fnv_hash(ptr + sent, chunk);
+            request.hash = chash;
             rpc_msg_set_tensor_hash_rsp response;
             bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
             if (!status) {
                 GGML_LOG_ERROR("Failed to send SET_TENSOR_HASH to RPC server\n");
             } else if (response.result) {
-                // server already has this chunk
+                // server already has this chunk - record locally so we can resend if later necessary
+                record_sent_chunk(ctx->endpoint, rpc_tensor.buffer, rpc_tensor.data, offset + sent, chunk, ptr + sent);
                 sent += chunk;
                 continue;
             }
@@ -732,6 +784,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             GGML_LOG_ERROR("Failed to send SET_TENSOR to RPC server\n");
             return;
         }
+
+        // record that we sent this chunk so that GET can trigger a resend if needed
+        record_sent_chunk(ctx->endpoint, rpc_tensor.buffer, rpc_tensor.data, offset + sent, chunk, ptr + sent);
 
         sent += chunk;
     }
@@ -759,11 +814,65 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         // receive chunk into temporary buffer
         std::vector<uint8_t> tmp(chunk);
         bool status = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
+
+        // If GET failed, try to resend the chunk from our local cache (if available) and retry once
         if (!status) {
-            GGML_LOG_ERROR("Failed to GET_TENSOR from RPC server; zeroing remainder to avoid uninitialized data\n");
-            memset(out_ptr + fetched, 0, size - fetched);
-            return;
+            GGML_LOG_ERROR("GET_TENSOR failed for %s (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu); attempting resend from local cache\n", ctx->endpoint.c_str(), (uint64_t)request.tensor.data, request.offset, chunk);
+            std::vector<uint8_t> cached;
+            if (get_sent_chunk(ctx->endpoint, request.tensor.buffer, request.tensor.data, request.offset, chunk, cached)) {
+                // build SET_TENSOR payload
+                size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + cached.size();
+                std::vector<uint8_t> input(input_size);
+                memcpy(input.data(), &request.tensor, sizeof(rpc_tensor));
+                uint64_t off64 = request.offset;
+                memcpy(input.data() + sizeof(rpc_tensor), &off64, sizeof(off64));
+                memcpy(input.data() + sizeof(rpc_tensor) + sizeof(uint64_t), cached.data(), cached.size());
+                bool s2 = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_SET_TENSOR, input.data(), input.size());
+                if (!s2) {
+                    GGML_LOG_ERROR("Resend SET_TENSOR failed for %s\n", ctx->endpoint.c_str());
+                    memset(out_ptr + fetched, 0, size - fetched);
+                    return;
+                }
+                // retry GET once
+                bool status2 = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
+                if (!status2) {
+                    GGML_LOG_ERROR("GET_TENSOR retry after resend failed; zeroing remainder\n");
+                    memset(out_ptr + fetched, 0, size - fetched);
+                    return;
+                }
+            } else {
+                GGML_LOG_ERROR("No cached chunk available to resend; zeroing remainder\n");
+                memset(out_ptr + fetched, 0, size - fetched);
+                return;
+            }
         }
+
+        // If we have a cached copy, validate received chunk matches; if not, resend and retry once
+        std::vector<uint8_t> cached2;
+        if (get_sent_chunk(ctx->endpoint, request.tensor.buffer, request.tensor.data, request.offset, chunk, cached2)) {
+            uint64_t recv_hash = fnv_hash(tmp.data(), chunk);
+            uint64_t expect_hash = fnv_hash(cached2.data(), chunk);
+            if (recv_hash != expect_hash) {
+                GGML_LOG_ERROR("Received chunk hash mismatch (expected=0x%" PRIx64 ", recv=0x%" PRIx64 "); resending chunk and retrying GET\n", expect_hash, recv_hash);
+                // resend
+                size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + cached2.size();
+                std::vector<uint8_t> input(input_size);
+                memcpy(input.data(), &request.tensor, sizeof(rpc_tensor));
+                uint64_t off64 = request.offset;
+                memcpy(input.data() + sizeof(rpc_tensor), &off64, sizeof(off64));
+                memcpy(input.data() + sizeof(rpc_tensor) + sizeof(uint64_t), cached2.data(), cached2.size());
+                bool s3 = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_SET_TENSOR, input.data(), input.size());
+                if (!s3) {
+                    GGML_LOG_ERROR("Resend SET_TENSOR after mismatch failed; using received chunk\n");
+                } else {
+                    bool status3 = send_rpc_cmd_with_retry(ctx->sock, ctx->endpoint, RPC_CMD_GET_TENSOR, &request, sizeof(request), tmp.data(), chunk);
+                    if (!status3) {
+                        GGML_LOG_ERROR("GET_TENSOR retry after resend failed; using received chunk\n");
+                    }
+                }
+            }
+        }
+
         memcpy(out_ptr + fetched, tmp.data(), chunk);
         fetched += chunk;
     }
@@ -1375,6 +1484,8 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    // Erase any cached chunks associated with this buffer to avoid unbounded memory growth
+    erase_sent_chunks_for_buffer(reinterpret_cast<uint64_t>(buffer));
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
