@@ -30,6 +30,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include "rpc-transport.h"
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -47,20 +48,6 @@ using ssize_t = __int64;
 #else
 typedef int sockfd_t;
 #endif
-
-// cross-platform socket
-struct socket_t {
-    sockfd_t fd;
-    socket_t(sockfd_t fd) : fd(fd) {}
-    ~socket_t() {
-        LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
-#ifdef _WIN32
-        closesocket(this->fd);
-#else
-        close(this->fd);
-#endif
-    }
-};
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")

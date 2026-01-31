@@ -28,7 +28,7 @@
 #include <functional>
 
 // forward declaration for graceful shutdown
-extern "C" void ggml_backend_rpc_stop_server(void);
+// extern "C" void ggml_backend_rpc_stop_server(void);
 
 // signal handling for graceful shutdown (file scope)
 static std::function<void(int)> shutdown_handler;
@@ -318,7 +318,7 @@ int main(int argc, char * argv[]) {
     // install signal handlers (use file-scope signal_handler/shutdown_handler)
     shutdown_handler = [](int){
         fprintf(stderr, "Shutting down rpc-server...\n");
-        ggml_backend_rpc_stop_server();
+        // ggml_backend_rpc_stop_server();
     };
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);

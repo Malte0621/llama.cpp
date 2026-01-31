@@ -1292,7 +1292,7 @@ bool llama_model_loader::load_all_data(
                         }
                     } else {
                         read_buf.resize(n_size);
-                        file->read_raw_at(read_buf.data(), n_size, weight->offs);
+                        file->read_raw(read_buf.data(), n_size);
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                         if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

@@ -26,10 +26,10 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
 // stop the RPC server (for graceful shutdown)
-GGML_BACKEND_API void ggml_backend_rpc_stop_server(void);
+// GGML_BACKEND_API void ggml_backend_rpc_stop_server(void);
 
 // Test helper: send DEVICE_COUNT to endpoint and return device count
-GGML_BACKEND_API bool ggml_rpc_send_device_count(const char * endpoint, uint32_t * device_count);
+// GGML_BACKEND_API bool ggml_rpc_send_device_count(const char * endpoint, uint32_t * device_count);
 
 #ifdef  __cplusplus
 }
