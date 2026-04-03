@@ -128,7 +128,7 @@ However, additional settings are required for generating and signing HTP Ops lib
 > $env:HEXAGON_HTP_CERT="c:\Users\MyUsers\Certs\ggml-htp-v1.pfx"
 > $env:WINDOWS_SDK_BIN="C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\arm64"
 
-> cmake --preset arm64-windows-snapdragon -B build-wos
+> cmake --preset arm64-windows-snapdragon-release -B build-wos
 ...
 > cmake --install build-wos --prefix pkg-snapdragon
 ```
@@ -144,7 +144,7 @@ Once the build is complete HTP ops libraries will be installed like this
 -a----         1/22/2026   6:01 PM           4139 libggml-htp.cat
 ```
 
-The .cat file, the signature and proper certicate installation can be verified with
+The .cat file, the signature and proper certificate installation can be verified with
 
 ```
 > signtool.exe verify /v /pa .\pkg-snapdragon\lib\libggml-htp.cat

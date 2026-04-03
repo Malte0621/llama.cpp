@@ -35,14 +35,19 @@ void apir_buffer_set_tensor(virtgpu *               gpu,
     apir_encode_ggml_tensor(encoder, tensor);
 
     virtgpu_shmem   temp_shmem;  // Local storage for large buffers
-    virtgpu_shmem * shmem = &temp_shmem;
+    virtgpu_shmem * shmem              = &temp_shmem;
+    bool            using_shared_shmem = false;
 
     if (size <= gpu->data_shmem.mmap_size) {
-        // prefer the init-time allocated page, if large enough
-        shmem = &gpu->data_shmem;
+        // Lock mutex before using shared data_shmem buffer
+        if (mtx_lock(&gpu->data_shmem_mutex) != thrd_success) {
+            GGML_ABORT(GGML_VIRTGPU "%s: Failed to lock data_shmem mutex", __func__);
+        }
+        using_shared_shmem = true;
+        shmem              = &gpu->data_shmem;
 
     } else if (virtgpu_shmem_create(gpu, size, shmem)) {
-        GGML_ABORT("Couldn't allocate the guest-host shared buffer");
+        GGML_ABORT(GGML_VIRTGPU "%s: Couldn't allocate the guest-host shared buffer", __func__);
     }
 
     memcpy(shmem->mmap_ptr, data, size);
@@ -55,7 +60,10 @@ void apir_buffer_set_tensor(virtgpu *               gpu,
 
     remote_call_finish(gpu, encoder, decoder);
 
-    if (shmem != &gpu->data_shmem) {
+    // Unlock mutex before cleanup
+    if (using_shared_shmem) {
+        mtx_unlock(&gpu->data_shmem_mutex);
+    } else {
         virtgpu_shmem_destroy(gpu, shmem);
     }
 
@@ -78,14 +86,19 @@ void apir_buffer_get_tensor(virtgpu *               gpu,
     apir_encode_ggml_tensor(encoder, tensor);
 
     virtgpu_shmem   temp_shmem;  // Local storage for large buffers
-    virtgpu_shmem * shmem = &temp_shmem;
+    virtgpu_shmem * shmem              = &temp_shmem;
+    bool            using_shared_shmem = false;
 
     if (size <= gpu->data_shmem.mmap_size) {
-        // prefer the init-time allocated page, if large enough
-        shmem = &gpu->data_shmem;
+        // Lock mutex before using shared data_shmem buffer
+        if (mtx_lock(&gpu->data_shmem_mutex) != thrd_success) {
+            GGML_ABORT(GGML_VIRTGPU "%s: Failed to lock data_shmem mutex", __func__);
+        }
+        using_shared_shmem = true;
+        shmem              = &gpu->data_shmem;
 
     } else if (virtgpu_shmem_create(gpu, size, shmem)) {
-        GGML_ABORT("Couldn't allocate the guest-host shared buffer");
+        GGML_ABORT(GGML_VIRTGPU "%s: Couldn't allocate the guest-host shared buffer", __func__);
     }
 
     apir_encode_virtgpu_shmem_res_id(encoder, shmem->res_id);
@@ -98,7 +111,10 @@ void apir_buffer_get_tensor(virtgpu *               gpu,
 
     remote_call_finish(gpu, encoder, decoder);
 
-    if (shmem != &gpu->data_shmem) {
+    // Unlock mutex before cleanup
+    if (using_shared_shmem) {
+        mtx_unlock(&gpu->data_shmem_mutex);
+    } else {
         virtgpu_shmem_destroy(gpu, shmem);
     }
 }

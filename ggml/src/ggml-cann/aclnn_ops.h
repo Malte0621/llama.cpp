@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2023-2024 The ggml authors
+ * Copyright (c) 2023-2026 The ggml authors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -542,6 +542,21 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst);
  *       not equal 1.
  */
 void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
+/**
+ * @brief Pre-load the RoPE cache before ACL graph capture.
+ *
+ * This function must be called outside of graph capture to perform
+ * host-to-device memory copies and device memory allocations that are
+ * not allowed on a captured stream.  After pre-loading, the rope cache
+ * metadata is updated so that the subsequent call to
+ * aclnn_rope_cache_init (inside graph capture) skips these operations
+ * and only records the on-device computations into the captured graph.
+ *
+ * @param ctx  CANN backend context.
+ * @param dst  A ROPE destination tensor from the computation graph.
+ */
+void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
  * @brief   Computes the index of the maximum value along the specified dimension

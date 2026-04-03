@@ -1,11 +1,10 @@
-#include "ggml-impl.h"
 #include "apir_cs.h"
 #include "apir_cs_rpc.h"
+#include "ggml-impl.h"
 
 // ggml_buffer_to_apir_host_handle(ggml_backend_buffer_t buffer);
 
-static inline void apir_encode_ggml_buffer_host_handle(apir_encoder *                    enc,
-                                                       const apir_buffer_host_handle_t * handle);
+static inline void apir_encode_ggml_buffer_host_handle(apir_encoder * enc, const apir_buffer_host_handle_t * handle);
 
 static inline ggml_backend_buffer_t apir_decode_ggml_buffer(apir_decoder * dec);
 
@@ -22,8 +21,7 @@ static inline apir_rpc_tensor * apir_decode_apir_rpc_tensor_inplace(apir_decoder
     return (apir_rpc_tensor *) (uintptr_t) apir_decoder_use_inplace(dec, apir_rpc_tensor_size);
 }
 
-static inline apir_rpc_tensor * apir_decode_apir_rpc_tensor_array_inplace(apir_decoder * dec,
-                                                                          uint32_t       n_tensors) {
+static inline apir_rpc_tensor * apir_decode_apir_rpc_tensor_array_inplace(apir_decoder * dec, uint32_t n_tensors) {
     size_t apir_rpc_tensor_size = sizeof(apir_rpc_tensor) * n_tensors;
 
     return (apir_rpc_tensor *) (uintptr_t) apir_decoder_use_inplace(dec, apir_rpc_tensor_size);
@@ -39,11 +37,17 @@ static inline void apir_encode_ggml_tensor(apir_encoder * enc, const ggml_tensor
 
 static inline const ggml_tensor * apir_decode_ggml_tensor(apir_decoder * dec) {
     const apir_rpc_tensor * apir_rpc_tensor = apir_decode_apir_rpc_tensor_inplace(dec);
+
+    if (!apir_rpc_tensor) {
+        return NULL;
+    }
+
     ggml_init_params params{
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
+        /*.mem_size   =*/ggml_tensor_overhead(),
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
     };
+
     ggml_context * ctx = ggml_init(params);
 
     const ggml_tensor * tensor = apir_deserialize_tensor(ctx, apir_rpc_tensor);
@@ -71,6 +75,10 @@ static inline ggml_backend_buffer_type_t apir_decode_ggml_buffer_type(apir_decod
     return (ggml_backend_buffer_type_t) handle;
 }
 
+static inline void apir_encode_apir_buffer_type_host_handle(apir_encoder * enc, apir_buffer_type_host_handle_t handle) {
+    apir_encoder_write(enc, sizeof(handle), &handle, sizeof(handle));
+}
+
 static inline apir_buffer_type_host_handle_t apir_decode_apir_buffer_type_host_handle(apir_decoder * dec) {
     apir_buffer_type_host_handle_t handle;
 
@@ -94,6 +102,19 @@ static inline ggml_backend_buffer_t apir_decode_ggml_buffer(apir_decoder * dec) 
     size_t                buffer_ptr_size = sizeof(buffer);
 
     apir_decoder_read(dec, buffer_ptr_size, &buffer, buffer_ptr_size);
+
+    // SECURITY: Validate buffer handle against tracked buffers to prevent
+    // guest VM from providing arbitrary host memory addresses
+    if (buffer) {
+        extern std::unordered_set<ggml_backend_buffer_t> backend_buffers;
+        if (backend_buffers.find(buffer) == backend_buffers.end()) {
+            GGML_LOG_WARN("ggml-virtgpu-backend: %s: Invalid buffer handle from guest: %p\n", __func__,
+                          (void *) buffer);
+            // Set fatal flag to prevent further processing with invalid handle
+            apir_decoder_set_fatal(dec);
+            return NULL;
+        }
+    }
 
     return buffer;
 }
@@ -154,13 +175,13 @@ static inline void apir_encode_ggml_tensor_inline(apir_encoder * enc, const ggml
     size_t tensor_size = sizeof(*tensor);
 
     if (tensor->extra) {
-        GGML_ABORT("Cannot pass tensors with extra");
+        GGML_ABORT("%s: Cannot pass tensors with extra", __func__);
     }
 
     if (tensor->src[0] && tensor->buffer) {
         static int first = 1;
         if (first) {
-            GGML_LOG_WARN("Cannot pass tensors with src and buffer\n");
+            GGML_LOG_WARN("%s: Cannot pass tensors with src and buffer\n", __func__);
             first = 0;
         }
     }

@@ -1,5 +1,6 @@
 #pragma once
 
+// clang-format off
 #include "virtgpu-utils.h"
 #include "virtgpu-shm.h"
 #include "virtgpu-apir.h"
@@ -17,24 +18,27 @@
 
 #include <cstring>
 
+#include "ggml-remoting.h"
+
 #define VIRGL_RENDERER_UNSTABLE_APIS 1
 #include "apir_hw.h"
 #include <drm/virtgpu_drm.h>
 #include "venus_hw.h"
+// clang-format on
 
 #ifndef VIRTGPU_DRM_CAPSET_APIR
 // Will be defined include/drm/virtgpu_drm.h when
 // https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1590/diffs
 // is merged
-#define VIRTGPU_DRM_CAPSET_APIR 10
+#    define VIRTGPU_DRM_CAPSET_APIR 10
 #endif
 
 // Mesa/Virlgrenderer Venus internal. Only necessary during the
 // Venus->APIR transition in Virglrenderer
 #define VENUS_COMMAND_TYPE_LENGTH 331
 
-#ifndef VIRTGPU_DRM_CAPSET_VENUS // only available with Linux >= v6.16
-#define VIRTGPU_DRM_CAPSET_VENUS 4
+#ifndef VIRTGPU_DRM_CAPSET_VENUS  // only available with Linux >= v6.16
+#    define VIRTGPU_DRM_CAPSET_VENUS 4
 #endif
 
 typedef uint32_t virgl_renderer_capset;
@@ -73,6 +77,27 @@ struct virtgpu {
     /* APIR communication pages */
     virtgpu_shmem reply_shmem;
     virtgpu_shmem data_shmem;
+
+    /* Mutex to protect shared data_shmem buffer from concurrent access */
+    mtx_t data_shmem_mutex;
+
+    /* Cached device information to prevent memory leaks and race conditions */
+    struct {
+        char *   description;
+        char *   name;
+        int32_t  device_count;
+        uint32_t type;
+        size_t   memory_free;
+        size_t   memory_total;
+    } cached_device_info;
+
+    /* Cached buffer type information to prevent memory leaks and race conditions */
+    struct {
+        apir_buffer_type_host_handle_t host_handle;
+        char *                         name;
+        size_t                         alignment;
+        size_t                         max_size;
+    } cached_buffer_type;
 };
 
 static inline int virtgpu_ioctl(virtgpu * gpu, unsigned long request, void * args) {

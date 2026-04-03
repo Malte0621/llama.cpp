@@ -36,18 +36,22 @@ uint32_t backend_buffer_type_get_max_size(apir_encoder * enc, apir_decoder * dec
     ggml_backend_buffer_type_t buft;
     buft = apir_decode_ggml_buffer_type(dec);
 
-    size_t value = buft->iface.get_max_size(buft);
+    size_t value = SIZE_MAX;
+    if (buft->iface.get_max_size) {
+        value = buft->iface.get_max_size(buft);
+    }
+
     apir_encode_size_t(enc, &value);
 
     return 0;
 }
 
+/* APIR_COMMAND_TYPE_BUFFER_TYPE_IS_HOST is deprecated. Keeping the handler for backward compatibility. */
 uint32_t backend_buffer_type_is_host(apir_encoder * enc, apir_decoder * dec, virgl_apir_context * ctx) {
     GGML_UNUSED(ctx);
-    ggml_backend_buffer_type_t buft;
-    buft = apir_decode_ggml_buffer_type(dec);
+    GGML_UNUSED(dec);
+    const bool is_host = false;
 
-    bool is_host = buft->iface.is_host(buft);
     apir_encode_bool_t(enc, &is_host);
 
     return 0;
@@ -81,7 +85,19 @@ uint32_t backend_buffer_type_get_alloc_size(apir_encoder * enc, apir_decoder * d
 
     const ggml_tensor * op = apir_decode_ggml_tensor_inplace(dec);
 
-    size_t value = buft->iface.get_alloc_size(buft, op);
+    // Check for decode error
+    if (op == nullptr) {
+        GGML_LOG_ERROR(GGML_VIRTGPU_BCK "%s: Failed to decode tensor\n", __func__);
+        apir_decoder_set_fatal(dec);
+        return 1;
+    }
+
+    size_t value;
+    if (buft->iface.get_alloc_size) {
+        value = buft->iface.get_alloc_size(buft, op);
+    } else {
+        value = ggml_nbytes(op);  // Default fallback
+    }
 
     apir_encode_size_t(enc, &value);
 
