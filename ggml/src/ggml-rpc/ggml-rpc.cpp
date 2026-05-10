@@ -17,7 +17,6 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
-#include "rpc-transport.h"
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -26,15 +25,6 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 
 namespace fs = std::filesystem;
-
-static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
-
-#ifdef _WIN32
-typedef SOCKET sockfd_t;
-using ssize_t = __int64;
-#else
-typedef int sockfd_t;
-#endif
 
 // macro for nicer error messages on server crash
 #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")

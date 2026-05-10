@@ -4,7 +4,7 @@ option(GGML_RPC_RDMA "Enable RDMA transport for RPC backend" OFF)
 
 set(RPC_SOURCES
     ggml-rpc.cpp
-    rpc-transport.cpp
+    transport.cpp
 )
 
 ggml_add_backend_library(ggml-rpc ${RPC_SOURCES})
