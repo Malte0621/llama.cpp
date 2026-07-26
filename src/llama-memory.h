@@ -64,6 +64,10 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
+    // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
+    virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

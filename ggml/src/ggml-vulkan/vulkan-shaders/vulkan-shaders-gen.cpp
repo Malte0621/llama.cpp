@@ -72,6 +72,7 @@ const std::vector<std::string> type_names = {
     "iq4_nl",
     "mxfp4",
     "nvfp4",
+    "tq4_1s",
     "bf16",
 };
 
@@ -590,6 +591,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
+        // TQ4_1S uses dequantization fallback for matrix-matrix products.
+        if (tname == "tq4_1s") {
+            continue;
+        }
 
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For aligned matmul loads
@@ -701,6 +706,19 @@ void process_shaders() {
             string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"MMQ", "1"}, {"FA_MMQ_MIXED", "1"}}), fp16, false, false, f16acc, "_int8");
 #endif
+            // TurboQuant3 FA: SPIR-V generation is DISABLED pending the turbo3 FA
+            // re-port onto upstream's evolved flash-attention shader. glslc hangs
+            // (infinite optimizer loop) compiling flash_attn.comp with
+            // DATA_A_TURBO3_0 against the current FA base, which blocks the entire
+            // Vulkan build. These variants are not wired into the runtime
+            // (flash_attn_f32_f16_turbo3_0_* is referenced nowhere in
+            // ggml-vulkan.cpp), so skipping generation has no runtime effect: a
+            // turbo3 K/V flash-attention path falls back as before. Re-enable once
+            // the turbo3 FA shader is reconciled with the new base.
+            // string_to_spv("flash_attn_f32_f16_turbo3_0", "flash_attn.comp",
+            //     merge_maps(fa_base_dict, {{"DATA_A_TURBO3_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+            // string_to_spv("flash_attn_f32_f16_turbo3_0", "flash_attn_cm1.comp",
+            //     merge_maps(fa_base_dict, {{"DATA_A_TURBO3_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
         }
     }
 
@@ -731,7 +749,7 @@ void process_shaders() {
     for (const auto& tname : type_names) {
         // mul mat vec
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-        std::string shader = (string_ends_with(tname, "_k") || string_starts_with(tname, "iq1_") || string_starts_with(tname, "iq2_") || string_starts_with(tname, "iq3_")) ? "mul_mat_vec_" + tname + ".comp" : "mul_mat_vec.comp";
+        std::string shader = (string_ends_with(tname, "_k") || string_starts_with(tname, "iq1_") || string_starts_with(tname, "iq2_") || string_starts_with(tname, "iq3_") || tname == "tq4_1s") ? "mul_mat_vec_" + tname + ".comp" : "mul_mat_vec.comp";
 
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
@@ -829,12 +847,18 @@ void process_shaders() {
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
+    // TQ4_1S copy-to-quant is only valid through SET_ROWS.
+    string_to_spv("cpy_tq4_1s_f32", "copy_from_quant.comp", {{"DATA_A_TQ4_1S", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
     for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
-        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "turbo2_0", "turbo3_0", "turbo4_0", "tq4_1s"}) {
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         }
     }
+
+    // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
+    string_to_spv("turbo_wht", "turbo_wht.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

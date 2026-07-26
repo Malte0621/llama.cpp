@@ -120,6 +120,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    ggml_tensor * get_turbo_innerq_scale_inv() const override;
+
     //
     // llama_memory_hybrid_context
     //

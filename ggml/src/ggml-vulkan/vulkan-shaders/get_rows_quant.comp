@@ -6,10 +6,71 @@
 #include "generic_binary_head.glsl"
 #include "dequant_funcs.glsl"
 
+#if defined(DATA_A_TQ4_1S)
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 void main() {
-    const uint i00 = (gl_GlobalInvocationID.x)*2;
+#if defined(DATA_A_TQ4_1S)
+    const uint ib0 = gl_GlobalInvocationID.x;
+    const uint i00 = ib0 * QUANT_K;
+
+    if (i00 >= p.ne00) {
+        return;
+    }
+
+    const float signs[32] = float[32](
+        +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+        -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+    );
+    const float inv_sqrt32 = 0.17677669529663688;
+
+    uint gid_z = gl_GlobalInvocationID.z;
+    while (gid_z < p.ne11 * p.ne12) {
+        uint gid_y = gl_GlobalInvocationID.y;
+        while (gid_y < p.ne10) {
+            const uint i10 = gid_y;
+            const uint i11 = gid_z / p.ne12;
+            const uint i12 = gid_z % p.ne12;
+
+            const uint i01 = data_b[i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+            const uint a_offset = i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+            const uint d_offset = i10*p.nb21 + i11*p.nb22 + i12*p.nb23 + i00;
+            const uint ib = a_offset + ib0;
+
+            float buf[32];
+            for (int j = 0; j < 32; j += 2) {
+                const vec2 v = dequantize(ib, uint(j), 0);
+                buf[j] = v.x;
+                buf[j + 1] = v.y;
+            }
+
+            for (uint step = 1u; step < 32u; step <<= 1u) {
+                for (uint i = 0u; i < 32u; i += step * 2u) {
+                    for (uint j = i; j < i + step; ++j) {
+                        const float a = buf[j];
+                        const float b = buf[j + step];
+                        buf[j] = a + b;
+                        buf[j + step] = a - b;
+                    }
+                }
+            }
+
+            for (uint j = 0u; j < 32u; ++j) {
+                data_d[d_offset + j] = D_TYPE(buf[j] * inv_sqrt32 * signs[j]);
+            }
+
+            gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+        gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+    }
+#else
+    const uint i00 = gl_GlobalInvocationID.x * 2;
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -48,4 +109,5 @@ void main() {
         }
         gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
     }
+#endif
 }

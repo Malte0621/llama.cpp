@@ -661,7 +661,7 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy,
                                                     const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -682,7 +682,7 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1078,7 +1078,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy,
                                                     const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1099,7 +1099,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1346,7 +1346,7 @@ static void reorder_mul_mat_vec_q3_k_q8_1_sycl(const void * vx, const void * vy,
     GGML_ASSERT(ncols % QK_K == 0);
 
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1367,7 +1367,7 @@ static void reorder_mul_mat_vec_q3_k_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1513,7 +1513,7 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy,
     GGML_ASSERT(ncols % QK_K == 0);
 
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1535,7 +1535,7 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
 
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1640,7 +1640,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy,
                                                const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
 
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1662,7 +1662,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
 
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1698,7 +1698,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
                                                const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -1720,7 +1720,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    constexpr size_t num_subgroups = WARP_SIZE;
+    constexpr size_t num_subgroups = 256 / WARP_SIZE;
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);

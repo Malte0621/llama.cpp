@@ -3,10 +3,10 @@
 from glob import glob
 import os
 
-HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
+HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576, 640]
 
 # DKQ -> DV override for asymmetric head dims.
-HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
+HEAD_SIZES_V_OVERRIDE = {640: 512, 576: 512, 320: 256, 192: 128}
 
 TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
 
@@ -96,7 +96,9 @@ for ncols in [8, 16, 32, 64]:
                     continue
                 if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
                     continue
-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
+                if head_size_kq == 640 and ncols2 != 16: # GLM 4.7 Flash with padded TurboQuant KV
+                    continue
+                if head_size_kq not in (192, 320, 576, 640) and ncols2 in (16, 32):
                     continue
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
