@@ -5,7 +5,7 @@
 // argmax/entropy/multinomial and self-conditioning stay on the GPU (Stage 1 + Stage 2).
 //
 // Tokenization, chat templating and detokenization all happen here, from the GGUF's own embedded tokenizer
-// + chat template (same path as llama-diffusion-cli), so the client needs no tokenizer files of its own.
+// + chat template (same path as llama-cli), so the client needs no tokenizer files of its own.
 //
 // Protocol (synchronous, one request per line on stdin):
 //   stdin  : a line containing a request-file path R

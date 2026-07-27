@@ -7,7 +7,7 @@ More Info:
 - https://github.com/ggml-org/llama.cpp/pull/14771
 
 ## Parameters
-The diffusion CLI supports various parameters to control the generation process:
+`llama-cli` automatically detects diffusion GGUF models and supports these generation parameters:
 
 ### Core Diffusion Parameters
 - `--diffusion-steps`: Number of diffusion steps (default: 256)
@@ -18,7 +18,9 @@ The diffusion CLI supports various parameters to control the generation process:
   - `3`: DIFFUSION_ALGORITHM_RANDOM - Random selection
   - `4`: DIFFUSION_ALGORITHM_CONFIDENCE_BASED - Confidence-based selection (default)
   - More documentation here https://github.com/DreamLM/Dream
-- `--diffusion-visual`: Enable live visualization during generation
+- `--diffusion-visual`: Repaint the denoising canvas in place during generation
+- `--diffusion-visual-progress`: Include the step progress bar in the visual viewport
+- `--diffusion-visual-interval N`: Repaint every Nth denoising step
 
 ### Scheduling Parameters
 Choose one of the following scheduling methods:
@@ -45,15 +47,15 @@ Choose one of the following scheduling methods:
 ### Examples
 #### Dream architecture:
 ```
-llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-eps 0.001 --diffusion-algorithm 3 --diffusion-steps 256 --diffusion-visual
+llama-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-eps 0.001 --diffusion-algorithm 3 --diffusion-steps 256 --diffusion-visual
 ```
 
 #### LLaDA architecture:
 ```
-llama-diffusion-cli -m llada-8b.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-block-length 32 --diffusion-steps 256 --diffusion-visual
+llama-cli -m llada-8b.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-block-length 32 --diffusion-steps 256 --diffusion-visual
 ```
 
 #### RND1 architecture:
 ```
-llama-diffusion-cli -m RND1-Base-0910.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-algorithm 1 --diffusion-steps 256 --diffusion-visual --temp 0.5 --diffusion-eps 0.001
+llama-cli -m RND1-Base-0910.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-algorithm 1 --diffusion-steps 256 --diffusion-visual --temp 0.5 --diffusion-eps 0.001
 ```

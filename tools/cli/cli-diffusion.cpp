@@ -1,4 +1,4 @@
-#include "arg.h"
+#include "cli-diffusion.h"
 #include "chat.h"
 #include "common.h"
 #include "diffusion.h"
@@ -19,7 +19,6 @@
 #endif
 
 #include <algorithm>
-#include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -75,7 +74,7 @@ static bool diffusion_step_callback(int32_t             step,
     auto print_progress_bar = [](int32_t step, int32_t total_steps) {
         int progress_percent = (step * 100) / total_steps;
         int progress_bars    = (step * 50) / total_steps;
-        LOG_INF("\rdiffusion step: %d/%d [%s%s] %d%%",
+        LOG("\rdiffusion step: %d/%d [%s%s] %d%%",
                 step,
                 total_steps,
                 std::string(progress_bars, '=').c_str(),
@@ -140,19 +139,7 @@ static bool diffusion_step_callback(int32_t             step,
     return true;
 }
 
-int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
-    ggml_time_init();
-
-    common_params params;
-
-    common_init();
-
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_DIFFUSION)) {
-        return 1;
-    }
-
+int llama_cli_diffusion(common_params & params) {
     llama_backend_init();
     ggml_backend_load_all();
 
@@ -161,12 +148,14 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
     if (!model) {
         LOG_ERR("error: failed to load model '%s'\n", params.model.path.c_str());
+        llama_backend_free();
         return 1;
     }
 
     if (!llama_model_is_diffusion(model)) {
-        LOG_ERR("error: unsupported model for diffusion");
+        LOG_ERR("error: unsupported model for diffusion\n");
         llama_model_free(model);
+        llama_backend_free();
         return 1;
     }
 
@@ -231,6 +220,7 @@ int main(int argc, char ** argv) {
     if (!ctx) {
         LOG_ERR("error: failed to create context\n");
         llama_model_free(model);
+        llama_backend_free();
         return 1;
     }
 
@@ -592,11 +582,12 @@ int main(int argc, char ** argv) {
         return response;
     };
 
-    if (params.conversation_mode == COMMON_CONVERSATION_MODE_ENABLED) {
+    if (params.conversation_mode != COMMON_CONVERSATION_MODE_DISABLED) {
         if (!params.enable_chat_template) {
             LOG_ERR("error: conversation mode requires a chat template\n");
             llama_free(ctx);
             llama_model_free(model);
+            llama_backend_free();
             return 1;
         }
 
@@ -607,7 +598,7 @@ int main(int argc, char ** argv) {
             messages.push_back(make_msg("system", params.system_prompt));
         }
 
-        LOG_INF("conversation mode: /help for commands, /clear to reset, /exit to quit\n");
+        LOG("conversation mode: /help for commands, /clear to reset, /exit to quit\n");
 
         std::string pending = params.prompt;  // optional first user turn supplied via -p
         while (true) {
@@ -648,6 +639,9 @@ int main(int argc, char ** argv) {
             messages.push_back(make_msg("user", user));
             const std::string response = run_turn_reply(apply_template(messages));
             messages.push_back(make_msg("assistant", response));
+            if (params.single_turn) {
+                break;
+            }
         }
     } else {
         std::string formatted = params.prompt;

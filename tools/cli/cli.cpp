@@ -1,8 +1,10 @@
 #include "arg.h"
 #include "common.h"
 #include "log.h"
+#include "gguf.h"
 
 #include "cli-context.h"
+#include "cli-diffusion.h"
 
 #include <signal.h>
 
@@ -26,6 +28,29 @@ static void signal_handler(int) {
     cli_context::interrupted().store(true);
 }
 #endif
+
+static bool is_diffusion_model(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    gguf_init_params params = { true, nullptr };
+    gguf_context * metadata = gguf_init_from_file(path.c_str(), params);
+    if (!metadata) {
+        return false;
+    }
+
+    bool result = false;
+    const int64_t key = gguf_find_key(metadata, "general.architecture");
+    if (key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_STRING) {
+        const std::string arch = gguf_get_val_str(metadata, key);
+        result = arch == "dream" || arch == "llada" || arch == "llada-moe" ||
+                 arch == "rnd1" || arch == "diffusion-gemma";
+    }
+
+    gguf_free(metadata);
+    return result;
+}
 
 // satisfies -Wmissing-declarations
 int llama_cli(int argc, char ** argv);
@@ -54,6 +79,10 @@ int llama_cli(int argc, char ** argv) {
     };
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
+
+    if (params.server_base.empty() && is_diffusion_model(params.model.path)) {
+        return llama_cli_diffusion(params);
+    }
 
     cli_context ctx_cli(params);
 
