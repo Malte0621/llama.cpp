@@ -596,6 +596,7 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_NANOQUANT_LINEAR,
         GGML_OP_COUNT,
     };
 
@@ -622,6 +623,7 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        GGML_UNARY_OP_SGN_STE,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -659,6 +661,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_GRAD    = 32, // ...requires a retained gradient
     };
 
     enum ggml_tri_type {
@@ -888,6 +891,7 @@ extern "C" {
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
+    GGML_API void ggml_set_grad(struct ggml_tensor * tensor);
 
     //
     // operations on tensors with backpropagation
@@ -1117,6 +1121,11 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_sgn_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // sign in the forward pass and identity in the backward pass
+    GGML_API struct ggml_tensor * ggml_sgn_ste(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
@@ -1989,7 +1998,6 @@ extern "C" {
 
 
     // clamp
-    // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_clamp(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2653,6 +2661,31 @@ extern "C" {
             int                   direction,
             int                   group_size,
             struct ggml_tensor  * scale);
+
+    // Marks a logical F32 matrix as a packed NanoQuant weight. ggml_mul_mat expands it to ggml_nanoquant_linear.
+    GGML_API void ggml_set_nanoquant_weight(
+            struct ggml_tensor * weight,
+            struct ggml_tensor * v_bits,
+            struct ggml_tensor * u_bits,
+            struct ggml_tensor * scale_pre,
+            struct ggml_tensor * scale_post);
+
+    // W x = scale_post * U * V^T * (scale_pre * x), with U and V packed as -1/+1 sign bits.
+    GGML_API struct ggml_tensor * ggml_nanoquant_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_post);
+
+    GGML_API struct ggml_tensor * ggml_nanoquant_linear_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_post);
 
     // custom operators
 

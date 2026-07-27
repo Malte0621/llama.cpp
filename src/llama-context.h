@@ -24,6 +24,21 @@ class llama_io_write_i;
 struct llama_memory_i;
 struct llama_memory_context_i;
 
+enum class llama_nanoquant_opt_loss {
+    MSE,
+    CROSS_ENTROPY,
+};
+
+struct llama_nanoquant_opt_param {
+    ggml_tensor * tensor;
+    float learning_rate;
+    float minimum;
+    std::vector<float> * first_moment;
+    std::vector<float> * second_moment;
+};
+
+struct llama_nanoquant_optimizer;
+
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
@@ -215,6 +230,29 @@ struct llama_context {
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
+
+    llama_nanoquant_optimizer * nanoquant_optimizer_init(
+            llama_nanoquant_opt_loss loss,
+            int32_t block,
+            const std::vector<llama_nanoquant_opt_param> & params,
+            uint64_t step,
+            const char * output_gradient_target = nullptr);
+
+    void nanoquant_optimizer_free(llama_nanoquant_optimizer * optimizer);
+
+    float nanoquant_optimizer_step(
+            llama_nanoquant_optimizer * optimizer,
+            llama_batch & batch,
+            const llama_token * tokens,
+            int32_t n_tokens,
+            const float * labels,
+            size_t n_labels,
+            const float * output_weights,
+            size_t n_output_weights,
+            float learning_rate_scale);
+
+    std::vector<float> nanoquant_optimizer_output_importance(
+            const llama_nanoquant_optimizer * optimizer) const;
 
 private:
     //

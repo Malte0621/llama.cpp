@@ -62,6 +62,7 @@
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/nanoquant.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -2086,6 +2087,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
             break;
+        case GGML_OP_NANOQUANT_LINEAR:
+            ggml_cuda_nanoquant_linear(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -2123,6 +2127,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_abs(ctx, dst);
                     break;
                 case GGML_UNARY_OP_SGN:
+                    ggml_cuda_op_sgn(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_SGN_STE:
                     ggml_cuda_op_sgn(ctx, dst);
                     break;
                 case GGML_UNARY_OP_NEG:
@@ -4791,6 +4798,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_SGN_STE:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_GELU:
@@ -5117,6 +5125,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TURBO_WHT:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 32 == 0;
+        case GGML_OP_NANOQUANT_LINEAR:
+            {
+                const auto is_scale = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+                return op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[2]->type == GGML_TYPE_I32 &&
+                       is_scale(op->src[3]->type) &&
+                       is_scale(op->src[4]->type) &&
+                       op->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous(op->src[0]) &&
+                       ggml_is_contiguous(op->src[1]) &&
+                       ggml_is_contiguous(op->src[2]) &&
+                       ggml_is_contiguous(op->src[3]) &&
+                       ggml_is_contiguous(op->src[4]) &&
+                       ggml_is_contiguous(op);
+            }
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

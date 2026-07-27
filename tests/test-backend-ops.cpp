@@ -2005,8 +2005,9 @@ struct test_unary : public test_case {
         : op(op), type(type), ne_a(ne_a), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
-            op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
+        const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN ||
+            op == GGML_UNARY_OP_SGN_STE || op == GGML_UNARY_OP_NEG || op == GGML_UNARY_OP_STEP ||
+            op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_GELU || op == GGML_UNARY_OP_SILU ||
             op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
 
         ggml_tensor * a;
@@ -2065,6 +2066,9 @@ struct test_unary : public test_case {
         }
         if (op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_STEP) {
             return {0.0f};
+        }
+        if (op == GGML_UNARY_OP_SGN_STE) {
+            return {1.0f};
         }
         if (op == GGML_UNARY_OP_RELU) {
             return {0.0f, 1.0f};
@@ -2267,8 +2271,7 @@ struct test_get_rows : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = ggml_is_matrix(in) && ggml_is_vector(rows);
-        if (grad_supported) {
+        if (type == GGML_TYPE_F32) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
         }
@@ -2405,6 +2408,10 @@ struct test_set_rows : public test_case {
 
         ggml_tensor * src = ggml_new_tensor_4d(ctx, type_src, ne[0], r,     ne[2]*nr23[0], ne[3]*nr23[1]);
         ggml_set_name(src, "src");
+
+        if (type_src == GGML_TYPE_F32 && type_dst == GGML_TYPE_F32) {
+            ggml_set_param(src);
+        }
 
         ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, type_idx, r, ne[2], ne[3]);
         ggml_set_name(row_idxs, "row_idxs");
@@ -4471,6 +4478,10 @@ struct test_mul_mat_id : public test_case {
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
 
+        if (type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
+            ggml_set_param(b);
+        }
+
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
 
@@ -4819,6 +4830,9 @@ struct test_clamp : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(a, "a");
+        if (type == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
         ggml_set_name(out, "out");
@@ -6793,6 +6807,174 @@ struct test_leaky_relu : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// GGML_OP_NANOQUANT_LINEAR
+struct test_nanoquant_linear : public test_case {
+    const int64_t n_in;
+    const int64_t n_out;
+    const int64_t n_rank;
+    const int64_t n_vectors;
+    const ggml_type scale_type;
+    const bool transparent;
+
+    std::vector<float> expected;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_in, n_out, n_rank, n_vectors, scale_type, transparent);
+    }
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != expected.size()) {
+            return INFINITY;
+        }
+        return std::max(nmse(a, expected.data(), n), nmse(b, expected.data(), n));
+    }
+
+    test_nanoquant_linear(
+            int64_t n_in,
+            int64_t n_out,
+            int64_t n_rank,
+            int64_t n_vectors,
+            ggml_type scale_type,
+            bool transparent = false)
+        : n_in(n_in), n_out(n_out), n_rank(n_rank), n_vectors(n_vectors),
+          scale_type(scale_type), transparent(transparent) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_vectors);
+        ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (n_in + 31)/32, n_rank);
+        ggml_tensor * u = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (n_rank + 31)/32, n_out);
+        ggml_tensor * scale_pre = ggml_new_tensor_1d(ctx, scale_type, n_in);
+        ggml_tensor * scale_post = ggml_new_tensor_1d(ctx, scale_type, n_out);
+        ggml_set_param(x);
+        if (scale_type == GGML_TYPE_F32) {
+            ggml_set_param(scale_pre);
+            ggml_set_param(scale_post);
+        }
+        ggml_set_name(x, "x");
+        ggml_set_name(v, "v");
+        ggml_set_name(u, "u");
+        ggml_set_name(scale_pre, "scale_pre");
+        ggml_set_name(scale_post, "scale_post");
+
+        ggml_tensor * out;
+        if (transparent) {
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_out);
+            ggml_set_nanoquant_weight(weight, v, u, scale_pre, scale_post);
+            out = ggml_mul_mat(ctx, weight, x);
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+            ggml_mul_mat_set_hint(out, GGML_HINT_NONE);
+        } else {
+            out = ggml_nanoquant_linear(ctx, x, v, u, scale_pre, scale_post);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+
+        ggml_tensor * x = ggml_get_tensor(ctx, "x");
+        ggml_tensor * v = ggml_get_tensor(ctx, "v");
+        ggml_tensor * u = ggml_get_tensor(ctx, "u");
+        ggml_tensor * scale_pre = ggml_get_tensor(ctx, "scale_pre");
+        ggml_tensor * scale_post = ggml_get_tensor(ctx, "scale_post");
+
+        std::vector<float> x_data(n_in*n_vectors);
+        for (int64_t iv = 0; iv < n_vectors; ++iv) {
+            for (int64_t i = 0; i < n_in; ++i) {
+                x_data[iv*n_in + i] = float((i*13 + iv*7) % 17 - 8)*0.125f + 0.03125f;
+            }
+        }
+
+        const int64_t v_words = (n_in + 31)/32;
+        const int64_t u_words = (n_rank + 31)/32;
+        std::vector<uint32_t> v_data(v_words*n_rank);
+        std::vector<uint32_t> u_data(u_words*n_out);
+        for (int64_t ir = 0; ir < n_rank; ++ir) {
+            for (int64_t i = 0; i < v_words*32; ++i) {
+                if ((i + 3*ir) % 7 < 3) {
+                    v_data[ir*v_words + i/32] |= UINT32_C(1) << (i % 32);
+                }
+            }
+        }
+        for (int64_t io = 0; io < n_out; ++io) {
+            for (int64_t ir = 0; ir < u_words*32; ++ir) {
+                if ((2*ir + 5*io) % 11 < 5) {
+                    u_data[io*u_words + ir/32] |= UINT32_C(1) << (ir % 32);
+                }
+            }
+        }
+
+        std::vector<float> pre_data(n_in);
+        std::vector<float> post_data(n_out);
+        for (int64_t i = 0; i < n_in; ++i) {
+            pre_data[i] = 0.5f*float(UINT32_C(1) << (i % 3));
+        }
+        for (int64_t i = 0; i < n_out; ++i) {
+            post_data[i] = 0.25f*float(UINT32_C(1) << (i % 4));
+        }
+
+        ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size()*sizeof(float));
+        ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size()*sizeof(uint32_t));
+        ggml_backend_tensor_set(u, u_data.data(), 0, u_data.size()*sizeof(uint32_t));
+
+        const auto set_scale = [](ggml_tensor * tensor, const std::vector<float> & data) {
+            switch (tensor->type) {
+                case GGML_TYPE_F32:
+                    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+                    break;
+                case GGML_TYPE_F16:
+                    {
+                        std::vector<ggml_fp16_t> converted(data.size());
+                        ggml_fp32_to_fp16_row(data.data(), converted.data(), data.size());
+                        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size()*sizeof(ggml_fp16_t));
+                    } break;
+                case GGML_TYPE_BF16:
+                    {
+                        std::vector<ggml_bf16_t> converted(data.size());
+                        ggml_fp32_to_bf16_row(data.data(), converted.data(), data.size());
+                        ggml_backend_tensor_set(tensor, converted.data(), 0, converted.size()*sizeof(ggml_bf16_t));
+                    } break;
+                default:
+                    GGML_ABORT("unsupported NanoQuant scale type");
+            }
+        };
+        set_scale(scale_pre, pre_data);
+        set_scale(scale_post, post_data);
+
+        std::vector<float> tmp(n_rank*n_vectors);
+        for (int64_t iv = 0; iv < n_vectors; ++iv) {
+            for (int64_t ir = 0; ir < n_rank; ++ir) {
+                float sum = 0.0f;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    const float value = x_data[iv*n_in + i]*pre_data[i];
+                    sum += (v_data[ir*v_words + i/32] & (UINT32_C(1) << (i % 32))) ? -value : value;
+                }
+                tmp[iv*n_rank + ir] = sum;
+            }
+        }
+
+        expected.resize(n_out*n_vectors);
+        for (int64_t iv = 0; iv < n_vectors; ++iv) {
+            for (int64_t io = 0; io < n_out; ++io) {
+                float sum = 0.0f;
+                for (int64_t ir = 0; ir < n_rank; ++ir) {
+                    const float value = tmp[iv*n_rank + ir];
+                    sum += (u_data[io*u_words + ir/32] & (UINT32_C(1) << (ir % 32))) ? -value : value;
+                }
+                expected[iv*n_out + io] = sum*post_data[io];
+            }
+        }
     }
 };
 
@@ -9685,6 +9867,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // NanoQuant binary-factorized linear
+    for (ggml_type scale_type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_nanoquant_linear(65, 43, 37, 3, scale_type));
+        test_cases.emplace_back(new test_nanoquant_linear(128, 96, 64, 7, scale_type));
+    }
+    test_cases.emplace_back(new test_nanoquant_linear(65, 43, 37, 3, GGML_TYPE_F32, true));
+
     // TURBO_WHT tests
     for (int dir : {0, 1}) {
         for (int64_t hd : {128, 256, 512}) {
@@ -10267,6 +10456,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // NanoQuant Llama-class projection: token generation and prompt processing.
+    test_cases.emplace_back(new test_nanoquant_linear(4096, 4096, 2048, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_nanoquant_linear(4096, 4096, 2048, 16, GGML_TYPE_F16));
 
     return test_cases;
 }

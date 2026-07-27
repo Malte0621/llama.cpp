@@ -1201,10 +1201,24 @@ size_t gguf_get_tensor_size(const struct gguf_context * ctx, int64_t tensor_id) 
     return ggml_nbytes(&ctx->info[tensor_id].t);
 }
 
+static void gguf_update_tensor_offsets(struct gguf_context * ctx) {
+    uint64_t offset = 0;
+    for (struct gguf_tensor_info & info : ctx->info) {
+        info.offset = offset;
+        const size_t size = GGML_PAD(ggml_nbytes(&info.t), ctx->alignment);
+        GGML_ASSERT(offset <= UINT64_MAX - size);
+        offset += size;
+    }
+}
+
 int64_t gguf_remove_key(struct gguf_context * ctx, const char * key) {
     const int64_t key_id = gguf_find_key(ctx, key);
     if (key_id >= 0) {
         ctx->kv.erase(ctx->kv.begin() + key_id);
+        if (strcmp(key, GGUF_KEY_GENERAL_ALIGNMENT) == 0) {
+            ctx->alignment = GGUF_DEFAULT_ALIGNMENT;
+            gguf_update_tensor_offsets(ctx);
+        }
     }
     return key_id;
 }
@@ -1249,6 +1263,10 @@ void gguf_set_val_u32(struct gguf_context * ctx, const char * key, uint32_t val)
     gguf_check_reserved_keys(key, val);
     gguf_remove_key(ctx, key);
     ctx->kv.emplace_back(key, val);
+    if (strcmp(key, GGUF_KEY_GENERAL_ALIGNMENT) == 0) {
+        ctx->alignment = val;
+        gguf_update_tensor_offsets(ctx);
+    }
 }
 
 void gguf_set_val_i32(struct gguf_context * ctx, const char * key, int32_t val) {

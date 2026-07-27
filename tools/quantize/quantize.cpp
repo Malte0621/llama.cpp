@@ -49,6 +49,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
     { "TQ3_1S",   LLAMA_FTYPE_MOSTLY_TQ3_1S,   " 4.00 bpw WHT-rotated",             },
     { "TQ4_1S",   LLAMA_FTYPE_MOSTLY_TQ4_1S,   " 5.00 bpw WHT-rotated",             },
+    { "NANOQUANT", LLAMA_FTYPE_MOSTLY_NANOQUANT, " low-rank binary NanoQuant", },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.96G, +3.1836 ppl @ Llama-3-8B",  },
     { "IQ3_XXS",  LLAMA_FTYPE_MOSTLY_IQ3_XXS,  " 3.06 bpw quantization",            },
@@ -125,6 +126,11 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--nanoquant-calibration-dataset] [--nanoquant-sequence-length] [--nanoquant-sample-count]\n");
+    printf("       [--nanoquant-target-bits] [--nanoquant-admm-outer] [--nanoquant-admm-inner]\n");
+    printf("       [--nanoquant-nonfactor-epochs] [--nanoquant-factor-epochs] [--nanoquant-model-epochs]\n");
+    printf("       [--nanoquant-nonfactor-lr] [--nanoquant-factor-lr] [--nanoquant-model-lr]\n");
+    printf("       [--nanoquant-checkpoint-dir] [--nanoquant-resume] [--nanoquant-seed]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -164,6 +170,42 @@ static void usage(const char * executable) {
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("  --nanoquant-calibration-dataset PATH\n");
+    printf("                                      UTF-8 text or Parquet calibration dataset; required for NANOQUANT conversion\n");
+    printf("  --nanoquant-calibration-column NAME\n");
+    printf("                                      Parquet string column (default: auto-detect text, content, or prompt)\n");
+    printf("  --nanoquant-device NAME\n");
+    printf("                                      primary training device (default: best available backend)\n");
+    printf("  --nanoquant-gpu-layers N\n");
+    printf("                                      transformer layers offloaded while training; negative means all (default: -1)\n");
+    printf("  --nanoquant-sequence-length N\n");
+    printf("                                      tokens per deterministic calibration sample (default: 2048)\n");
+    printf("  --nanoquant-sample-count N\n");
+    printf("                                      number of deterministic calibration samples (default: 128)\n");
+    printf("  --nanoquant-target-bits F\n");
+    printf("                                      target physical bits per original matrix weight (default: 1.0)\n");
+    printf("  --nanoquant-admm-outer N\n");
+    printf("                                      LB-ADMM outer iterations (default: 400)\n");
+    printf("  --nanoquant-admm-inner N\n");
+    printf("                                      SVID power iterations per projection (default: 5)\n");
+    printf("  --nanoquant-nonfactor-epochs N\n");
+    printf("                                      full-precision block reconstruction epochs (default: 8)\n");
+    printf("  --nanoquant-factor-epochs N\n");
+    printf("                                      STE factor/block reconstruction epochs (default: 8)\n");
+    printf("  --nanoquant-model-epochs N\n");
+    printf("                                      scale-only teacher/student KL epochs (default: 8)\n");
+    printf("  --nanoquant-nonfactor-lr F\n");
+    printf("                                      full-precision reconstruction learning rate (default: 1e-4)\n");
+    printf("  --nanoquant-factor-lr F\n");
+    printf("                                      latent factor/scale learning rate (default: 1e-5)\n");
+    printf("  --nanoquant-model-lr F\n");
+    printf("                                      final model scale learning rate (default: 1e-5)\n");
+    printf("  --nanoquant-checkpoint-dir PATH\n");
+    printf("                                      deterministic checkpoint directory (default: OUTPUT.nq-checkpoint)\n");
+    printf("  --nanoquant-resume\n");
+    printf("                                      resume after validating source, dataset, and configuration hashes\n");
+    printf("  --nanoquant-seed N\n");
+    printf("                                      deterministic calibration and factorization seed (default: 0)\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -387,6 +429,48 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
     prune_layers.erase(std::unique(prune_layers.begin(), prune_layers.end()), prune_layers.end());
     return true;
 }
+static bool parse_i32_option(const char * value, int32_t & result) {
+    try {
+        size_t end = 0;
+        const long parsed = std::stol(value, &end);
+        if (end != std::strlen(value) || parsed < INT32_MIN || parsed > INT32_MAX) {
+            return false;
+        }
+        result = (int32_t) parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_u64_option(const char * value, uint64_t & result) {
+    try {
+        size_t end = 0;
+        const unsigned long long parsed = std::stoull(value, &end);
+        if (end != std::strlen(value)) {
+            return false;
+        }
+        result = (uint64_t) parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_float_option(const char * value, float & result) {
+    try {
+        size_t end = 0;
+        const float parsed = std::stof(value, &end);
+        if (end != std::strlen(value) || !std::isfinite(parsed)) {
+            return false;
+        }
+        result = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 
 // satisfies -Wmissing-declarations
 int llama_quantize(int argc, char ** argv);
@@ -467,6 +551,98 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-calibration-dataset") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-calibration") == 0) {
+            if (arg_idx == argc - 1) {
+                usage(argv[0]);
+            }
+            params.nanoquant_calibration_dataset = argv[++arg_idx];
+        } else if (strcmp(argv[arg_idx], "--nanoquant-calibration-column") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-column") == 0) {
+            if (arg_idx == argc - 1) {
+                usage(argv[0]);
+            }
+            params.nanoquant_calibration_column = argv[++arg_idx];
+        } else if (strcmp(argv[arg_idx], "--nanoquant-device") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-device") == 0) {
+            if (arg_idx == argc - 1) {
+                usage(argv[0]);
+            }
+            params.nanoquant_device = argv[++arg_idx];
+        } else if (strcmp(argv[arg_idx], "--nanoquant-gpu-layers") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-gpu-layers") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_n_gpu_layers)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-checkpoint-dir") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-checkpoint-dir") == 0) {
+            if (arg_idx == argc - 1) {
+                usage(argv[0]);
+            }
+            params.nanoquant_checkpoint_directory = argv[++arg_idx];
+        } else if (strcmp(argv[arg_idx], "--nanoquant-sequence-length") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-seq-len") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_sequence_length)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-sample-count") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-samples") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_sample_count)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-target-bits") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-bits") == 0) {
+            if (arg_idx == argc - 1 || !parse_float_option(argv[++arg_idx], params.nanoquant_target_bits)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-admm-outer") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-admm-outer") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_admm_outer_iterations)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-admm-inner") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-admm-inner") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_admm_inner_iterations)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-nonfactor-epochs") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-nonfactor-epochs") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_nonfactor_epochs)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-factor-epochs") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-factor-epochs") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_factor_epochs)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-model-epochs") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-model-epochs") == 0) {
+            if (arg_idx == argc - 1 || !parse_i32_option(argv[++arg_idx], params.nanoquant_model_epochs)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-nonfactor-lr") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-nonfactor-lr") == 0) {
+            if (arg_idx == argc - 1 || !parse_float_option(argv[++arg_idx], params.nanoquant_nonfactor_learning_rate)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-factor-lr") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-factor-lr") == 0) {
+            if (arg_idx == argc - 1 || !parse_float_option(argv[++arg_idx], params.nanoquant_factor_learning_rate)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-model-lr") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-model-lr") == 0) {
+            if (arg_idx == argc - 1 || !parse_float_option(argv[++arg_idx], params.nanoquant_model_learning_rate)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-seed") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-seed") == 0) {
+            if (arg_idx == argc - 1 || !parse_u64_option(argv[++arg_idx], params.nanoquant_seed)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nanoquant-resume") == 0 ||
+                   strcmp(argv[arg_idx], "--nq-resume") == 0) {
+            params.nanoquant_resume = true;
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
         } else {

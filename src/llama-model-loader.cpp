@@ -75,6 +75,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_TQ3_1S:   name = LLAMA_FTYPE_PREFIX "TQ3_1S - 4.0 bpw WHT-rotated 3-bit"; break;
         case LLAMA_FTYPE_MOSTLY_TQ4_1S:   name = LLAMA_FTYPE_PREFIX "TQ4_1S - 5.0 bpw WHT-rotated 4-bit"; break;
+        case LLAMA_FTYPE_MOSTLY_NANOQUANT: name = LLAMA_FTYPE_PREFIX "NanoQuant"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_M:     name = LLAMA_FTYPE_PREFIX "IQ2_M - 2.7 bpw"; break;
@@ -1059,6 +1060,14 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static bool is_nanoquant_sidecar(const char * suffix) {
+    return suffix != nullptr && (
+        strcmp(suffix, "nq_v") == 0 ||
+        strcmp(suffix, "nq_u") == 0 ||
+        strcmp(suffix, "nq_scale_pre") == 0 ||
+        strcmp(suffix, "nq_scale_post") == 0);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1198,9 +1207,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
-            if (!buft) {
-                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            if (is_nanoquant_sidecar(tn.suffix)) {
+                buft = ggml_backend_dev_buffer_type(buft_list->front().first);
+            } else {
+                buft = select_weight_buft(hparams, t_meta, op, buft_list);
+                if (!buft) {
+                    throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+                }
             }
         }
 
@@ -1600,7 +1613,7 @@ bool llama_model_loader::load_all_data(
 
                     // Calculate aligned read boundaries
                     size_t read_start = aligned_offset;
-                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+                    size_t read_end = std::min(file->size(), (offset + n_size + alignment - 1) & ~(alignment - 1));
 
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
@@ -1674,7 +1687,7 @@ bool llama_model_loader::load_all_data(
 
                         // Calculate aligned read boundaries
                         size_t read_start = aligned_offset;
-                        size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+                        size_t read_end = std::min(file->size(), (offset + n_size + alignment - 1) & ~(alignment - 1));
 
                         size_t bytes_read = 0;
                         size_t data_read = 0; // actual tensor data copied (excluding padding)
@@ -1735,6 +1748,7 @@ bool llama_model_loader::load_all_data(
                             bytes_read += read_size;
                         }
                     } else {
+                        file->seek(weight->offs, SEEK_SET);
                         read_buf.resize(n_size);
                         file->read_raw(read_buf.data(), n_size);
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);

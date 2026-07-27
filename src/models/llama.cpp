@@ -92,11 +92,14 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_llama::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph<false>>(*this, params);
+    if (params.no_cache) {
+        return std::make_unique<graph<false, true>>(*this, params);
+    }
+    return std::make_unique<graph<false, false>>(*this, params);
 }
 
-template <bool embed>
-llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+template <bool embed, bool no_cache>
+llama_model_llama::graph<embed, no_cache>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -110,10 +113,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
+    using inp_attn_type = std::conditional_t<no_cache, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
 
     inp_attn_type * inp_attn = nullptr;
-    if constexpr (embed) {
+    if constexpr (no_cache) {
         inp_attn = build_attn_inp_no_cache();
     } else {
         inp_attn = build_attn_inp_kv();
@@ -246,5 +249,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
-template struct llama_model_llama::graph<false>;
-template struct llama_model_llama::graph<true>;
+template struct llama_model_llama::graph<false, false>;
+template struct llama_model_llama::graph<false, true>;
+template struct llama_model_llama::graph<true, true>;

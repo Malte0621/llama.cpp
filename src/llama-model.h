@@ -547,6 +547,28 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_nanoquant_weight {
+    ggml_tensor * v = nullptr;
+    ggml_tensor * u = nullptr;
+    ggml_tensor * scale_pre = nullptr;
+    ggml_tensor * scale_post = nullptr;
+
+    ggml_tensor * training_weight = nullptr;
+    ggml_tensor * training_v = nullptr;
+    ggml_tensor * training_u = nullptr;
+    ggml_tensor * training_scale_pre = nullptr;
+    ggml_tensor * training_scale_post = nullptr;
+
+    bool training_factorized() const {
+        return training_v != nullptr && training_u != nullptr &&
+               training_scale_pre != nullptr && training_scale_post != nullptr;
+    }
+
+    bool enabled() const {
+        return v != nullptr && u != nullptr && scale_pre != nullptr && scale_post != nullptr;
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -626,6 +648,8 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+    std::unordered_map<const ggml_tensor *, llama_nanoquant_weight> nanoquant_weights;
+    std::vector<std::unique_ptr<ggml_tensor>> virtual_tensors;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
@@ -669,6 +693,7 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    const llama_nanoquant_weight * get_nanoquant_weight(const ggml_tensor * tensor) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

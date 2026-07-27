@@ -4699,6 +4699,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q2_0          = 41  # except 1d tensors
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
+    MOSTLY_NANOQUANT     = 45  # low-rank binary factors with per-channel scales
 
     GUESSED              = 1024  # not specified in the model file
 

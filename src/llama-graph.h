@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -677,6 +678,7 @@ struct llm_graph_params {
     llama_cparams cparams;
 
     llama_ubatch ubatch; // note: intentionally make a copy
+    const llama_model * model;
 
     llm_graph_type gtype;
 
@@ -710,6 +712,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    bool no_cache = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -781,7 +785,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            no_cache == other.no_cache;
     }
 };
 
@@ -888,6 +893,9 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    const llama_model * model;
+    const bool functional_cache;
+
 
     const int64_t n_embd;
     const int64_t n_layer;

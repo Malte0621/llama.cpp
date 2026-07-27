@@ -128,6 +128,7 @@ option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 option(LLAMA_ZSTD       "llama: build bundled zstd compression library" ON)
+option(LLAMA_PARQUET    "llama: support Parquet calibration datasets through Apache Arrow" OFF)
 
 
 # Required for relocatable CMake package

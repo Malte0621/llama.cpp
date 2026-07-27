@@ -929,6 +929,39 @@ const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
     return LLM_TENSOR_INFOS.at(tensor);
 }
 
+static bool llm_tensor_name_matches(const char * pattern, const std::string & name) {
+    size_t i = 0;
+    size_t j = 0;
+    while (pattern[i] != '\0' && j < name.size()) {
+        if (pattern[i] == '%' && pattern[i + 1] == 'd') {
+            if (name[j] < '0' || name[j] > '9') {
+                return false;
+            }
+            do {
+                ++j;
+            } while (j < name.size() && name[j] >= '0' && name[j] <= '9');
+            i += 2;
+        } else if (pattern[i++] != name[j++]) {
+            return false;
+        }
+    }
+    return pattern[i] == '\0' && j == name.size();
+}
+
+bool llm_tensor_info_for_name(const std::string & name, llm_tensor_info & info) {
+    for (const auto & [tensor, pattern] : LLM_TENSOR_NAMES) {
+        if (!llm_tensor_name_matches(pattern, name)) {
+            continue;
+        }
+        const auto found = LLM_TENSOR_INFOS.find(tensor);
+        if (found != LLM_TENSOR_INFOS.end()) {
+            info = found->second;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llm_arch_is_recurrent(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_MAMBA:

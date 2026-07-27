@@ -2128,6 +2128,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_NANOQUANT_LINEAR:
+            {
+                ggml_compute_forward_nanoquant_linear(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2309,6 +2313,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_NANOQUANT_LINEAR:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2325,6 +2330,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             switch (ggml_get_unary_op(node)) {
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_SGN_STE:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_TANH:
@@ -3044,6 +3050,14 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;  // no extra workspace needed
+                    } break;
+                case GGML_OP_NANOQUANT_LINEAR:
+                    {
+                        const int64_t n_vectors = ggml_nrows(node->src[0]);
+                        const int64_t input_size = ggml_get_op_params_i32(node, 0) != 0 ?
+                                node->src[4]->ne[0] : node->src[3]->ne[0];
+                        const int64_t n_rank = node->src[1]->ne[1];
+                        cur = sizeof(float)*n_vectors*(input_size + n_rank);
                     } break;
                 case GGML_OP_COUNT:
                     {

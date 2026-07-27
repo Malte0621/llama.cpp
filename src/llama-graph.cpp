@@ -1325,6 +1325,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    model            (params.model),
+    functional_cache  (params.no_cache),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
@@ -1383,7 +1385,27 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    const llama_nanoquant_weight * nq = model == nullptr ? nullptr : model->get_nanoquant_weight(w);
+    ggml_tensor * res;
+    if (nq && nq->training_weight) {
+        res = ggml_mul_mat(ctx0, nq->training_weight, cur);
+    } else if (nq && nq->training_factorized()) {
+        ggml_tensor * scaled = ggml_mul(ctx0, cur, nq->training_scale_pre);
+        ggml_tensor * rank = ggml_mul_mat(ctx0, ggml_sgn_ste(ctx0, nq->training_v), scaled);
+        res = ggml_mul_mat(ctx0, ggml_sgn_ste(ctx0, nq->training_u), rank);
+        res = ggml_mul(ctx0, res, nq->training_scale_post);
+    } else if (nq && nq->enabled()) {
+        ggml_tensor * input = cur;
+        if (nq->training_scale_pre) {
+            input = ggml_mul(ctx0, input, ggml_div(ctx0, nq->training_scale_pre, nq->scale_pre));
+        }
+        res = ggml_nanoquant_linear(ctx0, input, nq->v, nq->u, nq->scale_pre, nq->scale_post);
+        if (nq->training_scale_post) {
+            res = ggml_mul(ctx0, res, ggml_div(ctx0, nq->training_scale_post, nq->scale_post));
+        }
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -2701,19 +2723,23 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
+    ggml_tensor * k_cache;
+    ggml_tensor * v_cache;
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        k_cache = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        v_cache = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        ggml_build_forward_expand(gf, k_cache);
+        ggml_build_forward_expand(gf, v_cache);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, functional_cache ? k_cache : nullptr);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, functional_cache ? v_cache : nullptr);
 
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)

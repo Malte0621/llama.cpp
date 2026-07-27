@@ -1535,13 +1535,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * source) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * k = layers[ikv].k;
+    auto * storage = layers[ikv].k;
+    auto * k = source ? source : storage;
+    GGML_ASSERT(k->type == storage->type && ggml_nelements(k) == ggml_nelements(storage));
 
     const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_k_gqa = k->ne[0];
+    const uint64_t n_embd_k_gqa = storage->ne[0];
 
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
@@ -1566,13 +1568,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * source) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * storage = layers[ikv].v;
+    auto * v = source ? source : storage;
+    GGML_ASSERT(v->type == storage->type && ggml_nelements(v) == ggml_nelements(storage));
 
     const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_v_gqa = v->ne[0];
+    const uint64_t n_embd_v_gqa = storage->ne[0];
 
     // [TAG_V_CACHE_VARIABLE] - for turbo-padded V, cache may be larger
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
@@ -3089,12 +3093,12 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, ggml_tensor * source) const {
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], source);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, ggml_tensor * source) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], source);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) const {

@@ -324,6 +324,35 @@ static std::pair<int, int> test_grad(
 
     return std::make_pair(npass, ntest);
 }
+static std::pair<int, int> test_grad_only(
+        enum ggml_opt_optimizer_type optim,
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 1;
+    int npass = 0;
+
+    struct helper_ctx_data cd = helper_get_ctx_data(
+        optim, backend_sched, backend, /*init_opt_ctx =*/ false, /*optimizer_defaults =*/ false);
+    cd.opt_params.build_type = GGML_OPT_BUILD_TYPE_GRAD;
+    cd.opt_ctx = ggml_opt_init(cd.opt_params);
+
+    const float input = 2.0f;
+    ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+    ggml_backend_tensor_set(cd.inputs, &input, 0, sizeof(input));
+    ggml_opt_eval(cd.opt_ctx, cd.result);
+
+    float weight;
+    float gradient;
+    ggml_backend_tensor_get(cd.weights, &weight, 0, sizeof(weight));
+    ggml_backend_tensor_get(ggml_opt_grad_acc(cd.opt_ctx, cd.weights), &gradient, 0, sizeof(gradient));
+    const bool subtest_ok = weight == float(ndata)/2 && gradient == 1.0f;
+    printf("  %s(): ", __func__);
+    print_ok(subtest_ok);
+    npass += subtest_ok;
+
+    helper_free_ctx_data(cd);
+    return std::make_pair(npass, ntest);
+}
+
 
 static void helper_after_test_forward_backward(
         enum ggml_opt_optimizer_type optim,
@@ -846,6 +875,11 @@ static std::pair<int, int> test_backend(
 
     for (bool shuffle : {false, true}) {
         std::pair<int, int> partial = test_dataset(optim, backend_sched, backend, shuffle);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_grad_only(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

@@ -332,7 +332,12 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
 
-        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        const llama_nanoquant_weight * nq_weight = model.get_nanoquant_weight(model_tensor);
+        const ggml_tensor * placement_tensor = nq_weight == nullptr ? model_tensor : nq_weight->scale_pre;
+        if (placement_tensor == nullptr || placement_tensor->buffer == nullptr) {
+            throw std::runtime_error("LoRA tensor '" + name + "' has no allocated base-model buffer");
+        }
+        auto * buft = ggml_backend_buffer_get_type(placement_tensor->buffer);
 
         // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
         for (auto & ex : buft_extra) {

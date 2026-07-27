@@ -158,6 +158,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NANOQUANT     = 45, // low-rank binary factors with per-channel scales
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -435,6 +436,24 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        const char * nanoquant_calibration_dataset;                 // UTF-8 calibration text file (required unless dry_run)
+        const char * nanoquant_checkpoint_directory;                // checkpoint directory; NULL derives it from fname_out
+        const char * nanoquant_calibration_column;                  // Parquet string column; NULL auto-detects text/content/prompt
+        const char * nanoquant_device;                              // primary training device name; NULL selects the best available device
+        int32_t nanoquant_sequence_length;                           // tokens per calibration sample
+        int32_t nanoquant_sample_count;                              // number of deterministic calibration samples
+        int32_t nanoquant_n_gpu_layers;                             // transformer layers to offload while training; negative means all
+        float nanoquant_target_bits;                                 // target physical bits per original weight
+        int32_t nanoquant_admm_outer_iterations;                     // LB-ADMM outer iterations
+        int32_t nanoquant_admm_inner_iterations;                     // SVID power iterations
+        int32_t nanoquant_nonfactor_epochs;                          // full-precision reconstruction epochs
+        int32_t nanoquant_factor_epochs;                             // STE factor reconstruction epochs
+        int32_t nanoquant_model_epochs;                              // scale-only teacher/student KL epochs
+        float nanoquant_nonfactor_learning_rate;                     // full-precision reconstruction learning rate
+        float nanoquant_factor_learning_rate;                        // latent factor and scale learning rate
+        float nanoquant_model_learning_rate;                         // model scale KL learning rate
+        uint64_t nanoquant_seed;                                     // deterministic calibration and initialization seed
+        bool nanoquant_resume;                                       // resume a validated deterministic checkpoint
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

@@ -5232,22 +5232,28 @@ static void ggml_compute_forward_get_rows_back_f32_f16(
 
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    // ggml_compute_forward_dup_same_cont(params, opt0, dst);
-
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nelements(src1);
 
-    GGML_ASSERT( dst->ne[0] == nc);
+    GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(ggml_fp16_t));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    for (int64_t i = 0; i < nr; ++i) {
+        const int64_t i12 = i/(src1->ne[1]*src1->ne[0]);
+        const int64_t i11 = (i - i12*src1->ne[1]*src1->ne[0])/src1->ne[0];
+        const int64_t i10 = i - i12*src1->ne[1]*src1->ne[0] - i11*src1->ne[0];
+        const int32_t r = *(const int32_t *) ((const char *) src1->data +
+                i10*src1->nb[0] + i11*src1->nb[1] + i12*src1->nb[2]);
+        GGML_ASSERT(r >= 0 && r < dst->ne[1]);
 
-        for (int j = 0; j < nc; ++j) {
-            ggml_fp16_t v = ((ggml_fp16_t *) ((char *) src0->data + i*src0->nb[1]))[j];
-            ((float *) ((char *) dst->data + r*dst->nb[1]))[j] += GGML_CPU_FP16_TO_FP32(v);
+        const char * src_row = (const char *) src0->data +
+                i10*src0->nb[1] + i11*src0->nb[2] + i12*src0->nb[3];
+        float * dst_row = (float *) ((char *) dst->data +
+                r*dst->nb[1] + i11*dst->nb[2] + i12*dst->nb[3]);
+        for (int64_t j = 0; j < nc; ++j) {
+            dst_row[j] += GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) (src_row + j*src0->nb[0]));
         }
     }
 }
@@ -5265,23 +5271,27 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    // ggml_compute_forward_dup_same_cont(params, opt0, dst);
-
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nelements(src1);
 
-    GGML_ASSERT( dst->ne[0] == nc);
+    GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    for (int64_t i = 0; i < nr; ++i) {
+        const int64_t i12 = i/(src1->ne[1]*src1->ne[0]);
+        const int64_t i11 = (i - i12*src1->ne[1]*src1->ne[0])/src1->ne[0];
+        const int64_t i10 = i - i12*src1->ne[1]*src1->ne[0] - i11*src1->ne[0];
+        const int32_t r = *(const int32_t *) ((const char *) src1->data +
+                i10*src1->nb[0] + i11*src1->nb[1] + i12*src1->nb[2]);
+        GGML_ASSERT(r >= 0 && r < dst->ne[1]);
 
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+        const float * src_row = (const float *) ((const char *) src0->data +
+                i10*src0->nb[1] + i11*src0->nb[2] + i12*src0->nb[3]);
+        float * dst_row = (float *) ((char *) dst->data +
+                r*dst->nb[1] + i11*dst->nb[2] + i12*dst->nb[3]);
+        ggml_vec_add_f32(nc, dst_row, dst_row, src_row);
     }
 }
 
@@ -10021,6 +10031,10 @@ void ggml_compute_forward_unary(
             {
                 ggml_compute_forward_sgn(params, dst);
             } break;
+        case GGML_UNARY_OP_SGN_STE:
+            {
+                ggml_compute_forward_sgn(params, dst);
+            } break;
         case GGML_UNARY_OP_NEG:
             {
                 ggml_compute_forward_neg(params, dst);
@@ -11349,6 +11363,108 @@ void ggml_compute_forward_turbo_wht(
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
+    }
+}
+
+static float nanoquant_get_scale(const ggml_tensor * scale, int64_t i) {
+    switch (scale->type) {
+        case GGML_TYPE_F32:
+            return ((const float *) scale->data)[i];
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(((const ggml_fp16_t *) scale->data)[i]);
+        case GGML_TYPE_BF16:
+            return ggml_bf16_to_fp32(((const ggml_bf16_t *) scale->data)[i]);
+        default:
+            GGML_ABORT("unsupported NanoQuant scale type");
+    }
+}
+
+void ggml_compute_forward_nanoquant_linear(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x          = dst->src[0];
+    const ggml_tensor * v_bits     = dst->src[1];
+    const ggml_tensor * u_bits     = dst->src[2];
+    const ggml_tensor * scale_pre  = dst->src[3];
+    const ggml_tensor * scale_post = dst->src[4];
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(v_bits));
+    GGML_ASSERT(ggml_is_contiguous(u_bits));
+    GGML_ASSERT(ggml_is_contiguous(scale_pre));
+    GGML_ASSERT(ggml_is_contiguous(scale_post));
+
+    const bool backward      = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t n_in       = scale_pre->ne[0];
+    const int64_t n_rank     = v_bits->ne[1];
+    const int64_t n_out      = scale_post->ne[0];
+    const int64_t n_vectors  = ggml_nrows(x);
+    const int64_t n_words_v  = v_bits->ne[0];
+    const int64_t n_words_u  = u_bits->ne[0];
+    const int64_t input_size = backward ? n_out : n_in;
+
+    const float * x_data = (const float *) x->data;
+    float * dst_data = (float *) dst->data;
+    float * x_scaled = (float *) params->wdata;
+    float * tmp = x_scaled + n_vectors*input_size;
+
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+    const ggml_tensor * input_scale = backward ? scale_post : scale_pre;
+
+    const int64_t nx0 = (n_vectors*input_size*ith)/nth;
+    const int64_t nx1 = (n_vectors*input_size*(ith + 1))/nth;
+    for (int64_t i = nx0; i < nx1; ++i) {
+        x_scaled[i] = x_data[i] * nanoquant_get_scale(input_scale, i % input_size);
+    }
+    ggml_barrier(params->threadpool);
+
+    const uint32_t * v_data = (const uint32_t *) v_bits->data;
+    const uint32_t * u_data = (const uint32_t *) u_bits->data;
+    const int64_t nt0 = (n_vectors*n_rank*ith)/nth;
+    const int64_t nt1 = (n_vectors*n_rank*(ith + 1))/nth;
+    for (int64_t i = nt0; i < nt1; ++i) {
+        const int64_t iv = i/n_rank;
+        const int64_t ir = i - iv*n_rank;
+        float sum = 0.0f;
+        if (backward) {
+            const float * xv = x_scaled + iv*n_out;
+            for (int64_t io = 0; io < n_out; ++io) {
+                const uint32_t * bits = u_data + io*n_words_u;
+                sum += (bits[ir/32] & (UINT32_C(1) << (ir % 32))) ? -xv[io] : xv[io];
+            }
+        } else {
+            const uint32_t * bits = v_data + ir*n_words_v;
+            const float * xv = x_scaled + iv*n_in;
+            for (int64_t ii = 0; ii < n_in; ++ii) {
+                sum += (bits[ii/32] & (UINT32_C(1) << (ii % 32))) ? -xv[ii] : xv[ii];
+            }
+        }
+        tmp[i] = sum;
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t output_size = backward ? n_in : n_out;
+    const int64_t no0 = (n_vectors*output_size*ith)/nth;
+    const int64_t no1 = (n_vectors*output_size*(ith + 1))/nth;
+    for (int64_t i = no0; i < no1; ++i) {
+        const int64_t iv = i/output_size;
+        const int64_t io = i - iv*output_size;
+        const float * tv = tmp + iv*n_rank;
+        float sum = 0.0f;
+        if (backward) {
+            for (int64_t ir = 0; ir < n_rank; ++ir) {
+                const uint32_t * bits = v_data + ir*n_words_v;
+                sum += (bits[io/32] & (UINT32_C(1) << (io % 32))) ? -tv[ir] : tv[ir];
+            }
+            dst_data[i] = sum * nanoquant_get_scale(scale_pre, io);
+        } else {
+            const uint32_t * bits = u_data + io*n_words_u;
+            for (int64_t ir = 0; ir < n_rank; ++ir) {
+                sum += (bits[ir/32] & (UINT32_C(1) << (ir % 32))) ? -tv[ir] : tv[ir];
+            }
+            dst_data[i] = sum * nanoquant_get_scale(scale_post, io);
+        }
     }
 }
 
