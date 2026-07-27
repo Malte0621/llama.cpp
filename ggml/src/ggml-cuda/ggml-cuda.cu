@@ -719,9 +719,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if (cusolver_handles[i] != nullptr) {
             CUSOLVER_CHECK(cusolverDnDestroy(cusolver_handles[i]));
         }
+#endif
     }
 }
 
@@ -4521,6 +4523,7 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static bool ggml_backend_cuda_solve_spd(
         ggml_backend_t backend,
         const float * system,
@@ -4583,6 +4586,7 @@ static bool ggml_backend_cuda_solve_spd(
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return info == 0;
 }
+#endif
 
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
@@ -5505,9 +5509,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_diffusion_sample") == 0) {
         return (void *) ggml_cuda_diffusion_sample;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_solve_spd") == 0) {
         return (void *) ggml_backend_cuda_solve_spd;
     }
+#endif
     return nullptr;
 }
 

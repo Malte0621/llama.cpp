@@ -1467,7 +1467,7 @@ static hash256 make_config_hash(
         const hash256 & dataset_hash,
         const std::vector<group> & groups) {
     hash_builder hash;
-    hash.update_string("llama.cpp-native-nanoquant-v10-resident-independent-admm");
+    hash.update_string("llama.cpp-native-nanoquant-v11-accelerated-spd");
     hash.update(dataset_hash.data(), sizeof(dataset_hash));
     hash.update_pod(effective_nthread);
     hash.update_pod(params->nanoquant_sequence_length);

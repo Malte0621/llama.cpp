@@ -214,6 +214,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 #define CUBLAS_CHECK(err) CUDA_CHECK_GEN(err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static const char * cusolver_get_error_str(cusolverStatus_t err) {
     switch (err) {
         case CUSOLVER_STATUS_SUCCESS: return "CUSOLVER_STATUS_SUCCESS";
@@ -232,6 +233,7 @@ static const char * cusolver_get_error_str(cusolverStatus_t err) {
 }
 
 #define CUSOLVER_CHECK(err) CUDA_CHECK_GEN(err, CUSOLVER_STATUS_SUCCESS, cusolver_get_error_str)
+#endif
 
 #ifdef GGML_USE_NCCL
 #define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
@@ -1430,7 +1432,9 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     cusolverDnHandle_t cusolver_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#endif
 
     int curr_stream_no = 0;
 
@@ -1520,6 +1524,7 @@ struct ggml_backend_cuda_context {
         return cublas_handle(device);
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     cusolverDnHandle_t cusolver_handle(int device) {
         if (cusolver_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
@@ -1531,6 +1536,7 @@ struct ggml_backend_cuda_context {
     cusolverDnHandle_t cusolver_handle() {
         return cusolver_handle(device);
     }
+#endif
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
