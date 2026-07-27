@@ -354,26 +354,33 @@ int llama_cli_diffusion(common_params & params) {
             blocks = ((int64_t) params.n_predict + cl - 1) / cl;
             params.diffusion.blocks = (int32_t) blocks;
         }
-        if (blocks <= 0 || blocks > INT_MAX) {
-            LOG_ERR("error: --diffusion-blocks must be positive\n");
+        if (blocks < 0 || blocks > INT_MAX) {
+            LOG_ERR("error: --diffusion-blocks must be non-negative\n");
             llama_model_free(model);
             llama_backend_free();
             return 1;
         }
-        const int64_t needed = blocks * cl + 2048;
-        if (needed > INT_MAX) {
-            LOG_ERR("error: requested diffusion output is too large (%lld context tokens)\n",
-                    (long long) needed);
-            llama_model_free(model);
-            llama_backend_free();
-            return 1;
+        if (blocks > 0) {
+            const int64_t needed = blocks * cl + 2048;
+            if (needed > INT_MAX) {
+                LOG_ERR("error: requested diffusion output is too large (%lld context tokens)\n",
+                        (long long) needed);
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+            params.n_ctx = std::max(params.n_ctx, (int32_t) needed);
         }
-        params.n_ubatch = std::max(params.n_ubatch, (int32_t) needed);
+        params.n_ubatch = std::max(params.n_ubatch, (int32_t) cl);
         params.n_batch  = std::max(params.n_batch, params.n_ubatch);
-        params.n_ctx    = std::max(params.n_ctx, (int32_t) needed);
-        LOG_INF("diffusion: %d blocks, n_ubatch=%d n_batch=%d n_ctx=%d (canvas_length=%d)\n",
-                params.diffusion.blocks, params.n_ubatch, params.n_batch, params.n_ctx,
-                (int) canvas_length);
+        if (blocks > 0) {
+            LOG_INF("diffusion: %d blocks, n_ubatch=%d n_batch=%d n_ctx=%d (canvas_length=%d)\n",
+                    params.diffusion.blocks, params.n_ubatch, params.n_batch, params.n_ctx,
+                    (int) canvas_length);
+        } else {
+            LOG_INF("diffusion: automatic blocks, n_ubatch=%d n_batch=%d n_ctx=%d (canvas_length=%d)\n",
+                    params.n_ubatch, params.n_batch, params.n_ctx, (int) canvas_length);
+        }
     }
 
     // --fit (auto context/layer fitting) runs inside common_init_from_params, which this runner does not
@@ -419,8 +426,8 @@ int llama_cli_diffusion(common_params & params) {
         return 1;
     }
 
-    // reused across turns; canvas models fill only n_input + canvas_length of it
-    std::vector<llama_token> output_tokens(params.n_ubatch);
+    // A growing block-autoregressive prefix can use the full context even when prefill is microbatched.
+    std::vector<llama_token> output_tokens(std::max<size_t>(params.n_ubatch, llama_n_ctx(ctx)));
 
     struct diffusion_params diff_params;
 
@@ -646,23 +653,47 @@ int llama_cli_diffusion(common_params & params) {
                 std::vector<llama_token>(output_tokens.begin() + n_input, output_tokens.begin() + n_generated), false);
         }
 
-        const int32_t max_ub   = std::min((int32_t) params.n_ubatch, (int32_t) llama_n_ctx(ctx));
-        const int     n_blocks = std::max(1, params.diffusion.blocks);
+        const int32_t max_ctx  = (int32_t) llama_n_ctx(ctx);
+        const int32_t max_full = std::min(params.n_ubatch, max_ctx);
+        const int32_t n_blocks = params.diffusion.blocks;
+        const int64_t token_budget = params.n_predict >= 0 ?
+            params.n_predict : std::numeric_limits<int64_t>::max();
         std::vector<llama_token> response;
+        size_t response_capacity = (size_t) max_ctx - prefix.size();
+        if (token_budget < (int64_t) response_capacity) {
+            response_capacity = (size_t) token_budget;
+        }
+        if (n_blocks > 0) {
+            response_capacity = std::min(response_capacity, (size_t) n_blocks * (size_t) canvas_length);
+        }
+        response.reserve(response_capacity);
 
-        for (int b = 0; b < n_blocks; b++) {
+        for (int b = 0; (n_blocks == 0 || b < n_blocks) && (int64_t) response.size() < token_budget; b++) {
             if (prefix.size() > (size_t) INT_MAX) {
                 LOG_ERR("error: accumulated diffusion prefix is too large\n");
                 break;
             }
             const int32_t prefix_len = (int32_t) prefix.size();
             const int64_t needed = (int64_t) prefix_len + canvas_length;
-            if (needed > max_ub) {
+            const bool chunked_prefill = use_eb && eb_params.kv_cache;
+            const int32_t eval_limit = chunked_prefill ? max_ctx : max_full;
+            if (needed > eval_limit) {
                 if (b == 0) {
-                    LOG_ERR("error: this diffusion model needs the whole [prompt | canvas] in one ubatch; "
-                            "set -ub and -c >= n_input + canvas_length = %d + %d = %lld\n",
-                            prefix_len, (int) canvas_length, (long long) needed);
+                    if (needed > max_ctx) {
+                        LOG_ERR("error: diffusion prompt and canvas need %lld context tokens, but -c is %d\n",
+                                (long long) needed, max_ctx);
+                    } else {
+                        LOG_ERR("error: diffusion without prefix KV caching needs the whole [prompt | canvas] "
+                                "in one ubatch; set -ub >= %lld or enable --diffusion-kv-cache\n",
+                                (long long) needed);
+                    }
                     return "";
+                }
+                if (needed > max_ctx) {
+                    LOG_WRN("diffusion: context limit reached after %zu generated tokens\n", response.size());
+                } else {
+                    LOG_WRN("diffusion: ubatch limit reached after %zu generated tokens; "
+                            "increase -ub or enable --diffusion-kv-cache\n", response.size());
                 }
                 break;
             }
@@ -687,10 +718,11 @@ int llama_cli_diffusion(common_params & params) {
             }
 
             const llama_token * canvas = output_tokens.data() + prefix_len;
-            const size_t        cut    = trim_canvas(canvas, (size_t) canvas_length);
+            size_t cut = trim_canvas(canvas, (size_t) canvas_length);
+            cut = std::min(cut, (size_t) (token_budget - (int64_t) response.size()));
             response.insert(response.end(), canvas, canvas + cut);
             if (cut < (size_t) canvas_length) {
-                break;  // end token or repetition loop: answer complete
+                break;  // end token, repetition loop, or requested token limit
             }
             prefix.insert(prefix.end(), canvas, canvas + cut);  // commit the block, denoise the next
         }

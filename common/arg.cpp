@@ -4257,7 +4257,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(
         {"--diffusion-blocks"}, "N",
-        string_format("max block-autoregressive blocks for block-diffusion models (default: %d)", params.diffusion.blocks),
+        string_format("max block-autoregressive blocks for block-diffusion models (default: %d, 0 = until end-of-generation or context limit)", params.diffusion.blocks),
         [](common_params & params, int value) { params.diffusion.blocks = value; }
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(
