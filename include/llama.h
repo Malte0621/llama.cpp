@@ -444,7 +444,7 @@ extern "C" {
         int32_t nanoquant_sequence_length;                           // tokens per calibration sample
         int32_t nanoquant_sample_count;                              // number of deterministic calibration samples
         int32_t nanoquant_n_gpu_layers;                             // transformer layers to offload while training; negative means all
-        float nanoquant_target_bits;                                 // target physical bits per original weight
+        float nanoquant_target_bits;                                 // maximum GGUF file bits per original model parameter
         int32_t nanoquant_admm_outer_iterations;                     // LB-ADMM outer iterations
         int32_t nanoquant_admm_inner_iterations;                     // SVID power iterations
         int32_t nanoquant_nonfactor_epochs;                          // full-precision reconstruction epochs

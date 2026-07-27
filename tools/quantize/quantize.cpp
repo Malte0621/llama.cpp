@@ -183,7 +183,7 @@ static void usage(const char * executable) {
     printf("  --nanoquant-sample-count N\n");
     printf("                                      number of deterministic calibration samples (default: 128)\n");
     printf("  --nanoquant-target-bits F\n");
-    printf("                                      target physical bits per original matrix weight (default: 1.0)\n");
+    printf("                                      maximum GGUF file bits per original model parameter (default: 1.0)\n");
     printf("  --nanoquant-admm-outer N\n");
     printf("                                      LB-ADMM outer iterations (default: 400)\n");
     printf("  --nanoquant-admm-inner N\n");

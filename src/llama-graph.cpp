@@ -1416,14 +1416,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul_mat(ctx0, ggml_sgn_ste(ctx0, nq->training_u), rank);
         res = ggml_mul(ctx0, res, nq->training_scale_post);
     } else if (nq && nq->enabled()) {
-        ggml_tensor * input = cur;
-        if (nq->training_scale_pre) {
-            input = ggml_mul(ctx0, input, ggml_div(ctx0, nq->training_scale_pre, nq->scale_pre));
-        }
-        res = ggml_nanoquant_linear(ctx0, input, nq->v, nq->u, nq->scale_pre, nq->scale_post);
-        if (nq->training_scale_post) {
-            res = ggml_mul(ctx0, res, ggml_div(ctx0, nq->training_scale_post, nq->scale_post));
-        }
+        ggml_tensor * scale_pre =
+                nq->training_scale_pre ? nq->training_scale_pre : nq->scale_pre;
+        ggml_tensor * scale_post =
+                nq->training_scale_post ? nq->training_scale_post : nq->scale_post;
+        res = ggml_nanoquant_linear(
+                ctx0, cur, nq->v, nq->u, scale_pre, scale_post);
     } else {
         res = ggml_mul_mat(ctx0, w, cur);
     }

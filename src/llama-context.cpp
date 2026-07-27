@@ -2353,6 +2353,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    const uint32_t n_tensors = uint32_t(model.n_tensors() + 4*model.nanoquant_weights.size());
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2360,9 +2361,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        return std::max<uint32_t>(n_tokens * 40, 32u * n_tensors);
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint32_t res = std::max<uint32_t>(1024u, 8u*n_tensors);
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
@@ -3270,7 +3271,7 @@ struct llama_nanoquant_optimizer {
     ggml_opt_context_t opt_ctx = nullptr;
     ggml_context * ctx_compute = nullptr;
     ggml_tensor * weight_tensor = nullptr;
-    std::vector<ggml_tensor *> output_gradients;
+    std::vector<std::vector<ggml_tensor *>> output_gradients;
     int32_t n_tokens = 0;
     size_t n_labels = 0;
     llama_nanoquant_opt_loss loss;
@@ -3353,7 +3354,7 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
         /*.opt_ctx    =*/ nullptr,
         /*.ctx_compute =*/ nullptr,
         /*.weight_tensor =*/ nullptr,
-        /*.output_gradients =*/ std::vector<ggml_tensor *>(output_gradient_targets.size(), nullptr),
+        /*.output_gradients =*/ std::vector<std::vector<ggml_tensor *>>(output_gradient_targets.size()),
         /*.n_tokens    =*/ 0,
         /*.n_labels    =*/ 0,
         /*.loss       =*/ loss,
@@ -3376,7 +3377,6 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
         throw std::runtime_error("NanoQuant: optimizer step is out of range");
     }
 
-    size_t max_elements = 0;
     for (const llama_nanoquant_opt_param & param : result->params) {
         if (param.tensor == nullptr || param.tensor->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(param.tensor) || param.learning_rate <= 0.0f ||
@@ -3386,13 +3386,12 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
             throw std::runtime_error("NanoQuant: invalid optimizer parameter");
         }
         const size_t n = size_t(ggml_nelements(param.tensor));
-        if (param.first_moment->empty()) {
-            param.first_moment->assign(n, 0.0f);
-        }
-        if (param.second_moment->empty()) {
-            param.second_moment->assign(n, 0.0f);
-        }
-        if (param.first_moment->size() != n || param.second_moment->size() != n) {
+        const bool first_empty = param.first_moment->empty();
+        const bool second_empty = param.second_moment->empty();
+        if (first_empty != second_empty ||
+            (!first_empty &&
+             (param.first_moment->size() != n ||
+              param.second_moment->size() != n))) {
             delete result;
             throw std::runtime_error("NanoQuant: optimizer moment shape mismatch");
         }
@@ -3404,9 +3403,7 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
             throw std::runtime_error(error);
         }
         ggml_set_param(param.tensor);
-        max_elements = std::max(max_elements, n);
     }
-    result->values.resize(max_elements);
 
 
     return result;
@@ -3439,6 +3436,8 @@ void llama_context::nanoquant_optimizer_export(llama_nanoquant_optimizer * optim
             size_t(ggml_nelements(first)) != n || size_t(ggml_nelements(second)) != n) {
             throw std::runtime_error("NanoQuant: optimizer moment is unavailable");
         }
+        param.first_moment->resize(n);
+        param.second_moment->resize(n);
         ggml_backend_tensor_get(first, param.first_moment->data(), 0, n*sizeof(float));
         ggml_backend_tensor_get(second, param.second_moment->data(), 0, n*sizeof(float));
         optimizer->values.resize(n);
@@ -3553,28 +3552,45 @@ float llama_context::nanoquant_optimizer_step(
                                 optimizer->output_gradient_targets[target])) {
                         continue;
                     }
-                    if (optimizer->output_gradients[target] != nullptr) {
-                        throw std::runtime_error(format(
-                                "NanoQuant: output-gradient target '%s' is used more than once",
-                                optimizer->output_gradient_targets[target].c_str()));
-                    }
                     if (node->type != GGML_TYPE_F32) {
                         throw std::runtime_error(format(
                                 "NanoQuant: output-gradient target '%s' is not F32",
                                 optimizer->output_gradient_targets[target].c_str()));
                     }
-                    optimizer->output_gradients[target] = node;
-                    ggml_set_grad(node);
+                    optimizer->output_gradients[target].push_back(node);
                 }
             }
             for (size_t target = 0;
                  target < optimizer->output_gradient_targets.size();
                  ++target) {
-                if (optimizer->output_gradients[target] == nullptr) {
+                if (optimizer->output_gradients[target].empty()) {
                     throw std::runtime_error(format(
                             "NanoQuant: output-gradient target '%s' was not built",
                             optimizer->output_gradient_targets[target].c_str()));
                 }
+                std::vector<ggml_tensor *> & candidates =
+                        optimizer->output_gradients[target];
+                if (candidates.size() > 1) {
+                    optimizer->output_importance[target].assign(
+                            size_t(candidates.front()->ne[0]), 0.0);
+                    candidates.clear();
+                    continue;
+                }
+                ggml_set_grad(candidates.front());
+            }
+            const bool any_output_gradient = std::any_of(
+                    optimizer->output_gradients.begin(),
+                    optimizer->output_gradients.end(),
+                    [](const std::vector<ggml_tensor *> & gradients) {
+                        return !gradients.empty();
+                    });
+            if (!any_output_gradient && optimizer->params.empty()) {
+                for (std::vector<double> & importance : optimizer->output_importance) {
+                    std::fill(importance.begin(), importance.end(), 1.0);
+                }
+                ++optimizer->output_batches;
+                ++optimizer->step;
+                return 0.0f;
             }
         }
         std::vector<ggml_tensor *> graph_inputs;
@@ -3702,8 +3718,13 @@ float llama_context::nanoquant_optimizer_step(
                 size_t(ggml_nelements(first)) != n || size_t(ggml_nelements(second)) != n) {
                 throw std::runtime_error("NanoQuant: optimizer moment is unavailable");
             }
-            ggml_backend_tensor_set(first, param.first_moment->data(), 0, n*sizeof(float));
-            ggml_backend_tensor_set(second, param.second_moment->data(), 0, n*sizeof(float));
+            if (param.first_moment->empty()) {
+                ggml_backend_tensor_memset(first, 0, 0, n*sizeof(float));
+                ggml_backend_tensor_memset(second, 0, 0, n*sizeof(float));
+            } else {
+                ggml_backend_tensor_set(first, param.first_moment->data(), 0, n*sizeof(float));
+                ggml_backend_tensor_set(second, param.second_moment->data(), 0, n*sizeof(float));
+            }
         }
         optimizer->moments_initialized = true;
     }
@@ -3755,18 +3776,54 @@ float llama_context::nanoquant_optimizer_step(
     }
     if (!optimizer->output_gradient_targets.empty()) {
         for (size_t target = 0; target < optimizer->output_gradients.size(); ++target) {
-            ggml_tensor * output_gradient = optimizer->output_gradients[target];
-            ggml_tensor * grad = ggml_opt_grad_acc(optimizer->opt_ctx, output_gradient);
-            if (grad == nullptr || grad->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(grad) ||
-                !ggml_are_same_shape(grad, output_gradient)) {
-                throw std::runtime_error("NanoQuant: output gradient is unavailable");
+            if (optimizer->output_gradients[target].empty()) {
+                for (double & value : optimizer->output_importance[target]) {
+                    value += 1.0;
+                }
+                continue;
             }
-            const size_t width = size_t(output_gradient->ne[0]);
-            const size_t n = size_t(ggml_nelements(output_gradient));
-            const size_t rows = n/width;
-            if (width == 0 || rows == 0 || n % width != 0) {
-                throw std::runtime_error("NanoQuant: invalid output-gradient shape");
+            const std::vector<ggml_tensor *> & output_gradients =
+                    optimizer->output_gradients[target];
+            size_t width = 0;
+            size_t total_rows = 0;
+            std::vector<double> norms;
+            for (ggml_tensor * output_gradient : output_gradients) {
+                ggml_tensor * grad =
+                        ggml_opt_grad_acc(optimizer->opt_ctx, output_gradient);
+                if (grad == nullptr || grad->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(grad) ||
+                    !ggml_are_same_shape(grad, output_gradient)) {
+                    throw std::runtime_error("NanoQuant: output gradient is unavailable");
+                }
+                const size_t use_width = size_t(output_gradient->ne[0]);
+                const size_t n = size_t(ggml_nelements(output_gradient));
+                const size_t rows = use_width == 0 ? 0 : n/use_width;
+                if (use_width == 0 || rows == 0 || n % use_width != 0 ||
+                    (width != 0 && use_width != width)) {
+                    throw std::runtime_error("NanoQuant: invalid output-gradient shape");
+                }
+                width = use_width;
+                if (rows > std::numeric_limits<size_t>::max() - total_rows) {
+                    throw std::runtime_error("NanoQuant: output-gradient row count overflow");
+                }
+                total_rows += rows;
+                optimizer->gradients.resize(n);
+                ggml_backend_tensor_get(
+                        grad, optimizer->gradients.data(), 0, n*sizeof(float));
+                for (size_t row = 0; row < rows; ++row) {
+                    double norm_sq = 0.0;
+                    for (size_t column = 0; column < width; ++column) {
+                        const float value = optimizer->gradients[row*width + column];
+                        if (!std::isfinite(value)) {
+                            throw std::runtime_error("NanoQuant: output gradient is non-finite");
+                        }
+                        norm_sq += double(value)*double(value);
+                    }
+                    norms.push_back(std::sqrt(norm_sq));
+                }
+            }
+            if (norms.size() != total_rows || total_rows == 0) {
+                throw std::runtime_error("NanoQuant: output gradient is empty");
             }
             std::vector<double> & output_importance =
                     optimizer->output_importance[target];
@@ -3775,28 +3832,12 @@ float llama_context::nanoquant_optimizer_step(
             } else if (output_importance.size() != width) {
                 throw std::runtime_error("NanoQuant: output-gradient width changed");
             }
-            optimizer->gradients.resize(n);
-            ggml_backend_tensor_get(
-                    grad, optimizer->gradients.data(), 0, n*sizeof(float));
 
-            static constexpr double gradient_importance_scale = 1.0e6;
-            std::vector<double> norms(rows, 0.0);
-            for (size_t row = 0; row < rows; ++row) {
-                double norm_sq = 0.0;
-                for (size_t column = 0; column < width; ++column) {
-                    const float value = optimizer->gradients[row*width + column];
-                    if (!std::isfinite(value)) {
-                        throw std::runtime_error("NanoQuant: output gradient is non-finite");
-                    }
-                    norm_sq += double(value)*double(value);
-                }
-                norms[row] = std::sqrt(norm_sq);
-            }
             std::vector<double> sorted_norms = norms;
             std::sort(sorted_norms.begin(), sorted_norms.end());
             const size_t kth_largest = std::max<size_t>(
-                    1, size_t(double(rows)*(1.0 - 0.999)));
-            const double batch_clip = sorted_norms[rows - kth_largest];
+                    1, size_t(double(total_rows)*(1.0 - 0.999)));
+            const double batch_clip = sorted_norms[total_rows - kth_largest];
             double & output_clip = optimizer->output_clip[target];
             if (output_clip == 0.0) {
                 output_clip = batch_clip;
@@ -3808,14 +3849,28 @@ float llama_context::nanoquant_optimizer_step(
                 }
                 output_clip = batch_clip;
             }
-            for (size_t row = 0; row < rows; ++row) {
-                const double scale = norms[row] > output_clip && norms[row] > 0.0 ?
-                        output_clip/norms[row] : 1.0;
-                for (size_t column = 0; column < width; ++column) {
-                    const double value =
-                            double(optimizer->gradients[row*width + column])*scale;
-                    output_importance[column] +=
-                            gradient_importance_scale*value*value/double(rows);
+
+            static constexpr double gradient_importance_scale = 1.0e6;
+            size_t norm_index = 0;
+            for (ggml_tensor * output_gradient : output_gradients) {
+                ggml_tensor * grad =
+                        ggml_opt_grad_acc(optimizer->opt_ctx, output_gradient);
+                const size_t n = size_t(ggml_nelements(output_gradient));
+                const size_t rows = n/width;
+                optimizer->gradients.resize(n);
+                ggml_backend_tensor_get(
+                        grad, optimizer->gradients.data(), 0, n*sizeof(float));
+                for (size_t row = 0; row < rows; ++row, ++norm_index) {
+                    const double scale =
+                            norms[norm_index] > output_clip &&
+                            norms[norm_index] > 0.0 ?
+                            output_clip/norms[norm_index] : 1.0;
+                    for (size_t column = 0; column < width; ++column) {
+                        const double value =
+                                double(optimizer->gradients[row*width + column])*scale;
+                        output_importance[column] +=
+                                gradient_importance_scale*value*value/double(total_rows);
+                    }
                 }
             }
         }
