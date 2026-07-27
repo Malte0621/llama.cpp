@@ -4250,17 +4250,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(
         {"--diffusion-visual"},
-        string_format("enable visual diffusion mode (show progressive generation) (default: %s)", params.diffusion.visual_mode ? "true" : "false"),
-        [](common_params & params) { params.diffusion.visual_mode = true; }
+        {"--no-diffusion-visual"},
+        string_format("whether to show the live denoising canvas (default: %s)", params.diffusion.visual_mode ? "true" : "false"),
+        [](common_params & params, bool value) { params.diffusion.visual_mode = value; }
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(
         {"--diffusion-visual-progress"},
-        string_format("show the step progress bar in visual mode (default: %s)", params.diffusion.visual_progress ? "true" : "false"),
-        [](common_params & params) { params.diffusion.visual_progress = true; }
+        {"--no-diffusion-visual-progress"},
+        string_format("whether to show progress above the live denoising canvas (default: %s)", params.diffusion.visual_progress ? "true" : "false"),
+        [](common_params & params, bool value) { params.diffusion.visual_progress = value; }
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(
         {"--diffusion-visual-interval"}, "N",
-        string_format("redraw the visual canvas every Nth step; all steps are still computed (default: %d)", params.diffusion.visual_interval),
+        string_format("redraw the live denoising canvas every Nth step; all steps are still computed (default: %d)", params.diffusion.visual_interval),
         [](common_params & params, int value) { params.diffusion.visual_interval = value; }
     ).set_examples({ LLAMA_EXAMPLE_CLI }));
     add_opt(common_arg(

@@ -193,7 +193,8 @@ void diffusion_generate(llama_context *          ctx,
     int64_t total_time          = 0;
     int64_t time_start          = ggml_time_us();
 
-    for (int block_num = 0; block_num < num_blocks; block_num++) {
+    bool stop_requested = false;
+    for (int block_num = 0; block_num < num_blocks && !stop_requested; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
         int32_t block_end   = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ?
                                   std::min(n_input + (block_num + 1) * params.block_length, params.max_length) :
@@ -213,12 +214,6 @@ void diffusion_generate(llama_context *          ctx,
         for (int32_t step = 0; step < steps_per_block; step++) {
             int32_t global_step = block_num * steps_per_block + step;
 
-            if (params.step_callback) {
-                if (!params.step_callback(
-                        global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
-                    break;
-                }
-            }
 
             // Setup batch
             for (int32_t i = 0; i < params.max_length; i++) {
@@ -423,6 +418,13 @@ void diffusion_generate(llama_context *          ctx,
 
             int64_t time_end_sampling = ggml_time_us();
             total_sampling_time += time_end_sampling - time_start_sampling;
+
+            if (params.step_callback &&
+                !params.step_callback(global_step, params.steps, output_tokens,
+                                      params.max_length, params.step_callback_user_data)) {
+                stop_requested = true;
+                break;
+            }
         }
     }
 

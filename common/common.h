@@ -405,9 +405,9 @@ struct common_params_vocoder {
 struct common_params_diffusion {
     int32_t steps         = 128;
     int32_t blocks        = 1;        // max block-autoregressive denoising blocks (block-diffusion models)
-    bool    visual_mode   = false;
-    bool    visual_progress = false;  // show the step progress bar in visual mode (default: hidden)
-    int32_t visual_interval = 1;      // redraw the visual canvas every Nth step (all steps still computed)
+    bool    visual_mode     = true;
+    bool    visual_progress = true;
+    int32_t visual_interval = 1;        // redraw every Nth step; all steps are still computed
 
     float   eps           = 0;        // epsilon for timesteps
     int32_t block_length  = 0;        // block length for generation

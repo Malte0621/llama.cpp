@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 #include "log.h"
+#include "unicode.h"
 
 #include <limits.h>
 #if defined(_WIN32)
@@ -13,6 +14,9 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#        define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#    endif
 #else
 #    include <sys/ioctl.h>
 #    include <unistd.h>
@@ -25,20 +29,61 @@
 #include <string>
 #include <vector>
 
+class visual_terminal {
+public:
+    explicit visual_terminal(bool requested) {
+        if (!requested) {
+            return;
+        }
+#if defined(_WIN32)
+        handle_ = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (handle_ == INVALID_HANDLE_VALUE || !GetConsoleMode(handle_, &mode_)) {
+            return;
+        }
+        restore_mode_ = (mode_ & ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0;
+        if (restore_mode_ && !SetConsoleMode(handle_, mode_ | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            return;
+        }
+        enabled_ = true;
+#else
+        enabled_ = isatty(STDOUT_FILENO);
+#endif
+    }
+
+    ~visual_terminal() {
+#if defined(_WIN32)
+        if (enabled_ && restore_mode_) {
+            SetConsoleMode(handle_, mode_);
+        }
+#endif
+    }
+
+    bool enabled() const {
+        return enabled_;
+    }
+
+private:
+    bool enabled_ = false;
+#if defined(_WIN32)
+    HANDLE handle_      = INVALID_HANDLE_VALUE;
+    DWORD  mode_        = 0;
+    bool   restore_mode_ = false;
+#endif
+};
+
 struct callback_data {
     diffusion_params *  diff_params;
     const llama_vocab * vocab;
     int32_t             n_input;
-    bool                show_progress;     // visual mode: draw the step progress bar
-    int32_t             visual_interval;   // visual mode: redraw every Nth step
-    int32_t             steps_seen;        // per-turn step count (callback invocations)
-    int32_t             blocks_seen;       // per-turn block count (callbacks with step == 0)
-    int32_t             term_rows;         // visual mode: terminal size (the canvas viewport is clamped to it)
+    bool                show_progress;
+    int32_t             visual_interval;
+    int32_t             steps_seen;
+    int32_t             blocks_seen;
+    int32_t             term_rows;
     int32_t             term_cols;
-    int32_t             vis_prev_rows;     // visual mode: rows the previous frame advanced (for cursor-up)
+    int32_t             vis_rows;
 };
 
-// Query the terminal size for the visual viewport; fall back to 24x80 when it can't be read (piped output).
 static void get_terminal_size(int32_t & rows, int32_t & cols) {
     rows = 24;
     cols = 80;
@@ -47,8 +92,12 @@ static void get_terminal_size(int32_t & rows, int32_t & cols) {
     if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
         const int r = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
         const int c = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
-        if (r > 1) { rows = r; }
-        if (c > 0) { cols = c; }
+        if (r > 1) {
+            rows = r;
+        }
+        if (c > 0) {
+            cols = c;
+        }
     }
 #else
     struct winsize ws;
@@ -57,6 +106,131 @@ static void get_terminal_size(int32_t & rows, int32_t & cols) {
         cols = ws.ws_col > 0 ? ws.ws_col : 80;
     }
 #endif
+}
+
+static int visual_codepoint_width(uint32_t codepoint) {
+    if ((codepoint >= 0x0300 && codepoint <= 0x036f) ||
+        (codepoint >= 0x1ab0 && codepoint <= 0x1aff) ||
+        (codepoint >= 0x1dc0 && codepoint <= 0x1dff) ||
+        (codepoint >= 0x20d0 && codepoint <= 0x20ff) ||
+        (codepoint >= 0xfe00 && codepoint <= 0xfe0f) ||
+        (codepoint >= 0xfe20 && codepoint <= 0xfe2f) ||
+        (codepoint >= 0x1f3fb && codepoint <= 0x1f3ff) ||
+        codepoint == 0x200d) {
+        return 0;
+    }
+
+    if ((codepoint >= 0x1100 && codepoint <= 0x115f) ||
+        codepoint == 0x2329 || codepoint == 0x232a ||
+        (codepoint >= 0x2e80 && codepoint <= 0xa4cf && codepoint != 0x303f) ||
+        (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+        (codepoint >= 0xf900 && codepoint <= 0xfaff) ||
+        (codepoint >= 0xfe10 && codepoint <= 0xfe19) ||
+        (codepoint >= 0xfe30 && codepoint <= 0xfe6f) ||
+        (codepoint >= 0xff00 && codepoint <= 0xff60) ||
+        (codepoint >= 0xffe0 && codepoint <= 0xffe6) ||
+        (codepoint >= 0x1f300 && codepoint <= 0x1faff) ||
+        (codepoint >= 0x20000 && codepoint <= 0x3fffd)) {
+        return 2;
+    }
+
+    return 1;
+}
+
+static std::vector<std::string> visual_canvas_lines(
+        const callback_data * data,
+        const llama_token *   tokens,
+        int32_t               n_tokens,
+        int                   cols,
+        int                   max_lines) {
+    std::string text;
+    text.reserve((size_t) std::max(0, n_tokens - data->n_input) * 4);
+    const llama_token mask = llama_vocab_mask(data->vocab);
+    for (int32_t i = data->n_input; i < n_tokens; ++i) {
+        text += tokens[i] == mask ? "." : common_token_to_piece(data->vocab, tokens[i], false);
+    }
+
+    std::vector<std::string> lines(1);
+    std::vector<int> widths(1, 0);
+    size_t offset = 0;
+    while (offset < text.size()) {
+        const utf8_parse_result parsed = common_parse_utf8_codepoint(text, offset);
+        uint32_t codepoint = '?';
+        size_t consumed = 1;
+        bool preserve = false;
+        if (parsed.status == utf8_parse_result::SUCCESS) {
+            codepoint = parsed.codepoint;
+            consumed  = parsed.bytes_consumed;
+            preserve  = true;
+        }
+
+        if (codepoint == '\r') {
+            offset += consumed;
+            continue;
+        }
+        if (codepoint == '\n') {
+            if ((int) lines.size() >= max_lines) {
+                break;
+            }
+            lines.emplace_back();
+            widths.push_back(0);
+            offset += consumed;
+            continue;
+        }
+        if (codepoint == '\t') {
+            codepoint = ' ';
+            preserve = false;
+        } else if (codepoint < 0x20 || (codepoint >= 0x7f && codepoint <= 0x9f)) {
+            codepoint = '?';
+            preserve = false;
+        }
+
+        int width = visual_codepoint_width(codepoint);
+        if (width > cols) {
+            codepoint = '?';
+            preserve = false;
+            width = 1;
+        }
+        if (widths.back() + width > cols && !lines.back().empty()) {
+            if ((int) lines.size() >= max_lines) {
+                break;
+            }
+            lines.emplace_back();
+            widths.push_back(0);
+        }
+
+        if (preserve) {
+            lines.back().append(text, offset, consumed);
+        } else {
+            lines.back().push_back((char) codepoint);
+        }
+        widths.back() += width;
+        offset += consumed;
+    }
+
+    return lines;
+}
+
+static std::string visual_progress_line(const callback_data * data, int32_t step, int32_t total_steps, int cols) {
+    total_steps = std::max(1, total_steps);
+    const int32_t completed = std::min(total_steps, std::max(0, step + 1));
+    const int percent = completed * 100 / total_steps;
+    const std::string prefix = "diffusion block " + std::to_string(std::max(1, data->blocks_seen)) +
+                               ", step " + std::to_string(completed) + "/" + std::to_string(total_steps);
+    const std::string suffix = " " + std::to_string(percent) + "%";
+    const int bar_width = std::min(50, cols - (int) prefix.size() - (int) suffix.size() - 3);
+
+    std::string line;
+    if (bar_width >= 4) {
+        const int filled = completed * bar_width / total_steps;
+        line = prefix + " [" + std::string(filled, '=') + std::string(bar_width - filled, ' ') + "]" + suffix;
+    } else {
+        line = prefix + suffix;
+    }
+    if ((int) line.size() > cols) {
+        line.resize(cols);
+    }
+    return line;
 }
 
 static bool diffusion_step_callback(int32_t             step,
@@ -68,74 +242,67 @@ static bool diffusion_step_callback(int32_t             step,
 
     data->steps_seen++;
     if (step == 0) {
-        data->blocks_seen++;  // each block's denoise restarts the step counter at 0
+        data->blocks_seen++;
     }
 
-    auto print_progress_bar = [](int32_t step, int32_t total_steps) {
-        int progress_percent = (step * 100) / total_steps;
-        int progress_bars    = (step * 50) / total_steps;
+    total_steps = std::max(1, total_steps);
+    const int32_t completed = std::min(total_steps, std::max(0, step + 1));
+    if (!data->diff_params->visual_mode) {
+        const int progress_percent = completed * 100 / total_steps;
+        const int progress_bars    = completed * 50 / total_steps;
         LOG("\rdiffusion step: %d/%d [%s%s] %d%%",
-                step,
+                completed,
                 total_steps,
                 std::string(progress_bars, '=').c_str(),
                 std::string(50 - progress_bars, ' ').c_str(),
                 progress_percent);
-    };
-
-    if (data->diff_params->visual_mode) {
-        // Throttle redraws to every Nth step (all steps are still computed); always draw the first.
-        if (data->visual_interval > 1 && (step % data->visual_interval) != 0) {
-            return true;
-        }
-
-        // Draw the canvas as a fixed-height region in the normal screen buffer (not the alternate buffer, so
-        // scrollback stays intact): step the cursor back up over the previous frame, then repaint exactly
-        // `rows` lines, each truncated to the terminal width and padded out, so the region never scrolls. The
-        // whole repaint is one synchronized update (DEC mode 2026) written directly, so it cannot tear.
-        const int rows = std::max(1, data->term_rows - 1);
-        const int cols = std::max(1, data->term_cols);
-
-        std::vector<std::string> lines;
-        if (data->show_progress) {
-            int progress_percent = (step * 100) / total_steps;
-            int progress_bars    = (step * 50) / total_steps;
-            lines.push_back("diffusion step: " + std::to_string(step) + "/" + std::to_string(total_steps) +
-                            " [" + std::string(progress_bars, '=') + std::string(50 - progress_bars, ' ') +
-                            "] " + std::to_string(progress_percent) + "%");
-        }
-        std::string cur = " ";
-        for (int32_t i = data->n_input; i < n_tokens; i++) {
-            if (tokens[i] != llama_vocab_mask(data->vocab)) {
-                char piece[256];
-                int  n_chars = llama_token_to_piece(data->vocab, tokens[i], piece, sizeof(piece), 0, false);
-                for (int32_t k = 0; k < n_chars; k++) {
-                    if (piece[k] == '\n') { lines.push_back(cur); cur.clear(); } else { cur += piece[k]; }
-                }
-            } else {
-                cur += ' ';
-            }
-        }
-        lines.push_back(cur);
-
-        std::string frame = "\033[?2026h";                     // begin synchronized frame
-        if (data->vis_prev_rows > 0) {
-            frame += "\033[" + std::to_string(data->vis_prev_rows) + "A";  // back to the top of the region
-        }
-        frame += "\r";
-        for (int r = 0; r < rows; r++) {
-            std::string ln = (r < (int) lines.size()) ? lines[r] : std::string();
-            if ((int) ln.size() > cols) { ln.resize(cols); }    // clamp width so the row never wraps
-            frame += ln + "\033[K";
-            if (r < rows - 1) { frame += "\n"; }
-        }
-        frame += "\033[?2026l";                                // end synchronized frame
-        data->vis_prev_rows = rows - 1;
-        fwrite(frame.data(), 1, frame.size(), stdout);
-        fflush(stdout);
-    } else {
-        print_progress_bar(step, total_steps);
+        return true;
     }
 
+    const bool final_step = completed == total_steps;
+    if (data->visual_interval > 1 && step % data->visual_interval != 0 && !final_step) {
+        return true;
+    }
+
+    const int max_rows = std::max(1, data->term_rows - 2);
+    const int cols     = std::max(1, data->term_cols);
+    std::vector<std::string> lines;
+    if (data->show_progress && max_rows > 1) {
+        lines.push_back(visual_progress_line(data, step, total_steps, cols));
+    }
+    const int canvas_rows = std::max(1, max_rows - (int) lines.size());
+    std::vector<std::string> canvas = visual_canvas_lines(data, tokens, n_tokens, cols, canvas_rows);
+    lines.insert(lines.end(), canvas.begin(), canvas.end());
+
+    const int needed_rows = std::min(max_rows, std::max(1, (int) lines.size()));
+    const int rows = std::max(data->vis_rows, needed_rows);
+    std::string frame = "\033[?2026h";
+    if (data->vis_rows == 0) {
+        for (int r = 1; r < rows; ++r) {
+            frame += "\r\n";
+        }
+    } else if (rows > data->vis_rows) {
+        for (int r = data->vis_rows; r < rows; ++r) {
+            frame += "\r\n";
+        }
+    }
+    if (rows > 1) {
+        frame += "\033[" + std::to_string(rows - 1) + "A";
+    }
+    for (int r = 0; r < rows; ++r) {
+        frame += "\r";
+        if (r < (int) lines.size()) {
+            frame += lines[r];
+        }
+        frame += "\033[K";
+        if (r < rows - 1) {
+            frame += "\r\n";
+        }
+    }
+    frame += "\033[?2026l";
+    data->vis_rows = rows;
+    fwrite(frame.data(), 1, frame.size(), stdout);
+    fflush(stdout);
     return true;
 }
 
@@ -239,7 +406,8 @@ int llama_cli_diffusion(common_params & params) {
         return 1;
     }
 
-    const bool visual_mode = params.diffusion.visual_mode;
+    visual_terminal terminal(params.diffusion.visual_mode);
+    const bool visual_mode = terminal.enabled();
 
     if (params.n_ubatch <= 0) {
         LOG_ERR("error: n_ubatch must be positive\n");
@@ -292,7 +460,7 @@ int llama_cli_diffusion(common_params & params) {
     diff_params.algorithm        = static_cast<diffusion_algorithm>(params.diffusion.algorithm);
     diff_params.top_p            = params.sampling.top_p;
     diff_params.top_k            = params.sampling.top_k;
-    diff_params.visual_mode      = params.diffusion.visual_mode;
+    diff_params.visual_mode      = visual_mode;
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
@@ -542,23 +710,16 @@ int llama_cli_diffusion(common_params & params) {
         return common_chat_templates_apply(chat_templates.get(), inputs).prompt;
     };
 
-    // Run one turn, print the reply, then (entropy-bound only) a timing summary just before the next prompt.
-    // In visual mode the denoising animation occupies a fixed region below the prompt in the normal screen
-    // buffer (so scrollback is preserved): reserve the region up front, hide the cursor, let the callback
-    // repaint it in place, then erase it and show the cursor before the reply prints in normal flow.
+    // A live frame grows only as tall as its wrapped canvas needs. The callback repaints that fixed region,
+    // then this wrapper clears it before printing the final reply into normal scrollback.
     auto run_turn_reply = [&](const std::string & formatted_prompt) -> std::string {
         cb_data.steps_seen  = 0;
         cb_data.blocks_seen = 0;
-        int region_rows = 0;
         if (visual_mode) {
             get_terminal_size(cb_data.term_rows, cb_data.term_cols);
-            cb_data.vis_prev_rows = 0;
-            region_rows = std::max(1, cb_data.term_rows - 1);
-            common_log_flush(common_log_main());           // flush pending logs before reserving the region
-            std::string init = "\033[?25l";                // hide cursor
-            init += std::string(region_rows, '\n');        // reserve the region (scroll up once if at bottom)
-            init += "\033[" + std::to_string(region_rows) + "A";  // park at the top of the region
-            fwrite(init.data(), 1, init.size(), stdout);
+            cb_data.vis_rows = 0;
+            common_log_flush(common_log_main());
+            fwrite("\033[?25l", 1, 6, stdout);
             fflush(stdout);
         }
         const int64_t t0 = ggml_time_us();
@@ -566,10 +727,10 @@ int llama_cli_diffusion(common_params & params) {
         const int64_t turn_us = ggml_time_us() - t0;
         if (visual_mode) {
             std::string fin;
-            if (cb_data.vis_prev_rows > 0) {
-                fin += "\033[" + std::to_string(cb_data.vis_prev_rows) + "A";  // back to the region top
+            if (cb_data.vis_rows > 1) {
+                fin += "\033[" + std::to_string(cb_data.vis_rows - 1) + "A";
             }
-            fin += "\r\033[J\033[?25h";                    // erase the region, show the cursor
+            fin += "\r\033[J\033[?25h";
             fwrite(fin.data(), 1, fin.size(), stdout);
             fflush(stdout);
         }
