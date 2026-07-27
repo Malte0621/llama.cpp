@@ -33,6 +33,8 @@ struct diffusion_params {
     int32_t                   seed                    = 0;
     bool                      visual_mode             = false;
     bool                      shift_logits            = false;  // Shift logits by -1 after decode
+    bool                      suppress_mask_token     = false;  // forbid revealing a position as the mask token
+    bool                      self_conditioning       = false;  // feed each step's canvas logits into the next
 
     float   top_p = 0.;
     int32_t top_k = 0.;
@@ -55,3 +57,30 @@ void diffusion_generate(llama_context *          ctx,
                         int32_t                  n_input,
                         const diffusion_params & params,
                         int32_t &                n_generated);
+
+// Entropy-bound denoiser for block-diffusion canvas models (DiffusionGemma). The canvas is
+// random-initialized and non-accepted positions are renoised each step; tokens are accepted by a
+// per-position entropy bound under a linear temperature schedule with adaptive stopping.
+struct diffusion_eb_params {
+    int32_t max_denoising_steps  = 48;
+    float   t_min                = 0.4f;
+    float   t_max                = 0.8f;
+    float   entropy_bound        = 0.1f;
+    int32_t stability_threshold  = 1;
+    float   confidence_threshold = 0.005f;
+    int32_t seed                 = 0;
+    int32_t max_length           = 0;
+    bool    kv_cache             = false;
+    bool    gpu_sampling         = false;
+    bool    gpu_sample_reduce    = false;
+
+    diffusion_step_callback_t step_callback           = nullptr;
+    void *                    step_callback_user_data = nullptr;
+};
+
+void diffusion_generate_entropy_bound(llama_context *             ctx,
+                                      const llama_token *         input_tokens,
+                                      llama_token *               output_tokens,
+                                      int32_t                     n_input,
+                                      const diffusion_eb_params & params,
+                                      int32_t &                   n_generated);

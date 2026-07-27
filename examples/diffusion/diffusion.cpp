@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <random>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -107,7 +109,15 @@ void diffusion_generate(llama_context *          ctx,
                         const diffusion_params & params,
                         int32_t &                n_generated) {
     n_generated = 0;
-    if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input) {
+    if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input ||
+        params.steps <= 0 || (uint32_t) params.max_length > llama_n_ctx(ctx) ||
+        (params.suppress_mask_token && params.mask_token_id == LLAMA_TOKEN_NULL)) {
+        return;
+    }
+    if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED &&
+        (params.block_length <= 0 || params.max_length % params.block_length != 0 ||
+         params.steps % (params.max_length / params.block_length) != 0)) {
+        LOG_ERR("%s: block length/step count do not divide the diffusion buffer\n", __func__);
         return;
     }
 
@@ -122,6 +132,9 @@ void diffusion_generate(llama_context *          ctx,
     llama_set_causal_attn(ctx, false);
 
     int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (n_vocab <= 0) {
+        return;
+    }
 
     std::vector<llama_token_data> candidates(n_vocab);
     std::vector<llama_token_data> conf_candidates;
@@ -147,6 +160,14 @@ void diffusion_generate(llama_context *          ctx,
     llama_batch batch = llama_batch_init(params.max_length, 0, 1);
     batch.n_tokens    = params.max_length;
 
+    // Self-conditioning (DiffusionGemma): feed the previous step's canvas logits back into the graph.
+    llama_model *      sc_model = const_cast<llama_model *>(llama_get_model(ctx));
+    const int32_t      sc_canvas = params.max_length - n_input;
+    std::vector<float> sc_buffer;
+    if (params.self_conditioning) {
+        sc_buffer.assign((size_t) sc_canvas * n_vocab, 0.0f);
+    }
+
     // Pre-allocate buffers for CFG if needed
     int32_t                  logits_size = n_vocab * params.max_length;
     std::vector<float>       cond_logits_buffer;
@@ -162,9 +183,7 @@ void diffusion_generate(llama_context *          ctx,
     int32_t              steps_per_block = params.steps;
 
     if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
-        GGML_ASSERT(params.max_length % params.block_length == 0);
-        num_blocks = params.max_length / params.block_length;
-        GGML_ASSERT(params.steps % num_blocks == 0);
+        num_blocks     = params.max_length / params.block_length;
         steps_per_block = params.steps / num_blocks;
     }
 
@@ -208,6 +227,10 @@ void diffusion_generate(llama_context *          ctx,
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i]    = 1;
+            }
+
+            if (params.self_conditioning) {
+                llama_diffusion_set_sc(sc_model, sc_buffer.data(), global_step == 0 ? 0.0f : 1.0f, 1.0f, true);
             }
 
             float * logits = nullptr;
@@ -257,6 +280,11 @@ void diffusion_generate(llama_context *          ctx,
                 break;
             }
 
+            if (params.self_conditioning) {
+                std::memcpy(sc_buffer.data(), logits + (size_t) n_input * n_vocab,
+                            (size_t) sc_canvas * n_vocab * sizeof(float));
+            }
+
             auto get_logits_for_pos = [&](int32_t pos) -> const float * {
                 if (params.shift_logits) {
                     return pos == 0 ? logits : logits + (pos - 1) * n_vocab;
@@ -297,6 +325,9 @@ void diffusion_generate(llama_context *          ctx,
                             candidates[token_id].logit = pos_logits[token_id];
                             candidates[token_id].p     = 0.0f;
                         }
+                        if (params.suppress_mask_token) {
+                            candidates[params.mask_token_id].logit = -INFINITY;
+                        }
 
                         llama_token_data_array cur_p = {
                             candidates.data(),
@@ -321,6 +352,9 @@ void diffusion_generate(llama_context *          ctx,
                         candidates[token_id].logit = pos_logits[token_id];
                         candidates[token_id].p     = 0.0f;
                         candidates[token_id].id    = token_id;
+                    }
+                    if (params.suppress_mask_token) {
+                        candidates[params.mask_token_id].logit = -INFINITY;
                     }
 
                     llama_token_data_array cur_p = {
@@ -400,9 +434,280 @@ void diffusion_generate(llama_context *          ctx,
             total_time / 1000.0 / params.steps,
             total_sampling_time / 1000.0 / params.steps);
 
+    if (params.self_conditioning) {
+        llama_diffusion_set_sc(sc_model, nullptr, 0.0f, 1.0f, false);
+    }
+
     llama_batch_free(batch);
     llama_sampler_free(sampler);
     llama_sampler_free(dist_sampler);
 
     n_generated = params.max_length;
+}
+
+void diffusion_generate_entropy_bound(llama_context *             ctx,
+                                      const llama_token *         input_tokens,
+                                      llama_token *               output_tokens,
+                                      int32_t                     n_input,
+                                      const diffusion_eb_params & params,
+                                      int32_t &                   n_generated) {
+    n_generated = 0;
+    if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input ||
+        (uint32_t) params.max_length > llama_n_ctx(ctx) || params.max_denoising_steps <= 0 ||
+        !std::isfinite(params.t_min) || !std::isfinite(params.t_max) ||
+        !std::isfinite(params.entropy_bound) || !std::isfinite(params.confidence_threshold) ||
+        params.t_min <= 0.0f || params.t_max <= 0.0f || params.entropy_bound < 0.0f ||
+        params.confidence_threshold < 0.0f || params.stability_threshold < 0) {
+        return;
+    }
+
+    llama_model * model   = const_cast<llama_model *>(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int32_t n_canvas = params.max_length - n_input;
+    if (n_vocab <= 0 || n_canvas <= 0) {
+        return;
+    }
+
+    struct diffusion_state_restore {
+        llama_model * model;
+        ~diffusion_state_restore() {
+            llama_diffusion_set_phase(model, 0, 0, 0);
+            llama_diffusion_set_device_sc(model, false);
+            llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
+        }
+    } state_restore{model};
+
+    const bool dev_sc            = params.gpu_sampling;
+    const bool gpu_sample_reduce = params.gpu_sample_reduce && dev_sc;
+    llama_diffusion_set_phase(model, 0, 0, 0);
+    llama_diffusion_set_device_sc(model, dev_sc);
+    llama_set_causal_attn(ctx, false);
+    std::copy(input_tokens, input_tokens + n_input, output_tokens);
+
+    std::mt19937                           rng(params.seed);
+    std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
+    std::uniform_int_distribution<int32_t> vocab_dist(0, n_vocab - 1);
+
+    std::vector<llama_token> current_canvas(n_canvas);
+    for (llama_token & token : current_canvas) {
+        token = vocab_dist(rng);
+    }
+
+    std::vector<float>       sc_buffer((size_t) (dev_sc ? 0 : n_canvas) * n_vocab, 0.0f);
+    std::vector<llama_token> argmax_canvas(n_canvas, 0);
+    std::vector<llama_token> prev_argmax(n_canvas, -1);
+    std::vector<float>       entropy(n_canvas);
+    std::vector<llama_token> denoiser(n_canvas);
+    std::vector<int32_t>     order(n_canvas);
+    std::vector<float>       uniforms(n_canvas);
+    std::vector<llama_token> renoise(n_canvas);
+    std::vector<char>        accepted(n_canvas);
+
+    const unsigned hw  = std::thread::hardware_concurrency();
+    const unsigned nth = std::max(1u, std::min(hw ? hw : 1u, 32u));
+
+    struct batch_owner {
+        llama_batch batch;
+        ~batch_owner() {
+            llama_batch_free(batch);
+        }
+    } owner{llama_batch_init(params.max_length, 0, 1)};
+    llama_batch & batch = owner.batch;
+
+    // Request only canvas logits in either phase; llama_decode packs selected rows contiguously.
+    const int32_t logit_off = 0;
+    if (params.kv_cache) {
+        llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
+
+        const int32_t chunk_size = std::max(1, (int32_t) llama_n_ubatch(ctx));
+        for (int32_t offset = 0; offset < n_input; offset += chunk_size) {
+            const int32_t n_chunk = std::min(chunk_size, n_input - offset);
+            llama_diffusion_set_phase(model, 1, n_input, offset);
+            batch.n_tokens = n_chunk;
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                batch.token[i]     = input_tokens[offset + i];
+                batch.pos[i]       = offset + i;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i]    = i == n_chunk - 1;
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                LOG_ERR("%s: prefill chunk [%d,%d) failed\n", __func__, offset, offset + n_chunk);
+                return;
+            }
+        }
+    }
+
+    float prev_temp_inv = 1.0f;
+    int32_t held        = 0;
+    bool finished       = false;
+    bool decoded_any    = false;
+    bool device_sample_ok = gpu_sample_reduce;
+
+    for (int32_t cur_step = params.max_denoising_steps; cur_step >= 1 && !finished; --cur_step) {
+        const int32_t step_idx = params.max_denoising_steps - cur_step;
+        const float t = params.t_min +
+                        (params.t_max - params.t_min) *
+                            ((float) cur_step / (float) params.max_denoising_steps);
+        const float temp_inv = 1.0f / t;
+
+        if (params.kv_cache) {
+            llama_diffusion_set_phase(model, 2, n_input, 0);
+            batch.n_tokens = n_canvas;
+            for (int32_t i = 0; i < n_canvas; ++i) {
+                batch.token[i]     = current_canvas[i];
+                batch.pos[i]       = n_input + i;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i]    = 1;
+            }
+        } else {
+            batch.n_tokens = params.max_length;
+            for (int32_t i = 0; i < params.max_length; ++i) {
+                batch.token[i]     = i < n_input ? input_tokens[i] : current_canvas[i - n_input];
+                batch.pos[i]       = i;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i]    = i >= n_input;
+            }
+        }
+
+        llama_diffusion_set_sc(model, dev_sc ? nullptr : sc_buffer.data(),
+                               step_idx == 0 ? 0.0f : 1.0f, prev_temp_inv, true);
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("%s: failed to decode at step %d\n", __func__, step_idx);
+            break;
+        }
+
+        const bool gpu_reduce = dev_sc && device_sample_ok;
+        const float * logits  = gpu_reduce ? nullptr : llama_get_logits(ctx);
+        if (!gpu_reduce && !logits) {
+            LOG_ERR("%s: failed to get logits at step %d\n", __func__, step_idx);
+            break;
+        }
+        if (gpu_reduce) {
+            llama_synchronize(ctx);
+        }
+
+        for (int32_t pos = 0; pos < n_canvas; ++pos) {
+            uniforms[pos] = uni01(rng);
+            renoise[pos]  = vocab_dist(rng);
+        }
+
+        auto host_worker = [&](int32_t p0, int32_t p1) {
+            for (int32_t pos = p0; pos < p1; ++pos) {
+                const float * row = logits + (size_t) (logit_off + pos) * n_vocab;
+                float max_logit = -INFINITY;
+                int32_t argmax  = 0;
+                for (int32_t v = 0; v < n_vocab; ++v) {
+                    const float z = row[v] * temp_inv;
+                    if (z > max_logit) {
+                        max_logit = z;
+                        argmax    = v;
+                    }
+                }
+
+                float normalizer = 0.0f;
+                for (int32_t v = 0; v < n_vocab; ++v) {
+                    normalizer += expf(row[v] * temp_inv - max_logit);
+                }
+
+                const float target = uniforms[pos] * normalizer;
+                float cumulative = 0.0f;
+                float h          = 0.0f;
+                int32_t sampled  = n_vocab - 1;
+                bool picked      = false;
+                for (int32_t v = 0; v < n_vocab; ++v) {
+                    const float e = expf(row[v] * temp_inv - max_logit);
+                    const float p = e / normalizer;
+                    if (p > 0.0f) {
+                        h -= p * logf(p);
+                    }
+                    cumulative += e;
+                    if (!picked && cumulative >= target) {
+                        sampled = v;
+                        picked  = true;
+                    }
+                }
+
+                entropy[pos]       = h;
+                argmax_canvas[pos] = argmax;
+                denoiser[pos]      = sampled;
+                if (!dev_sc) {
+                    std::memcpy(sc_buffer.data() + (size_t) pos * n_vocab, row,
+                                (size_t) n_vocab * sizeof(float));
+                }
+            }
+        };
+
+        auto run_host_workers = [&]() {
+            std::vector<std::thread> pool;
+            pool.reserve(nth);
+            const int32_t chunk = (n_canvas + (int32_t) nth - 1) / (int32_t) nth;
+            for (unsigned ti = 0; ti < nth; ++ti) {
+                const int32_t p0 = (int32_t) ti * chunk;
+                const int32_t p1 = std::min(p0 + chunk, n_canvas);
+                if (p0 < p1) {
+                    pool.emplace_back(host_worker, p0, p1);
+                }
+            }
+            for (std::thread & thread : pool) {
+                thread.join();
+            }
+        };
+
+        if (gpu_reduce) {
+            if (!llama_diffusion_device_sample(model, uniforms.data(), argmax_canvas.data(), entropy.data(),
+                                               denoiser.data(), n_canvas, temp_inv)) {
+                LOG_WRN("%s: on-device sampling unsupported on this backend; using host sampling\n", __func__);
+                device_sample_ok = false;
+                logits = llama_get_logits(ctx);
+                if (!logits) {
+                    LOG_ERR("%s: failed to get logits for host sampling at step %d\n", __func__, step_idx);
+                    break;
+                }
+                run_host_workers();
+            }
+        } else {
+            run_host_workers();
+        }
+
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            return entropy[a] < entropy[b];
+        });
+        std::fill(accepted.begin(), accepted.end(), 0);
+        double cumulative_entropy = 0.0;
+        for (int32_t rank = 0; rank < n_canvas; ++rank) {
+            const int32_t pos = order[rank];
+            cumulative_entropy += entropy[pos];
+            if (cumulative_entropy - entropy[pos] <= params.entropy_bound) {
+                accepted[pos] = 1;
+            }
+        }
+
+        float entropy_sum = 0.0f;
+        for (int32_t pos = 0; pos < n_canvas; ++pos) {
+            current_canvas[pos]          = accepted[pos] ? denoiser[pos] : renoise[pos];
+            output_tokens[n_input + pos] = argmax_canvas[pos];
+            entropy_sum += entropy[pos];
+        }
+        decoded_any = true;
+
+        held = prev_argmax == argmax_canvas ? held + 1 : 0;
+        const bool confident = entropy_sum / (float) n_canvas < params.confidence_threshold;
+        finished      = held >= params.stability_threshold && confident;
+        prev_argmax   = argmax_canvas;
+        prev_temp_inv = temp_inv;
+
+        if (params.step_callback &&
+            !params.step_callback(step_idx, params.max_denoising_steps, output_tokens,
+                                  params.max_length, params.step_callback_user_data)) {
+            break;
+        }
+    }
+
+    if (decoded_any) {
+        n_generated = params.max_length;
+    }
 }
