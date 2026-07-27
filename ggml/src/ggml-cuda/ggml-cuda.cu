@@ -4549,7 +4549,7 @@ static bool ggml_backend_cuda_solve_spd(
     ggml_cuda_pool & pool = cuda_ctx->pool();
     ggml_cuda_pool_alloc<float> system_device(pool, system_elements);
     ggml_cuda_pool_alloc<float> solution_device(pool, rhs_elements);
-    ggml_cuda_pool_alloc<int> info_device(pool, 1);
+    ggml_cuda_pool_alloc<int> info_device(pool, 2);
     CUDA_CHECK(cudaMemcpyAsync(
             system_device.get(), system, system_elements*sizeof(float),
             cudaMemcpyHostToDevice, stream));
@@ -4566,25 +4566,19 @@ static bool ggml_backend_cuda_solve_spd(
             handle, CUBLAS_FILL_MODE_UPPER, int(n), system_device.get(),
             int(n), workspace.get(), workspace_elements, info_device.get()));
 
-    int info = 0;
-    CUDA_CHECK(cudaMemcpyAsync(
-            &info, info_device.get(), sizeof(info), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (info != 0) {
-        return false;
-    }
+    int info[2] = {};
 
     CUSOLVER_CHECK(cusolverDnSpotrs(
             handle, CUBLAS_FILL_MODE_UPPER, int(n), int(n_rhs),
             system_device.get(), int(n), solution_device.get(), int(n),
-            info_device.get()));
+            info_device.get() + 1));
     CUDA_CHECK(cudaMemcpyAsync(
             solution, solution_device.get(), rhs_elements*sizeof(float),
             cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(
-            &info, info_device.get(), sizeof(info), cudaMemcpyDeviceToHost, stream));
+            info, info_device.get(), sizeof(info), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return info == 0;
+    return info[0] == 0 && info[1] == 0;
 }
 #endif
 

@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <limits>
 #include <memory>
@@ -1467,7 +1468,7 @@ static hash256 make_config_hash(
         const hash256 & dataset_hash,
         const std::vector<group> & groups) {
     hash_builder hash;
-    hash.update_string("llama.cpp-native-nanoquant-v11-accelerated-spd");
+    hash.update_string("llama.cpp-native-nanoquant-v12-parallel-spd");
     hash.update(dataset_hash.data(), sizeof(dataset_hash));
     hash.update_pod(effective_nthread);
     hash.update_pod(params->nanoquant_sequence_length);
@@ -2322,7 +2323,7 @@ struct compute_backend {
     std::vector<cached_graph *> active_graphs;
     ggml_backend_solve_spd_t solve_spd_fn = nullptr;
 
-    explicit compute_backend(const char * device) {
+    explicit compute_backend(const char * device, bool report = true) {
         backend = device != nullptr && device[0] != '\0' ?
                 ggml_backend_init_by_name(device, nullptr) :
                 ggml_backend_init_best();
@@ -2349,11 +2350,13 @@ struct compute_backend {
         solve_spd_fn = (ggml_backend_solve_spd_t)
                 ggml_backend_reg_get_proc_address(
                         backend_reg, "ggml_backend_solve_spd");
-        LLAMA_LOG_INFO("NanoQuant: primary training backend = %s%s\n",
-                ggml_backend_name(backend),
-                backends.size() > 1 ? " (CPU fallback enabled)" : "");
-        if (solve_spd_fn != nullptr) {
-            LLAMA_LOG_INFO("NanoQuant: accelerated SPD solver enabled\n");
+        if (report) {
+            LLAMA_LOG_INFO("NanoQuant: primary training backend = %s%s\n",
+                    ggml_backend_name(backend),
+                    backends.size() > 1 ? " (CPU fallback enabled)" : "");
+            if (solve_spd_fn != nullptr) {
+                LLAMA_LOG_INFO("NanoQuant: accelerated SPD solver enabled\n");
+            }
         }
     }
 
@@ -2554,23 +2557,39 @@ struct compute_backend {
             int64_t n_in,
             int64_t n_out,
             int64_t rank,
-            int32_t inner_iterations) {
-        cached_graph * required[] = {
-            &get_graph(graph_op::SVID, rank, n_out, inner_iterations, 0),
-            &get_graph(graph_op::SVID, n_in, rank, inner_iterations, 0),
-            &get_graph(graph_op::MUL_MAT, n_in, rank, n_in, rank),
-            &get_graph(graph_op::MUL_MAT, n_in, rank, n_in, n_out),
-            &get_graph(graph_op::OUT_PROD, rank, n_out, rank, n_out),
-            &get_graph(graph_op::OUT_PROD, rank, n_out, n_in, n_out),
-        };
+            int32_t inner_iterations,
+            bool update_u,
+            bool update_v) {
+        std::vector<cached_graph *> required;
+        required.reserve(6);
+        if (update_u) {
+            required.push_back(&get_graph(
+                    graph_op::SVID, rank, n_out, inner_iterations, 0));
+            required.push_back(&get_graph(
+                    graph_op::MUL_MAT, n_in, rank, n_in, rank));
+            required.push_back(&get_graph(
+                    graph_op::MUL_MAT, n_in, rank, n_in, n_out));
+        }
+        if (update_v) {
+            required.push_back(&get_graph(
+                    graph_op::SVID, n_in, rank, inner_iterations, 0));
+            required.push_back(&get_graph(
+                    graph_op::OUT_PROD, rank, n_out, rank, n_out));
+            required.push_back(&get_graph(
+                    graph_op::OUT_PROD, rank, n_out, n_in, n_out));
+        }
         for (cached_graph * graph : required) {
             allocate_graph(*graph);
         }
         if (solve_spd_fn == nullptr) {
-            allocate_graph(get_graph(
-                    graph_op::SOLVE_TRI, rank, rank, n_out, rank));
-            allocate_graph(get_graph(
-                    graph_op::SOLVE_TRI, rank, rank, n_in, rank));
+            if (update_u) {
+                allocate_graph(get_graph(
+                        graph_op::SOLVE_TRI, rank, rank, n_out, rank));
+            }
+            if (update_v) {
+                allocate_graph(get_graph(
+                        graph_op::SOLVE_TRI, rank, rank, n_in, rank));
+            }
         }
         for (const auto & graph : graphs) {
             clear_tensor_allocations(*graph);
@@ -2665,14 +2684,11 @@ struct compute_backend {
             int64_t rows,
             int64_t columns,
             int32_t inner_iterations,
-            deterministic_rng & rng) {
+            const std::vector<float> & right) {
         if (matrix.size() != size_t(rows)*size_t(columns) ||
+            right.size() != size_t(columns) ||
             inner_iterations <= 0) {
             throw std::runtime_error("NanoQuant: internal SVID shape mismatch");
-        }
-        std::vector<float> right(columns);
-        for (float & value : right) {
-            value = rng.normal();
         }
         cached_graph & graph = get_graph(
                 graph_op::SVID, columns, rows, inner_iterations, 0);
@@ -2920,12 +2936,30 @@ static void run_admm(
                 item.name.c_str()));
     }
     backend.reset_cache();
+    std::unique_ptr<compute_backend> auxiliary;
+    if (backend.solve_spd_fn != nullptr) {
+        auxiliary = std::make_unique<compute_backend>(
+                params->nanoquant_device, false);
+        if (auxiliary->solve_spd_fn == nullptr) {
+            auxiliary.reset();
+        }
+    }
     const bool transposed = item.n_out < item.n_in;
     const int64_t n_in = transposed ? item.n_out : item.n_in;
     const int64_t n_out = transposed ? item.n_in : item.n_out;
     const int64_t rank = item.rank;
-    backend.reserve_admm(
-            n_in, n_out, rank, params->nanoquant_admm_inner_iterations);
+    if (auxiliary) {
+        backend.reserve_admm(
+                n_in, n_out, rank, params->nanoquant_admm_inner_iterations,
+                true, false);
+        auxiliary->reserve_admm(
+                n_in, n_out, rank, params->nanoquant_admm_inner_iterations,
+                false, true);
+    } else {
+        backend.reserve_admm(
+                n_in, n_out, rank, params->nanoquant_admm_inner_iterations,
+                true, true);
+    }
     const std::vector<float> & input_importance =
             transposed ? calibration.output_norm : calibration.input_norm;
     const std::vector<float> & output_importance =
@@ -2954,6 +2988,13 @@ static void run_admm(
             uint64_t(item.block + 1) : uint64_t(item.weight->idx + 1);
     deterministic_rng rng(state.rng_state ? state.rng_state :
             (params->nanoquant_seed ^ group_seed*UINT64_C(0x9e3779b97f4a7c15)));
+    auto make_svid_right = [&rng](int64_t columns) {
+        std::vector<float> values(static_cast<size_t>(columns));
+        for (float & value : values) {
+            value = rng.normal();
+        }
+        return values;
+    };
     if (state.stage != checkpoint_stage::ADMM) {
         state.u.resize(size_t(n_out)*size_t(rank));
         state.v.resize(size_t(rank)*size_t(n_in));
@@ -2963,10 +3004,26 @@ static void run_admm(
         for (float & value : state.v) {
             value = rng.normal();
         }
-        state.z_u = backend.svid_rank1(state.u, n_out, rank,
-                params->nanoquant_admm_inner_iterations, rng);
-        state.z_v = backend.svid_rank1(state.v, rank, n_in,
-                params->nanoquant_admm_inner_iterations, rng);
+        const std::vector<float> right_u = make_svid_right(rank);
+        const std::vector<float> right_v = make_svid_right(n_in);
+        if (auxiliary) {
+            auto z_v_future = std::async(std::launch::async, [&]() {
+                return auxiliary->svid_rank1(
+                        state.v, rank, n_in,
+                        params->nanoquant_admm_inner_iterations, right_v);
+            });
+            state.z_u = backend.svid_rank1(
+                    state.u, n_out, rank,
+                    params->nanoquant_admm_inner_iterations, right_u);
+            state.z_v = z_v_future.get();
+        } else {
+            state.z_u = backend.svid_rank1(
+                    state.u, n_out, rank,
+                    params->nanoquant_admm_inner_iterations, right_u);
+            state.z_v = backend.svid_rank1(
+                    state.v, rank, n_in,
+                    params->nanoquant_admm_inner_iterations, right_v);
+        }
         state.dual_u.assign(state.u.size(), 0.0f);
         state.dual_v.assign(state.v.size(), 0.0f);
         state.stage = checkpoint_stage::ADMM;
@@ -2974,116 +3031,146 @@ static void run_admm(
         state.rng_state = rng.state;
     }
 
+    struct admm_branch_result {
+        std::vector<float> factor;
+        std::vector<float> projected;
+    };
+
     for (int32_t iteration = state.progress;
          iteration < params->nanoquant_admm_outer_iterations;
          ++iteration) {
         const float fraction =
                 float(iteration)/float(params->nanoquant_admm_outer_iterations);
         const float rho = fraction;
-
-        std::vector<float> normalized_v = state.z_v;
-        for (int64_t k = 0; k < rank; ++k) {
-            double norm_sq = 0.0;
-            for (int64_t column = 0; column < n_in; ++column) {
-                const float value =
-                        normalized_v[size_t(k)*size_t(n_in) + size_t(column)];
-                norm_sq += double(value)*double(value);
-            }
-            const float inverse =
-                    1.0f/std::max(float(std::sqrt(norm_sq)), NUMERIC_EPSILON);
-            for (int64_t column = 0; column < n_in; ++column) {
-                normalized_v[size_t(k)*size_t(n_in) + size_t(column)] *= inverse;
-            }
-        }
-        std::vector<float> system_u = backend.mul_mat_transposed(
-                normalized_v, rank, normalized_v, rank, n_in);
-        double diagonal_mean_u = 0.0;
-        for (int64_t k = 0; k < rank; ++k) {
-            diagonal_mean_u +=
-                    std::abs(system_u[size_t(k)*size_t(rank) + size_t(k)]);
-        }
-        const float stabilizer_u = std::max(
-                rho*float(diagonal_mean_u/rank) + ADMM_REGULARIZATION,
-                NUMERIC_EPSILON);
-        for (int64_t k = 0; k < rank; ++k) {
-            system_u[size_t(k)*size_t(rank) + size_t(k)] += stabilizer_u;
-        }
-        std::vector<float> rhs_u = backend.mul_mat_transposed(
-                normalized_v, rank, weighted_weight, n_out, n_in);
-        for (size_t i = 0; i < rhs_u.size(); ++i) {
-            rhs_u[i] += rho*(state.z_u[i] - state.dual_u[i]);
-        }
+        const std::vector<float> right_u = make_svid_right(rank);
+        const std::vector<float> right_v = make_svid_right(n_in);
         release_vector(state.u);
-        state.u = solve_spd(backend, std::move(system_u), rhs_u, rank, n_out);
-
-        std::vector<float> normalized_u = state.z_u;
-        std::vector<float> column_norm(rank, 0.0f);
-        for (int64_t row = 0; row < n_out; ++row) {
-            for (int64_t k = 0; k < rank; ++k) {
-                const float value =
-                        normalized_u[size_t(row)*size_t(rank) + size_t(k)];
-                column_norm[k] += value*value;
-            }
-        }
-        for (float & value : column_norm) {
-            value = 1.0f/std::max(std::sqrt(value), NUMERIC_EPSILON);
-        }
-        for (int64_t row = 0; row < n_out; ++row) {
-            for (int64_t k = 0; k < rank; ++k) {
-                normalized_u[size_t(row)*size_t(rank) + size_t(k)] *=
-                        column_norm[k];
-            }
-        }
-        std::vector<float> system_v = backend.out_product(
-                normalized_u, n_out, rank, normalized_u, rank);
-        double diagonal_mean_v = 0.0;
-        for (int64_t k = 0; k < rank; ++k) {
-            diagonal_mean_v +=
-                    std::abs(system_v[size_t(k)*size_t(rank) + size_t(k)]);
-        }
-        const float stabilizer_v = std::max(
-                rho*float(diagonal_mean_v/rank) + ADMM_REGULARIZATION,
-                NUMERIC_EPSILON);
-        for (int64_t k = 0; k < rank; ++k) {
-            system_v[size_t(k)*size_t(rank) + size_t(k)] += stabilizer_v;
-        }
-        std::vector<float> rhs_v_rows = backend.out_product(
-                normalized_u, n_out, rank, weighted_weight, n_in);
-        for (int64_t column = 0; column < n_in; ++column) {
-            for (int64_t k = 0; k < rank; ++k) {
-                const size_t source = size_t(k)*size_t(n_in) + size_t(column);
-                const size_t target = size_t(column)*size_t(rank) + size_t(k);
-                rhs_v_rows[target] +=
-                        rho*(state.z_v[source] - state.dual_v[source]);
-            }
-        }
         release_vector(state.v);
-        const std::vector<float> solved_v_rows =
-                solve_spd(backend, std::move(system_v), rhs_v_rows, rank, n_in);
-        state.v = transpose_matrix(solved_v_rows, n_in, rank);
 
-        for (size_t i = 0; i < state.u.size(); ++i) {
-            state.u[i] += state.dual_u[i];
+        auto update_u = [&]() -> admm_branch_result {
+            std::vector<float> normalized_v = state.z_v;
+            for (int64_t k = 0; k < rank; ++k) {
+                double norm_sq = 0.0;
+                for (int64_t column = 0; column < n_in; ++column) {
+                    const float value =
+                            normalized_v[size_t(k)*size_t(n_in) + size_t(column)];
+                    norm_sq += double(value)*double(value);
+                }
+                const float inverse =
+                        1.0f/std::max(float(std::sqrt(norm_sq)), NUMERIC_EPSILON);
+                for (int64_t column = 0; column < n_in; ++column) {
+                    normalized_v[size_t(k)*size_t(n_in) + size_t(column)] *= inverse;
+                }
+            }
+            std::vector<float> system = backend.mul_mat_transposed(
+                    normalized_v, rank, normalized_v, rank, n_in);
+            double diagonal_mean = 0.0;
+            for (int64_t k = 0; k < rank; ++k) {
+                diagonal_mean +=
+                        std::abs(system[size_t(k)*size_t(rank) + size_t(k)]);
+            }
+            const float stabilizer = std::max(
+                    rho*float(diagonal_mean/rank) + ADMM_REGULARIZATION,
+                    NUMERIC_EPSILON);
+            for (int64_t k = 0; k < rank; ++k) {
+                system[size_t(k)*size_t(rank) + size_t(k)] += stabilizer;
+            }
+            std::vector<float> rhs = backend.mul_mat_transposed(
+                    normalized_v, rank, weighted_weight, n_out, n_in);
+            for (size_t i = 0; i < rhs.size(); ++i) {
+                rhs[i] += rho*(state.z_u[i] - state.dual_u[i]);
+            }
+            std::vector<float> factor =
+                    solve_spd(backend, std::move(system), rhs, rank, n_out);
+            for (size_t i = 0; i < factor.size(); ++i) {
+                factor[i] += state.dual_u[i];
+            }
+            std::vector<float> projected = backend.svid_rank1(
+                    factor, n_out, rank,
+                    params->nanoquant_admm_inner_iterations, right_u);
+            for (size_t i = 0; i < factor.size(); ++i) {
+                factor[i] -= state.dual_u[i];
+                state.dual_u[i] += factor[i] - projected[i];
+            }
+            return {std::move(factor), std::move(projected)};
+        };
+
+        compute_backend & v_backend = auxiliary ? *auxiliary : backend;
+        auto update_v = [&]() -> admm_branch_result {
+            std::vector<float> normalized_u = state.z_u;
+            std::vector<float> column_norm(rank, 0.0f);
+            for (int64_t row = 0; row < n_out; ++row) {
+                for (int64_t k = 0; k < rank; ++k) {
+                    const float value =
+                            normalized_u[size_t(row)*size_t(rank) + size_t(k)];
+                    column_norm[k] += value*value;
+                }
+            }
+            for (float & value : column_norm) {
+                value = 1.0f/std::max(std::sqrt(value), NUMERIC_EPSILON);
+            }
+            for (int64_t row = 0; row < n_out; ++row) {
+                for (int64_t k = 0; k < rank; ++k) {
+                    normalized_u[size_t(row)*size_t(rank) + size_t(k)] *=
+                            column_norm[k];
+                }
+            }
+            std::vector<float> system = v_backend.out_product(
+                    normalized_u, n_out, rank, normalized_u, rank);
+            double diagonal_mean = 0.0;
+            for (int64_t k = 0; k < rank; ++k) {
+                diagonal_mean +=
+                        std::abs(system[size_t(k)*size_t(rank) + size_t(k)]);
+            }
+            const float stabilizer = std::max(
+                    rho*float(diagonal_mean/rank) + ADMM_REGULARIZATION,
+                    NUMERIC_EPSILON);
+            for (int64_t k = 0; k < rank; ++k) {
+                system[size_t(k)*size_t(rank) + size_t(k)] += stabilizer;
+            }
+            std::vector<float> rhs_rows = v_backend.out_product(
+                    normalized_u, n_out, rank, weighted_weight, n_in);
+            for (int64_t column = 0; column < n_in; ++column) {
+                for (int64_t k = 0; k < rank; ++k) {
+                    const size_t source =
+                            size_t(k)*size_t(n_in) + size_t(column);
+                    const size_t target =
+                            size_t(column)*size_t(rank) + size_t(k);
+                    rhs_rows[target] +=
+                            rho*(state.z_v[source] - state.dual_v[source]);
+                }
+            }
+            std::vector<float> solved_rows =
+                    solve_spd(v_backend, std::move(system), rhs_rows, rank, n_in);
+            std::vector<float> factor =
+                    transpose_matrix(solved_rows, n_in, rank);
+            for (size_t i = 0; i < factor.size(); ++i) {
+                factor[i] += state.dual_v[i];
+            }
+            std::vector<float> projected = v_backend.svid_rank1(
+                    factor, rank, n_in,
+                    params->nanoquant_admm_inner_iterations, right_v);
+            for (size_t i = 0; i < factor.size(); ++i) {
+                factor[i] -= state.dual_v[i];
+                state.dual_v[i] += factor[i] - projected[i];
+            }
+            return {std::move(factor), std::move(projected)};
+        };
+
+        admm_branch_result result_u;
+        admm_branch_result result_v;
+        if (auxiliary) {
+            auto v_future = std::async(std::launch::async, update_v);
+            result_u = update_u();
+            result_v = v_future.get();
+        } else {
+            result_u = update_u();
+            result_v = update_v();
         }
-        state.z_u = backend.svid_rank1(state.u, n_out, rank,
-                params->nanoquant_admm_inner_iterations, rng);
-        for (size_t i = 0; i < state.u.size(); ++i) {
-            state.u[i] -= state.dual_u[i];
-        }
-        for (size_t i = 0; i < state.v.size(); ++i) {
-            state.v[i] += state.dual_v[i];
-        }
-        state.z_v = backend.svid_rank1(state.v, rank, n_in,
-                params->nanoquant_admm_inner_iterations, rng);
-        for (size_t i = 0; i < state.v.size(); ++i) {
-            state.v[i] -= state.dual_v[i];
-        }
-        for (size_t i = 0; i < state.u.size(); ++i) {
-            state.dual_u[i] += state.u[i] - state.z_u[i];
-        }
-        for (size_t i = 0; i < state.v.size(); ++i) {
-            state.dual_v[i] += state.v[i] - state.z_v[i];
-        }
+        state.u = std::move(result_u.factor);
+        state.z_u = std::move(result_u.projected);
+        state.v = std::move(result_v.factor);
+        state.z_v = std::move(result_v.projected);
         state.progress = uint32_t(iteration + 1);
         state.rng_state = rng.state;
         const bool log_iteration =
