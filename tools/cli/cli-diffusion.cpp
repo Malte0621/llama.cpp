@@ -1,4 +1,5 @@
 #include "cli-diffusion.h"
+#include "cli-ui.h"
 #include "chat.h"
 #include "common.h"
 #include "diffusion.h"
@@ -307,6 +308,7 @@ static bool diffusion_step_callback(int32_t             step,
 }
 
 int llama_cli_diffusion(common_params & params) {
+    ui::init(params);
     llama_backend_init();
     ggml_backend_load_all();
 
@@ -734,23 +736,22 @@ int llama_cli_diffusion(common_params & params) {
             fwrite(fin.data(), 1, fin.size(), stdout);
             fflush(stdout);
         }
-        LOG("\n%s\n", response.c_str());
-        if (use_eb && cb_data.steps_seen > 0) {
+        {
+            ui::assistant_turn turn;
+            turn.push(ui::ASSISTANT_DISPLAY_MODE_CONTENT, "\n" + response);
+        }
+        if (params.show_timings && cb_data.steps_seen > 0 && turn_us > 0) {
             const double total_ms = turn_us / 1000.0;
             const double per_step = total_ms / cb_data.steps_seen;
-            LOG("total time: %.2fms, time per step: %.2fms (%d steps over %d blocks, entropy-bound)\n",
-                total_ms, per_step, cb_data.steps_seen, cb_data.blocks_seen);
-            // effective tok/s = canvas tokens this turn / wall time; in-step parallel = canvas / per-step
-            // (every canvas position is refined each step; step count divides it down to effective).
-            if (canvas_length > 0 && cb_data.blocks_seen > 0) {
-                const int    gen_toks = (int) canvas_length * cb_data.blocks_seen;
-                const double eff_tps  = gen_toks * 1000.0 / total_ms;
-                const double par_tps  = canvas_length * 1000.0 / per_step;
-                LOG("throughput: %.1f tok/s (%d tok in %.2fms), in-step parallel %.0f tok/s "
-                    "(%d-tok canvas x %.1f steps/block)\n",
-                    eff_tps, gen_toks, total_ms, par_tps, (int) canvas_length,
-                    (double) cb_data.steps_seen / cb_data.blocks_seen);
-            }
+            const int64_t step_tokens = canvas_length > 0 ?
+                canvas_length : std::max<int64_t>(1, diff_params.max_length - cb_data.n_input);
+            const int64_t generated_tokens = step_tokens * std::max(1, cb_data.blocks_seen);
+            const double prompt_tps = step_tokens * 1000.0 / per_step;
+            const double generation_tps = generated_tokens * 1000.0 / total_ms;
+            ui::show_info(string_format(
+                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+                prompt_tps,
+                generation_tps));
         }
         return response;
     };
@@ -776,37 +777,36 @@ int llama_cli_diffusion(common_params & params) {
         std::string pending = params.prompt;  // optional first user turn supplied via -p
         while (true) {
             std::string user;
-            if (!pending.empty()) {
-                user = pending;
-                pending.clear();
-            } else {
-                common_log_flush(common_log_main());  // drain async logs so they don't clobber the prompt
-                printf("\n> ");
-                fflush(stdout);
-                if (!std::getline(std::cin, user)) {
-                    break;  // EOF (Ctrl-D)
+            {
+                ui::user_turn turn;
+                if (!pending.empty()) {
+                    user = pending;
+                    pending.clear();
+                    turn.echo(user);
+                } else {
+                    user = turn.read_input(params.multiline_input);
                 }
-                if (user == "/exit" || user == "/quit") {
-                    break;
+            }
+            if (user == "/exit" || user == "/quit") {
+                break;
+            }
+            if (user == "/help" || user == "/?") {
+                LOG("commands:\n"
+                    "  /help, /?      show this message\n"
+                    "  /clear         clear the conversation history (keeps the system prompt)\n"
+                    "  /exit, /quit   end the session\n");
+                continue;
+            }
+            if (user == "/clear") {
+                messages.clear();
+                if (!params.system_prompt.empty()) {
+                    messages.push_back(make_msg("system", params.system_prompt));
                 }
-                if (user == "/help" || user == "/?") {
-                    LOG("commands:\n"
-                        "  /help, /?      show this message\n"
-                        "  /clear         clear the conversation history (keeps the system prompt)\n"
-                        "  /exit, /quit   end the session\n");
-                    continue;
-                }
-                if (user == "/clear") {
-                    messages.clear();
-                    if (!params.system_prompt.empty()) {
-                        messages.push_back(make_msg("system", params.system_prompt));
-                    }
-                    LOG("conversation history cleared\n");
-                    continue;
-                }
-                if (user.empty()) {
-                    continue;
-                }
+                LOG("conversation history cleared\n");
+                continue;
+            }
+            if (user.empty()) {
+                continue;
             }
 
             messages.push_back(make_msg("user", user));
@@ -817,6 +817,10 @@ int llama_cli_diffusion(common_params & params) {
             }
         }
     } else {
+        if (params.display_prompt) {
+            ui::user_turn turn;
+            turn.echo(params.prompt);
+        }
         std::string formatted = params.prompt;
         if (params.enable_chat_template) {
             std::vector<common_chat_msg> messages;
