@@ -357,22 +357,34 @@ int llama_cli_diffusion(common_params & params) {
         eb_params.step_callback           = diffusion_step_callback;
         eb_params.step_callback_user_data = &cb_data;
 
-        // Prefix KV caching is safe on CPU and single-accelerator placement, but the prompt store is not
-        // replicated across multiple accelerator devices.
-        int gpu_devs = 0;
+        // Prefix KV caching and device sampling require a single accelerator because their persistent
+        // buffers are not replicated across devices.
+        int accelerator_devs = 0;
         int sampling_devs = 0;
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        auto count_device = [&](ggml_backend_dev_t dev) {
             const auto type = ggml_backend_dev_type(dev);
             if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                continue;
+                return;
             }
-            ++gpu_devs;
+            ++accelerator_devs;
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
             const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
             if (reg_name && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 ||
-                             strcmp(reg_name, "MUSA") == 0)) {
+                             strcmp(reg_name, "MUSA") == 0 ||
+                             ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample") != nullptr)) {
                 ++sampling_devs;
+            }
+        };
+        if (params.devices.empty()) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                count_device(ggml_backend_dev_get(i));
+            }
+        } else {
+            for (ggml_backend_dev_t dev : params.devices) {
+                if (dev == nullptr) {
+                    break;
+                }
+                count_device(dev);
             }
         }
         if (params.diffusion.eb_kv_cache == 1) {
@@ -380,13 +392,13 @@ int llama_cli_diffusion(common_params & params) {
         } else if (params.diffusion.eb_kv_cache == 2) {
             eb_params.kv_cache = false;
         } else {
-            eb_params.kv_cache = gpu_devs <= 1;
-            if (gpu_devs > 1) {
-                LOG_INF("diffusion_eb: kv cache auto-off (%d accelerator devices)\n", gpu_devs);
+            eb_params.kv_cache = accelerator_devs <= 1;
+            if (accelerator_devs > 1) {
+                LOG_INF("diffusion_eb: kv cache auto-off (%d accelerator devices)\n", accelerator_devs);
             }
         }
 
-        const bool can_device_sample = sampling_devs == 1 && params.n_gpu_layers != 0;
+        const bool can_device_sample = accelerator_devs == 1 && sampling_devs == 1 && params.n_gpu_layers != 0;
         eb_params.gpu_sampling = params.diffusion.eb_gpu_sampling != 2 && can_device_sample;
         if (params.diffusion.eb_gpu_sampling != 2 && !can_device_sample) {
             LOG_INF("diffusion_eb: device sampling off (found %d compatible CUDA/ROCm/MUSA devices)\n",

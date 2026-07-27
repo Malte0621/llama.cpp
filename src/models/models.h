@@ -854,15 +854,15 @@ struct llama_model_diffusion_gemma : public llama_model_base {
     mutable float         sc_temp_inv   = 1.0f;
     mutable bool          sc_enabled    = false;
 
-    // self-conditioning soft embedding: embed_tokens transposed to [n_vocab, n_embd] F16 in a device
-    // weights buffer (per-step matmul stays on-device). Built lazily on first use, freed in the destructor.
+    // self-conditioning soft embedding: embed_tokens transposed to [n_vocab, n_embd] F16 in the output
+    // device's weights buffer beside the SC MLP. Built lazily on first use, freed in the destructor.
     mutable ggml_tensor           * sc_embT     = nullptr;  // [n_vocab, n_embd] F16 (embed_tokens transposed)
     mutable ggml_context          * sc_embT_ctx = nullptr;
     mutable ggml_backend_buffer_t   sc_embT_buf = nullptr;
 
-    // device-resident self-conditioning (opt-in via llama_diffusion_set_device_sc): keep the prev step's
-    // raw canvas logits in sc_dev (device) and read SC from it instead of a per-step 268 MB host upload.
-    // Bit-identical to the host path (same F32 logits); single-device, like the PKV store.
+    // device-resident self-conditioning (opt-in via llama_diffusion_set_device_sc): keep the previous step's
+    // raw canvas logits on the output device and read SC from them instead of uploading logits from the host.
+    // Bit-identical to the host path because both retain the same F32 logits.
     mutable bool                    sc_device_resident = false;
     mutable ggml_tensor           * sc_dev      = nullptr;  // [n_vocab, sc_dev_C] F32 prev-step canvas logits
     mutable ggml_context          * sc_dev_ctx  = nullptr;
@@ -874,8 +874,8 @@ struct llama_model_diffusion_gemma : public llama_model_base {
     //   PKV_UNIFIED : no-cache forward over [prompt|canvas] (default + safety fallback).
     //   PKV_PREFILL : forward a chunk of the prompt; write its per-layer K,V into the store at pkv_prefill_off.
     //   PKV_DECODE  : forward the canvas only; read the cached prompt K,V.
-    // Store is device-resident (in pkv_buf/pkv_ctx), allocated lazily from the PREFILL graph; element type
-    // follows flash-attn (F16 under FA - precision-neutral since FA casts K,V to F16 anyway - else F32).
+    // Store is sharded by layer buffer type, allocated lazily from the PREFILL graph; element type follows
+    // flash-attn (F16 under FA, precision-neutral since FA casts K,V to F16 anyway, else F32).
     enum pkv_phase_t { PKV_UNIFIED = 0, PKV_PREFILL = 1, PKV_DECODE = 2 };
     mutable pkv_phase_t pkv_phase = PKV_UNIFIED;
     mutable int64_t     pkv_P     = 0;   // prompt length of the current block
@@ -883,8 +883,8 @@ struct llama_model_diffusion_gemma : public llama_model_base {
     mutable int64_t     pkv_cap   = 0;   // allocated capacity (max P) of the store
     mutable std::vector<ggml_tensor *> pkv_k;   // per layer [n_embd_head_k(il), n_head_kv(il), pkv_cap]
     mutable std::vector<ggml_tensor *> pkv_v;
-    mutable ggml_context        * pkv_ctx = nullptr;
-    mutable ggml_backend_buffer_t pkv_buf = nullptr;
+    mutable std::vector<ggml_context *>          pkv_ctxs;
+    mutable std::vector<ggml_backend_buffer_t>   pkv_bufs;
 
     ~llama_model_diffusion_gemma() override;
 

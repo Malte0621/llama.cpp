@@ -17,6 +17,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -71,6 +72,8 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_DIFFUSION_SAMPLE,
+    RPC_CMD_SUPPORTS_OP,
     RPC_CMD_COUNT,
 };
 
@@ -103,6 +106,12 @@ struct rpc_msg_get_alloc_size_req {
 
 struct rpc_msg_get_alloc_size_rsp {
     uint64_t alloc_size;
+};
+
+typedef rpc_msg_get_alloc_size_req rpc_msg_supports_op_req;
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t result;
 };
 
 struct rpc_msg_init_tensor_req {
@@ -190,7 +199,22 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+struct rpc_msg_diffusion_sample_req {
+    uint32_t   device;
+    rpc_tensor logits;
+    int32_t    n_tokens;
+    float      inv_temp;
+};
+
+struct rpc_msg_diffusion_sample_rsp {
+    uint8_t result;
+    uint8_t padding[7];
+};
+
 #pragma pack(pop)
+
+typedef bool (*rpc_diffusion_sample_fn)(
+        struct ggml_tensor *, const float *, int *, float *, int *, int, float);
 
 // RPC data structures
 
@@ -445,6 +469,66 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
+}
+
+static bool ggml_backend_rpc_diffusion_sample(
+        struct ggml_tensor * logits,
+        const float        * uniforms,
+        int                * argmax,
+        float              * entropy,
+        int                * sampled,
+        int                  n_tokens,
+        float                inv_temp) {
+    static_assert(sizeof(int) == sizeof(int32_t), "RPC diffusion sampling requires 32-bit int");
+
+    if (logits == nullptr || logits->buffer == nullptr || uniforms == nullptr ||
+            argmax == nullptr || entropy == nullptr || sampled == nullptr || n_tokens <= 0 ||
+            !ggml_backend_buffer_is_rpc(logits->buffer)) {
+        return false;
+    }
+
+    auto * buffer_ctx = (ggml_backend_rpc_buffer_context *) logits->buffer->context;
+    auto * buft_ctx = (ggml_backend_rpc_buffer_type_context *)
+        ggml_backend_buffer_get_type(logits->buffer)->context;
+    if (buffer_ctx == nullptr || buffer_ctx->sock == nullptr || buft_ctx == nullptr) {
+        return false;
+    }
+
+    const size_t count = (size_t) n_tokens;
+    const size_t result_stride = 2 * sizeof(int32_t) + sizeof(float);
+    if (count > (std::numeric_limits<size_t>::max() - sizeof(rpc_msg_diffusion_sample_req)) / sizeof(float) ||
+            count > (std::numeric_limits<size_t>::max() - sizeof(rpc_msg_diffusion_sample_rsp)) / result_stride) {
+        return false;
+    }
+
+    rpc_msg_diffusion_sample_req request = {};
+    request.device   = buft_ctx->device;
+    request.logits   = serialize_tensor(logits);
+    request.n_tokens = n_tokens;
+    request.inv_temp = inv_temp;
+
+    std::vector<uint8_t> input(sizeof(request) + count * sizeof(float));
+    memcpy(input.data(), &request, sizeof(request));
+    memcpy(input.data() + sizeof(request), uniforms, count * sizeof(float));
+
+    std::vector<uint8_t> output(sizeof(rpc_msg_diffusion_sample_rsp) + count * result_stride);
+    const bool status = send_rpc_cmd(buffer_ctx->sock, RPC_CMD_DIFFUSION_SAMPLE,
+            input.data(), input.size(), output.data(), output.size());
+    RPC_STATUS_ASSERT(status);
+
+    rpc_msg_diffusion_sample_rsp response;
+    memcpy(&response, output.data(), sizeof(response));
+    if (!response.result) {
+        return false;
+    }
+
+    const uint8_t * src = output.data() + sizeof(response);
+    memcpy(argmax,  src, count * sizeof(int32_t));
+    src += count * sizeof(int32_t);
+    memcpy(entropy, src, count * sizeof(float));
+    src += count * sizeof(float);
+    memcpy(sampled, src, count * sizeof(int32_t));
+    return true;
 }
 
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -841,7 +925,9 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool diffusion_sample(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -908,6 +994,36 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
 
+    return true;
+}
+
+bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response) {
+    if (request.device >= backends.size()) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+
+    ggml_tensor * op = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (op == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (request.srcs[i].id != 0) {
+            op->src[i] = deserialize_tensor(ctx_ptr.get(), &request.srcs[i]);
+            if (op->src[i] == nullptr) {
+                return false;
+            }
+        }
+    }
+
+    response.result = ggml_backend_supports_op(backends[request.device], op);
     return true;
 }
 
@@ -1421,6 +1537,75 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::diffusion_sample(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    static_assert(sizeof(int) == sizeof(int32_t), "RPC diffusion sampling requires 32-bit int");
+
+    if (input.size() < sizeof(rpc_msg_diffusion_sample_req)) {
+        return false;
+    }
+
+    rpc_msg_diffusion_sample_req request;
+    memcpy(&request, input.data(), sizeof(request));
+    if (request.device >= backends.size() || request.n_tokens <= 0) {
+        return false;
+    }
+
+    const size_t count = (size_t) request.n_tokens;
+    const size_t result_stride = 2 * sizeof(int32_t) + sizeof(float);
+    if (count > (std::numeric_limits<size_t>::max() - sizeof(request)) / sizeof(float) ||
+            count > (std::numeric_limits<size_t>::max() - sizeof(rpc_msg_diffusion_sample_rsp)) / result_stride ||
+            input.size() != sizeof(request) + count * sizeof(float)) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * logits = deserialize_tensor(ctx_ptr.get(), &request.logits);
+    if (logits == nullptr || logits->buffer == nullptr ||
+            !ggml_backend_supports_buft(backends[request.device], logits->buffer->buft)) {
+        return false;
+    }
+
+    response.assign(sizeof(rpc_msg_diffusion_sample_rsp) + count * result_stride, 0);
+    rpc_msg_diffusion_sample_rsp response_header = {};
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[request.device]);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const auto fn = reg ? (rpc_diffusion_sample_fn)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample") : nullptr;
+    if (fn == nullptr) {
+        memcpy(response.data(), &response_header, sizeof(response_header));
+        return true;
+    }
+
+    std::vector<float> uniforms(count);
+    std::vector<int> argmax(count);
+    std::vector<float> entropy(count);
+    std::vector<int> sampled(count);
+    memcpy(uniforms.data(), input.data() + sizeof(request), count * sizeof(float));
+
+    response_header.result = fn(logits, uniforms.data(), argmax.data(), entropy.data(), sampled.data(),
+            request.n_tokens, request.inv_temp);
+    memcpy(response.data(), &response_header, sizeof(response_header));
+    if (response_header.result) {
+        uint8_t * dst = response.data() + sizeof(response_header);
+        memcpy(dst, argmax.data(), count * sizeof(int32_t));
+        dst += count * sizeof(int32_t);
+        memcpy(dst, entropy.data(), count * sizeof(float));
+        dst += count * sizeof(float);
+        memcpy(dst, sampled.data(), count * sizeof(int32_t));
+    }
+
+    LOG_DBG("[%s] device: %u, n_tokens: %d, result: %u\n",
+            __func__, request.device, request.n_tokens, response_header.result);
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -1672,6 +1857,34 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_DIFFUSION_SAMPLE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.diffusion_sample(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -1822,10 +2035,24 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    if (op == nullptr) {
+        return false;
+    }
+
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    rpc_msg_supports_op_req request = {};
+    request.device = ctx->device;
+    request.tensor = serialize_tensor(op);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        request.srcs[i] = serialize_tensor(op->src[i]);
+    }
+
+    rpc_msg_supports_op_rsp response;
+    auto sock = get_socket(ctx->endpoint);
+    const bool status = sock && send_rpc_cmd(sock, RPC_CMD_SUPPORTS_OP,
+            &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    return response.result;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -1888,6 +2115,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_cuda_diffusion_sample") == 0) {
+        return (void *)ggml_backend_rpc_diffusion_sample;
     }
     return NULL;
 

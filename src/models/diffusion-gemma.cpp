@@ -687,8 +687,8 @@ bool llama_diffusion_device_sample(const struct llama_model * model, const float
 }
 
 llama_model_diffusion_gemma::~llama_model_diffusion_gemma() {
-    if (pkv_buf) { ggml_backend_buffer_free(pkv_buf); pkv_buf = nullptr; }
-    if (pkv_ctx) { ggml_free(pkv_ctx); pkv_ctx = nullptr; }
+    for (auto * buf : pkv_bufs) { ggml_backend_buffer_free(buf); }
+    for (auto * ctx : pkv_ctxs) { ggml_free(ctx); }
     if (sc_embT_buf) { ggml_backend_buffer_free(sc_embT_buf); sc_embT_buf = nullptr; }
     if (sc_embT_ctx) { ggml_free(sc_embT_ctx); sc_embT_ctx = nullptr; }
     if (sc_dev_buf)  { ggml_backend_buffer_free(sc_dev_buf);  sc_dev_buf  = nullptr; }
@@ -696,7 +696,7 @@ llama_model_diffusion_gemma::~llama_model_diffusion_gemma() {
 }
 
 // Build the SC soft-embedding weight once: tok_embd dequantized + transposed to [n_vocab, n_embd] F16
-// in a device weights buffer, so the per-step SC matmul runs on-device instead of on the CPU.
+// in the output device's weights buffer beside the SC MLP, so the per-step matmul stays on-device.
 static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
     if (m.sc_embT != nullptr) {
         return;
@@ -712,7 +712,7 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
     m.sc_embT = ggml_new_tensor_2d(m.sc_embT_ctx, GGML_TYPE_F16, n_vocab, n_embd);
     ggml_set_name(m.sc_embT, "sc_embT");
 
-    ggml_backend_dev_t dev = m.dev_layer(0);
+    ggml_backend_dev_t dev = m.dev_output();
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
     m.sc_embT_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_embT_ctx, buft);
     GGML_ASSERT(m.sc_embT_buf != nullptr);
@@ -759,8 +759,8 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
     ggml_backend_tensor_set(m.sc_embT, dstT.data(), 0, dstT.size() * sizeof(ggml_fp16_t));
 }
 
-// Lazily (re)allocate the device prev-step canvas-logits buffer [n_vocab, C] F32 (grow-only) on layer-0's
-// buft. Zero-init so step 0 (SC gated off) reads finite values: soft_max(0)=uniform x 0 gate, no NaN.
+// Lazily (re)allocate the device prev-step canvas-logits buffer [n_vocab, C] F32 (grow-only) on the output
+// device. Zero-init so step 0 (SC gated off) reads finite values: soft_max(0)=uniform x 0 gate, no NaN.
 static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
     const int64_t n_vocab = m.tok_embd->ne[1];
     if (m.sc_dev != nullptr && m.sc_dev_C >= C) {
@@ -775,7 +775,7 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
     m.sc_dev = ggml_new_tensor_2d(m.sc_dev_ctx, GGML_TYPE_F32, n_vocab, C);
     ggml_set_name(m.sc_dev, "sc_dev");
 
-    ggml_backend_dev_t dev = m.dev_layer(0);
+    ggml_backend_dev_t dev = m.dev_output();
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
                                           : ggml_backend_cpu_buffer_type();
     m.sc_dev_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_dev_ctx, buft);
@@ -785,44 +785,63 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
 }
 
 // Lazily (re)allocate the device-resident prompt-KV store (per-layer K,V, grow-only) for a prompt of length
-// P at element type `type`, on layer-0's buffer type (single-GPU; cross-device would need a per-buft context
-// map). Reallocates when the capacity grows or the type changes. Called from the graph (PREFILL), where the
-// type can follow cparams.flash_attn - F16 halves the store and is precision-neutral under FA.
+// P at element type `type`. Tensors share one context and buffer per layer buffer type, keeping every
+// layer's cache on the same device as that layer. Reallocates when capacity grows or type changes.
 static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type) {
-    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
+    if (!m.pkv_bufs.empty() && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
         return;
     }
-    if (m.pkv_buf) { ggml_backend_buffer_free(m.pkv_buf); m.pkv_buf = nullptr; }
-    if (m.pkv_ctx) { ggml_free(m.pkv_ctx); m.pkv_ctx = nullptr; }
+    for (auto * buf : m.pkv_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (auto * ctx : m.pkv_ctxs) {
+        ggml_free(ctx);
+    }
+    m.pkv_bufs.clear();
+    m.pkv_ctxs.clear();
     m.pkv_k.clear();
     m.pkv_v.clear();
 
     const int     n_layer = (int) m.hparams.n_layer();
     const int64_t cap     = P;
 
-    ggml_init_params ip = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (2 * n_layer + 4),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    m.pkv_ctx = ggml_init(ip);
-    GGML_ASSERT(m.pkv_ctx != nullptr);
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context *>> ctx_by_buft;
     m.pkv_k.resize(n_layer);
     m.pkv_v.resize(n_layer);
+
     for (int il = 0; il < n_layer; ++il) {
+        ggml_backend_dev_t dev = m.dev_layer(il);
+        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
+                                              : ggml_backend_cpu_buffer_type();
+
+        auto it = std::find_if(ctx_by_buft.begin(), ctx_by_buft.end(),
+                [buft](const auto & item) { return item.first == buft; });
+        if (it == ctx_by_buft.end()) {
+            ggml_init_params ip = {
+                /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (2 * n_layer + 4),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(ip);
+            GGML_ASSERT(ctx != nullptr);
+            ctx_by_buft.emplace_back(buft, ctx);
+            it = std::prev(ctx_by_buft.end());
+        }
+
         const int64_t hd  = m.hparams.n_embd_head_k(il);
         const int64_t nkv = m.hparams.n_head_kv(il);
-        m.pkv_k[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
-        m.pkv_v[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
+        m.pkv_k[il] = ggml_new_tensor_3d(it->second, type, hd, nkv, cap);
+        m.pkv_v[il] = ggml_new_tensor_3d(it->second, type, hd, nkv, cap);
         ggml_format_name(m.pkv_k[il], "pkv_k_l%d", il);
         ggml_format_name(m.pkv_v[il], "pkv_v_l%d", il);
     }
 
-    ggml_backend_dev_t dev = m.dev_layer(0);
-    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
-                                          : ggml_backend_cpu_buffer_type();
-    m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
-    GGML_ASSERT(m.pkv_buf != nullptr);
+    for (const auto & [buft, ctx] : ctx_by_buft) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        GGML_ASSERT(buf != nullptr);
+        m.pkv_ctxs.push_back(ctx);
+        m.pkv_bufs.push_back(buf);
+    }
     m.pkv_cap = cap;
 }
 
