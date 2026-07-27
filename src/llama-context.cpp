@@ -3542,9 +3542,10 @@ float llama_context::nanoquant_optimizer_step(
     }
 
     const size_t size_gf = ggml_graph_size(gf);
+    const size_t size_opt_graph = 6*size_gf;
     const size_t size_meta =
             6*size_gf*ggml_tensor_overhead() +
-            2*ggml_graph_overhead_custom(size_gf, true);
+            2*ggml_graph_overhead_custom(size_opt_graph, true);
     ggml_init_params compute_params = {
         /*.mem_size   =*/ size_meta,
         /*.mem_buffer =*/ nullptr,
@@ -3554,9 +3555,12 @@ float llama_context::nanoquant_optimizer_step(
     if (!ctx_compute_opt) {
         throw std::runtime_error("NanoQuant: failed to allocate optimizer graph metadata");
     }
+    ggml_cgraph * gf_opt = ggml_new_graph_custom(
+            ctx_compute_opt.get(), size_opt_graph, true);
+    ggml_graph_cpy(gf, gf_opt);
 
     ggml_opt_prepare_alloc(
-            optimizer->opt_ctx, ctx_compute_opt.get(), gf, res->get_inp_tokens(), output);
+            optimizer->opt_ctx, ctx_compute_opt.get(), gf_opt, res->get_inp_tokens(), output);
     ggml_opt_alloc(optimizer->opt_ctx, true);
     res->set_inputs(&ubatch);
     if (weight_tensor != nullptr) {
