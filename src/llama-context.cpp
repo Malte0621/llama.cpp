@@ -3779,6 +3779,7 @@ float llama_context::nanoquant_optimizer_step(
             ggml_backend_tensor_get(
                     grad, optimizer->gradients.data(), 0, n*sizeof(float));
 
+            static constexpr double gradient_importance_scale = 1.0e6;
             std::vector<double> norms(rows, 0.0);
             for (size_t row = 0; row < rows; ++row) {
                 double norm_sq = 0.0;
@@ -3813,7 +3814,8 @@ float llama_context::nanoquant_optimizer_step(
                 for (size_t column = 0; column < width; ++column) {
                     const double value =
                             double(optimizer->gradients[row*width + column])*scale;
-                    output_importance[column] += value*value/double(rows);
+                    output_importance[column] +=
+                            gradient_importance_scale*value*value/double(rows);
                 }
             }
         }

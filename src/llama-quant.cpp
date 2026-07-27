@@ -1450,7 +1450,7 @@ static hash256 make_config_hash(
         const hash256 & dataset_hash,
         const std::vector<group> & groups) {
     hash_builder hash;
-    hash.update_string("llama.cpp-native-nanoquant-v4-fisher-transpose");
+    hash.update_string("llama.cpp-native-nanoquant-v5-gradient-scale");
     hash.update(dataset_hash.data(), sizeof(dataset_hash));
     hash.update_pod(effective_nthread);
     hash.update_pod(params->nanoquant_sequence_length);
