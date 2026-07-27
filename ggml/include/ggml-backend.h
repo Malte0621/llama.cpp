@@ -206,6 +206,15 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Solve A*X=B for a symmetric positive-definite A. A is [n,n], B and X are [n,n_rhs].
+    // Returns false if A is not positive-definite. The function may be unavailable.
+    typedef bool (*ggml_backend_solve_spd_t)(
+            ggml_backend_t backend,
+            const float * a,
+            const float * b,
+            float * x,
+            int64_t n,
+            int64_t n_rhs);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

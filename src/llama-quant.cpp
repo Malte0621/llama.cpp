@@ -2320,6 +2320,7 @@ struct compute_backend {
     std::vector<std::unique_ptr<cached_graph>> graphs;
     std::vector<ggml_gallocr_t> allocators;
     std::vector<cached_graph *> active_graphs;
+    ggml_backend_solve_spd_t solve_spd_fn = nullptr;
 
     explicit compute_backend(const char * device) {
         backend = device != nullptr && device[0] != '\0' ?
@@ -2343,9 +2344,17 @@ struct compute_backend {
         }
         allocators.resize(backends.size(), nullptr);
         active_graphs.resize(backends.size(), nullptr);
+        ggml_backend_reg_t backend_reg = ggml_backend_dev_backend_reg(
+                ggml_backend_get_device(backend));
+        solve_spd_fn = (ggml_backend_solve_spd_t)
+                ggml_backend_reg_get_proc_address(
+                        backend_reg, "ggml_backend_solve_spd");
         LLAMA_LOG_INFO("NanoQuant: primary training backend = %s%s\n",
                 ggml_backend_name(backend),
                 backends.size() > 1 ? " (CPU fallback enabled)" : "");
+        if (solve_spd_fn != nullptr) {
+            LLAMA_LOG_INFO("NanoQuant: accelerated SPD solver enabled\n");
+        }
     }
 
     ~compute_backend() {
@@ -2553,11 +2562,15 @@ struct compute_backend {
             &get_graph(graph_op::MUL_MAT, n_in, rank, n_in, n_out),
             &get_graph(graph_op::OUT_PROD, rank, n_out, rank, n_out),
             &get_graph(graph_op::OUT_PROD, rank, n_out, n_in, n_out),
-            &get_graph(graph_op::SOLVE_TRI, rank, rank, n_out, rank),
-            &get_graph(graph_op::SOLVE_TRI, rank, rank, n_in, rank),
         };
         for (cached_graph * graph : required) {
             allocate_graph(*graph);
+        }
+        if (solve_spd_fn == nullptr) {
+            allocate_graph(get_graph(
+                    graph_op::SOLVE_TRI, rank, rank, n_out, rank));
+            allocate_graph(get_graph(
+                    graph_op::SOLVE_TRI, rank, rank, n_in, rank));
         }
         for (const auto & graph : graphs) {
             clear_tensor_allocations(*graph);
@@ -2633,6 +2646,20 @@ struct compute_backend {
         return execute(graph, lower, rhs, "SOLVE_TRI");
     }
 
+    bool solve_spd_accelerated(
+            const std::vector<float> & system,
+            const std::vector<float> & rhs,
+            int64_t n,
+            int64_t n_rhs,
+            std::vector<float> & solution) const {
+        if (solve_spd_fn == nullptr) {
+            return false;
+        }
+        solution.resize(rhs.size());
+        return solve_spd_fn(
+                backend, system.data(), rhs.data(), solution.data(), n, n_rhs);
+    }
+
     std::vector<float> svid_rank1(
             const std::vector<float> & matrix,
             int64_t rows,
@@ -2696,6 +2723,25 @@ static std::vector<float> solve_spd(
     if (system.size() != size_t(rank) * size_t(rank) ||
         rhs_rows.size() != size_t(n_rhs) * size_t(rank)) {
         throw std::runtime_error("NanoQuant: internal SPD solve shape mismatch");
+    }
+    if (backend.solve_spd_fn != nullptr) {
+        std::vector<float> solution;
+        float jitter = NUMERIC_EPSILON;
+        float applied_jitter = 0.0f;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            const float increment = jitter - applied_jitter;
+            for (int64_t i = 0; i < rank; ++i) {
+                system[size_t(i)*size_t(rank) + size_t(i)] += increment;
+            }
+            if (backend.solve_spd_accelerated(
+                    system, rhs_rows, rank, n_rhs, solution)) {
+                return solution;
+            }
+            applied_jitter = jitter;
+            jitter *= 10.0f;
+        }
+        throw std::runtime_error(
+                "NanoQuant: accelerated Cholesky decomposition failed");
     }
     std::vector<float> lower(system.size(), 0.0f);
     float jitter = NUMERIC_EPSILON;

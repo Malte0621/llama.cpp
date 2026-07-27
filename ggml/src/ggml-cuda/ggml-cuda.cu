@@ -719,6 +719,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+        if (cusolver_handles[i] != nullptr) {
+            CUSOLVER_CHECK(cusolverDnDestroy(cusolver_handles[i]));
+        }
     }
 }
 
@@ -4518,6 +4521,69 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+static bool ggml_backend_cuda_solve_spd(
+        ggml_backend_t backend,
+        const float * system,
+        const float * rhs,
+        float * solution,
+        int64_t n,
+        int64_t n_rhs) {
+    if (!ggml_backend_is_cuda(backend) || n <= 0 || n_rhs <= 0 ||
+        n > std::numeric_limits<int>::max() ||
+        n_rhs > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx =
+            (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+    cusolverDnHandle_t handle = cuda_ctx->cusolver_handle();
+    CUSOLVER_CHECK(cusolverDnSetStream(handle, stream));
+
+    const size_t system_elements = size_t(n)*size_t(n);
+    const size_t rhs_elements = size_t(n)*size_t(n_rhs);
+    ggml_cuda_pool & pool = cuda_ctx->pool();
+    ggml_cuda_pool_alloc<float> system_device(pool, system_elements);
+    ggml_cuda_pool_alloc<float> solution_device(pool, rhs_elements);
+    ggml_cuda_pool_alloc<int> info_device(pool, 1);
+    CUDA_CHECK(cudaMemcpyAsync(
+            system_device.get(), system, system_elements*sizeof(float),
+            cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+            solution_device.get(), rhs, rhs_elements*sizeof(float),
+            cudaMemcpyHostToDevice, stream));
+
+    int workspace_elements = 0;
+    CUSOLVER_CHECK(cusolverDnSpotrf_bufferSize(
+            handle, CUBLAS_FILL_MODE_UPPER, int(n), system_device.get(),
+            int(n), &workspace_elements));
+    ggml_cuda_pool_alloc<float> workspace(pool, size_t(workspace_elements));
+    CUSOLVER_CHECK(cusolverDnSpotrf(
+            handle, CUBLAS_FILL_MODE_UPPER, int(n), system_device.get(),
+            int(n), workspace.get(), workspace_elements, info_device.get()));
+
+    int info = 0;
+    CUDA_CHECK(cudaMemcpyAsync(
+            &info, info_device.get(), sizeof(info), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (info != 0) {
+        return false;
+    }
+
+    CUSOLVER_CHECK(cusolverDnSpotrs(
+            handle, CUBLAS_FILL_MODE_UPPER, int(n), int(n_rhs),
+            system_device.get(), int(n), solution_device.get(), int(n),
+            info_device.get()));
+    CUDA_CHECK(cudaMemcpyAsync(
+            solution, solution_device.get(), rhs_elements*sizeof(float),
+            cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+            &info, info_device.get(), sizeof(info), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return info == 0;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -5438,6 +5504,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_diffusion_sample") == 0) {
         return (void *) ggml_cuda_diffusion_sample;
+    }
+    if (strcmp(name, "ggml_backend_solve_spd") == 0) {
+        return (void *) ggml_backend_cuda_solve_spd;
     }
     return nullptr;
 }
