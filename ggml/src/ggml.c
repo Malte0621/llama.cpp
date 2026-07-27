@@ -7226,8 +7226,9 @@ static void ggml_compute_backward(
             }
             if (src1_needs_grads) {
                 struct ggml_tensor * src0_grad = src0;
-                if (src0->type == GGML_TYPE_F16 &&
-                    (src0->ne[2] != grad->ne[2] || src0->ne[3] != grad->ne[3])) {
+                if (src0->type == GGML_TYPE_BF16 ||
+                    (src0->type == GGML_TYPE_F16 &&
+                     (src0->ne[2] != grad->ne[2] || src0->ne[3] != grad->ne[3]))) {
                     src0_grad = ggml_cast(ctx, src0, GGML_TYPE_F32);
                 }
                 ggml_add_or_set(ctx, cgraph, isrc1,
