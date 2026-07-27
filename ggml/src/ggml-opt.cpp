@@ -56,10 +56,12 @@ struct ggml_opt_context {
     struct ggml_cgraph * gb_opt  = nullptr;
     bool static_graphs           = false;
     bool eval_ready              = false;
+    bool reuse_graph             = false;
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
     std::unordered_map<struct ggml_tensor *, struct ggml_tensor *> grad_acc_by_node;
+    std::unordered_map<struct ggml_tensor *, float> param_minimum;
     struct ggml_tensor * loss_grad_acc = nullptr;
 
     int64_t iter               = 1;
@@ -259,6 +261,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*reuse_graph     =*/ false,
     };
 }
 
@@ -552,6 +555,13 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     GGML_ABORT("fatal error");
             }
             ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
+            const auto minimum = opt_ctx->param_minimum.find(node);
+            if (minimum != opt_ctx->param_minimum.end()) {
+                struct ggml_tensor * clamped =
+                    ggml_clamp(opt_ctx->ctx_compute, opt_step, minimum->second, INFINITY);
+                opt_step = ggml_cpy(opt_ctx->ctx_compute, clamped, node);
+                ggml_format_name(opt_step, "%s constrained step for %s", optimizer_name, node->name);
+            }
             ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
         }
     }
@@ -578,6 +588,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->reuse_graph      = params.reuse_graph;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -669,6 +680,52 @@ struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_t
     const auto found = opt_ctx->grad_acc_by_node.find(node);
     return found == opt_ctx->grad_acc_by_node.end() ? nullptr : found->second;
 }
+struct ggml_tensor * ggml_opt_first_moment(
+        ggml_opt_context_t opt_ctx,
+        struct ggml_tensor * node) {
+    if (opt_ctx == nullptr || opt_ctx->gf == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        if (opt_ctx->gf->nodes[i] == node) {
+            return i < int(opt_ctx->grad_m.size()) ? opt_ctx->grad_m[i] : nullptr;
+        }
+    }
+    return nullptr;
+}
+
+struct ggml_tensor * ggml_opt_second_moment(
+        ggml_opt_context_t opt_ctx,
+        struct ggml_tensor * node) {
+    if (opt_ctx == nullptr || opt_ctx->gf == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        if (opt_ctx->gf->nodes[i] == node) {
+            return i < int(opt_ctx->grad_v.size()) ? opt_ctx->grad_v[i] : nullptr;
+        }
+    }
+    return nullptr;
+}
+
+void ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(iter >= 1);
+    opt_ctx->iter = iter;
+}
+void ggml_opt_set_param_minimum(
+        ggml_opt_context_t opt_ctx,
+        struct ggml_tensor * node,
+        float minimum) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(node != nullptr);
+    GGML_ASSERT(std::isfinite(minimum));
+    opt_ctx->param_minimum[node] = minimum;
+}
+
+
 
 // ====== Optimization Result ======
 
@@ -772,7 +829,8 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
     }
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs &&
+        (!opt_ctx->reuse_graph || opt_ctx->gb_grad == nullptr)) {
         ggml_opt_build(opt_ctx);
     }
     if (reset_grad) {
@@ -866,7 +924,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
 
-    if (!opt_ctx->static_graphs) {
+    if (!opt_ctx->static_graphs && !opt_ctx->reuse_graph) {
         opt_ctx->allocated_graph      = nullptr;
         opt_ctx->allocated_graph_copy = nullptr;
         opt_ctx->gf                   = nullptr;

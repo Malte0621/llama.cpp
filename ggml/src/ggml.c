@@ -6718,6 +6718,34 @@ struct ggml_tensor * ggml_nanoquant_linear_back(
     ggml_set_op_params_i32(result, 0, 1);
     return result;
 }
+struct ggml_tensor * ggml_nanoquant_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * v_bits,
+        struct ggml_tensor  * u_bits,
+        struct ggml_tensor  * scale_pre,
+        struct ggml_tensor  * scale_post) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[3] == 1);
+    GGML_ASSERT(v_bits->type == GGML_TYPE_I32 && u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(v_bits->ne[0] == (scale_pre->ne[0] + 31)/32);
+    GGML_ASSERT(v_bits->ne[1] > 0);
+    GGML_ASSERT(u_bits->ne[0] == (v_bits->ne[1] + 31)/32);
+    GGML_ASSERT(scale_post->ne[0] == u_bits->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F32,
+            scale_pre->ne[0], ids->ne[0], ids->ne[1], ids->ne[2]);
+    result->op = GGML_OP_NANOQUANT_LINEAR;
+    result->src[0] = ids;
+    result->src[1] = v_bits;
+    result->src[2] = u_bits;
+    result->src[3] = scale_pre;
+    result->src[4] = scale_post;
+    ggml_set_op_params_i32(result, 0, 3);
+    return result;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -7557,7 +7585,13 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_NANOQUANT_LINEAR: {
-            GGML_ASSERT(ggml_get_op_params_i32(tensor, 0) == 0);
+            const int32_t mode = ggml_get_op_params_i32(tensor, 0);
+            if (mode == 3) {
+                GGML_ASSERT(!src0_needs_grads && !src1_needs_grads &&
+                            !src2_needs_grads && !src3_needs_grads && !src4_needs_grads);
+                break;
+            }
+            GGML_ASSERT(mode == 0);
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_nanoquant_linear_back(
                         ctx, grad, src1, src2, src3, src4));

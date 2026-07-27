@@ -463,6 +463,27 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         }
     }
 }
+bool llm_graph_input_attn_no_cache::can_reuse(const llm_graph_params & params) {
+    const int64_t n_tokens = params.ubatch.n_tokens;
+    const ggml_type type = params.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    const auto can_reuse_mask = [n_tokens, type](const ggml_tensor * mask) {
+        return mask != nullptr &&
+               mask->type == type &&
+               mask->ne[0] == n_tokens &&
+               mask->ne[1] == n_tokens &&
+               mask->ne[2] == 1 &&
+               mask->ne[3] == 1;
+    };
+
+    if (!can_reuse_mask(self_kq_mask)) {
+        return false;
+    }
+
+    return hparams.swa_type == LLAMA_SWA_TYPE_NONE ?
+            self_kq_mask_swa == nullptr :
+            can_reuse_mask(self_kq_mask_swa);
+}
+
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
@@ -2206,7 +2227,27 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        const llama_nanoquant_weight * nq =
+                model == nullptr ? nullptr : model->get_nanoquant_weight(tok_embd);
+        if (nq && nq->training_weight) {
+            cur = ggml_get_rows(ctx0, nq->training_weight, inp->tokens);
+        } else if (nq && nq->training_factorized()) {
+            ggml_tensor * u = ggml_get_rows(
+                    ctx0, ggml_sgn_ste(ctx0, nq->training_u), inp->tokens);
+            ggml_tensor * scale_post = ggml_get_rows(
+                    ctx0,
+                    ggml_reshape_2d(ctx0, nq->training_scale_post, 1, tok_embd->ne[1]),
+                    inp->tokens);
+            u = ggml_mul(ctx0, u, scale_post);
+            cur = ggml_mul_mat(
+                    ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, ggml_sgn_ste(ctx0, nq->training_v))), u);
+            cur = ggml_mul(ctx0, cur, nq->training_scale_pre);
+        } else if (nq && nq->enabled()) {
+            cur = ggml_nanoquant_get_rows(
+                    ctx0, inp->tokens, nq->v, nq->u, nq->scale_pre, nq->scale_post);
+        } else {
+            cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

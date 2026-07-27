@@ -1702,14 +1702,15 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             }
 
             llama_nanoquant_weight nq;
+            const int sidecar_flags = flags & TENSOR_DUPLICATED;
             nq.v = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_v, { (n_in + 31)/32, n_rank }, 0);
+                    buft_list_layer, tn_v, { (n_in + 31)/32, n_rank }, sidecar_flags);
             nq.u = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_u, { (n_rank + 31)/32, n_out }, 0);
+                    buft_list_layer, tn_u, { (n_rank + 31)/32, n_out }, sidecar_flags);
             nq.scale_pre = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_scale_pre, { n_in }, 0);
+                    buft_list_layer, tn_scale_pre, { n_in }, sidecar_flags);
             nq.scale_post = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_scale_post, { n_out }, 0);
+                    buft_list_layer, tn_scale_post, { n_out }, sidecar_flags);
 
             auto logical = std::make_unique<ggml_tensor>();
             memset(logical.get(), 0, sizeof(ggml_tensor));
@@ -1730,10 +1731,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             tensors_by_name.emplace_back(tn.str(), result);
             nanoquant_weights.emplace(result, nq);
 
-            const uint64_t stored_elements = ggml_nelements(v_meta) + ggml_nelements(u_meta) +
-                    ggml_nelements(pre_meta) + ggml_nelements(post_meta);
-            GGML_ASSERT(pimpl->n_elements >= stored_elements);
-            pimpl->n_elements += (uint64_t) n_in*n_out - stored_elements;
+            if (!(flags & TENSOR_DUPLICATED)) {
+                const uint64_t stored_elements = ggml_nelements(v_meta) + ggml_nelements(u_meta) +
+                        ggml_nelements(pre_meta) + ggml_nelements(post_meta);
+                GGML_ASSERT(pimpl->n_elements >= stored_elements);
+                pimpl->n_elements += (uint64_t) n_in*n_out - stored_elements;
+            }
             return result;
         }
     }

@@ -236,9 +236,11 @@ struct llama_context {
             int32_t block,
             const std::vector<llama_nanoquant_opt_param> & params,
             uint64_t step,
-            const char * output_gradient_target = nullptr);
+            const std::vector<std::string> & output_gradient_targets = {});
 
     void nanoquant_optimizer_free(llama_nanoquant_optimizer * optimizer);
+    void nanoquant_optimizer_export(llama_nanoquant_optimizer * optimizer);
+
 
     float nanoquant_optimizer_step(
             llama_nanoquant_optimizer * optimizer,
@@ -247,11 +249,13 @@ struct llama_context {
             int32_t n_tokens,
             const float * labels,
             size_t n_labels,
+            const llama_token * sparse_labels,
+            size_t n_sparse_labels,
             const float * output_weights,
             size_t n_output_weights,
             float learning_rate_scale);
 
-    std::vector<float> nanoquant_optimizer_output_importance(
+    std::vector<std::vector<float>> nanoquant_optimizer_output_importance(
             const llama_nanoquant_optimizer * optimizer) const;
 
 private:

@@ -5130,7 +5130,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const auto is_scale = [](ggml_type type) {
                     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
                 };
-                return op->src[0]->type == GGML_TYPE_F32 &&
+                const int32_t mode = ggml_get_op_params_i32(op, 0);
+                return (op->src[0]->type == (mode == 3 ? GGML_TYPE_I32 : GGML_TYPE_F32)) &&
+                       (mode == 0 || mode == 1 || mode == 3) &&
                        op->src[1]->type == GGML_TYPE_I32 &&
                        op->src[2]->type == GGML_TYPE_I32 &&
                        is_scale(op->src[3]->type) &&

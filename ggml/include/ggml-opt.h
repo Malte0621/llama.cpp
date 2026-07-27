@@ -127,6 +127,9 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // keep dynamically prepared graphs across evaluations; the caller must keep their tensors alive and use identical topology
+        bool reuse_graph;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -155,6 +158,13 @@ extern "C" {
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    GGML_API struct ggml_tensor * ggml_opt_first_moment(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+    GGML_API struct ggml_tensor * ggml_opt_second_moment(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+    GGML_API void ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
+    GGML_API void ggml_opt_set_param_minimum(
+            ggml_opt_context_t opt_ctx,
+            struct ggml_tensor * node,
+            float minimum);
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);

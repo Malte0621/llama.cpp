@@ -11394,7 +11394,46 @@ void ggml_compute_forward_nanoquant_linear(
     GGML_ASSERT(ggml_is_contiguous(scale_pre));
     GGML_ASSERT(ggml_is_contiguous(scale_post));
 
-    const bool backward      = ggml_get_op_params_i32(dst, 0) != 0;
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == 3) {
+        GGML_ASSERT(x->type == GGML_TYPE_I32);
+        const int64_t n_in = scale_pre->ne[0];
+        const int64_t n_rank = v_bits->ne[1];
+        const int64_t n_out = scale_post->ne[0];
+        const int64_t n_vectors = ggml_nelements(x);
+        const int64_t n_words_v = v_bits->ne[0];
+        const int64_t n_words_u = u_bits->ne[0];
+        const int32_t * ids = (const int32_t *) x->data;
+        const uint32_t * v_data = (const uint32_t *) v_bits->data;
+        const uint32_t * u_data = (const uint32_t *) u_bits->data;
+        float * dst_data = (float *) dst->data;
+        const int64_t ith = params->ith;
+        const int64_t nth = params->nth;
+        const int64_t no0 = (n_vectors*n_in*ith)/nth;
+        const int64_t no1 = (n_vectors*n_in*(ith + 1))/nth;
+        for (int64_t i = no0; i < no1; ++i) {
+            const int64_t iv = i/n_in;
+            const int64_t ii = i - iv*n_in;
+            const int32_t row = ids[iv];
+            GGML_ASSERT(row >= 0 && row < n_out);
+            const uint32_t * u_row = u_data + int64_t(row)*n_words_u;
+            float sum = 0.0f;
+            for (int64_t ir = 0; ir < n_rank; ++ir) {
+                const uint32_t * v_row = v_data + ir*n_words_v;
+                const bool v_negative =
+                        (v_row[ii/32] & (UINT32_C(1) << (ii % 32))) != 0;
+                const bool u_negative =
+                        (u_row[ir/32] & (UINT32_C(1) << (ir % 32))) != 0;
+                sum += v_negative == u_negative ? 1.0f : -1.0f;
+            }
+            dst_data[i] = sum*nanoquant_get_scale(scale_pre, ii)*
+                    nanoquant_get_scale(scale_post, row);
+        }
+        return;
+    }
+    GGML_ASSERT(mode == 0 || mode == 1);
+
+    const bool backward = mode == 1;
     const int64_t n_in       = scale_pre->ne[0];
     const int64_t n_rank     = v_bits->ne[1];
     const int64_t n_out      = scale_post->ne[0];

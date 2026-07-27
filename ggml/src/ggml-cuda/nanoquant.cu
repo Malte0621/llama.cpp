@@ -148,6 +148,102 @@ static __global__ void nanoquant_stage2_back(
     }
 }
 
+template <int block_size, typename scale_pre_t, typename scale_post_t>
+static __global__ void nanoquant_get_rows(
+        const int32_t * GGML_CUDA_RESTRICT ids,
+        const uint32_t * GGML_CUDA_RESTRICT v_bits,
+        const uint32_t * GGML_CUDA_RESTRICT u_bits,
+        const scale_pre_t * GGML_CUDA_RESTRICT scale_pre,
+        const scale_post_t * GGML_CUDA_RESTRICT scale_post,
+        float * GGML_CUDA_RESTRICT dst,
+        int64_t n_in,
+        int64_t n_rank,
+        int64_t n_out,
+        int64_t n_tasks) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int64_t ii = task % n_in;
+        const int64_t iv = task / n_in;
+        const int32_t row = ids[iv];
+        const int64_t n_words_v = (n_in + 31)/32;
+        const int64_t n_words_u = (n_rank + 31)/32;
+        const uint32_t * u_row = u_bits + int64_t(row)*n_words_u;
+
+        float sum = 0.0f;
+        for (int64_t ir = threadIdx.x; ir < n_rank; ir += block_size) {
+            const uint32_t * v_row = v_bits + ir*n_words_v;
+            const bool v_negative =
+                    (v_row[ii/32] & (uint32_t(1) << (ii % 32))) != 0;
+            const bool u_negative =
+                    (u_row[ir/32] & (uint32_t(1) << (ir % 32))) != 0;
+            sum += v_negative == u_negative ? 1.0f : -1.0f;
+        }
+
+        __shared__ float sums[block_size/WARP_SIZE];
+        sum = block_reduce<block_reduce_method::SUM, block_size>(sum, sums);
+        if (threadIdx.x == 0) {
+            dst[task] = sum*nanoquant_to_float(scale_pre[ii])*
+                    nanoquant_to_float(scale_post[row]);
+        }
+        if (task + gridDim.x < n_tasks) {
+            __syncthreads();
+        }
+    }
+}
+
+template <typename scale_pre_t, typename scale_post_t>
+static void nanoquant_launch_get_rows(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * ids,
+        const ggml_tensor * v_bits,
+        const ggml_tensor * u_bits,
+        const ggml_tensor * scale_pre,
+        const ggml_tensor * scale_post,
+        ggml_tensor * dst) {
+    constexpr int block_size = 256;
+    const int64_t n_tasks = ggml_nelements(ids)*scale_pre->ne[0];
+    cudaStream_t stream = ctx.stream();
+    const ggml_cuda_kernel_launch_params launch_params(
+            dim3((unsigned int) MIN(n_tasks, int64_t(INT_MAX)), 1, 1),
+            block_size, 0, stream);
+    ggml_cuda_kernel_launch(nanoquant_get_rows<block_size, scale_pre_t, scale_post_t>, launch_params,
+            (const int32_t *) ids->data,
+            (const uint32_t *) v_bits->data,
+            (const uint32_t *) u_bits->data,
+            (const scale_pre_t *) scale_pre->data,
+            (const scale_post_t *) scale_post->data,
+            (float *) dst->data,
+            scale_pre->ne[0], v_bits->ne[1], scale_post->ne[0], n_tasks);
+}
+
+template <typename scale_pre_t>
+static void nanoquant_launch_get_rows_post(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * ids,
+        const ggml_tensor * v_bits,
+        const ggml_tensor * u_bits,
+        const ggml_tensor * scale_pre,
+        const ggml_tensor * scale_post,
+        ggml_tensor * dst) {
+    switch (scale_post->type) {
+        case GGML_TYPE_F32:
+            nanoquant_launch_get_rows<scale_pre_t, float>(
+                    ctx, ids, v_bits, u_bits, scale_pre, scale_post, dst);
+            break;
+        case GGML_TYPE_F16:
+            nanoquant_launch_get_rows<scale_pre_t, half>(
+                    ctx, ids, v_bits, u_bits, scale_pre, scale_post, dst);
+            break;
+        case GGML_TYPE_BF16:
+            nanoquant_launch_get_rows<scale_pre_t, nv_bfloat16>(
+                    ctx, ids, v_bits, u_bits, scale_pre, scale_post, dst);
+            break;
+        default:
+            GGML_ABORT("unsupported NanoQuant post-scale type");
+    }
+}
+
 template <typename scale_pre_t, typename scale_post_t>
 static void nanoquant_launch(
         ggml_backend_cuda_context & ctx,
@@ -266,7 +362,8 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * scale_pre = dst->src[3];
     const ggml_tensor * scale_post = dst->src[4];
 
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(x->type == (mode == 3 ? GGML_TYPE_I32 : GGML_TYPE_F32));
     GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
     GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -276,16 +373,35 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(ggml_is_contiguous(scale_pre));
     GGML_ASSERT(ggml_is_contiguous(scale_post));
 
-    const bool backward = ggml_get_op_params_i32(dst, 0) != 0;
+    GGML_ASSERT(mode == 0 || mode == 1 || mode == 3);
+    const bool backward = mode == 1;
     switch (scale_pre->type) {
         case GGML_TYPE_F32:
-            nanoquant_launch_post<float>(ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            if (mode == 3) {
+                nanoquant_launch_get_rows_post<float>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else {
+                nanoquant_launch_post<float>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            }
             break;
         case GGML_TYPE_F16:
-            nanoquant_launch_post<half>(ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            if (mode == 3) {
+                nanoquant_launch_get_rows_post<half>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else {
+                nanoquant_launch_post<half>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            }
             break;
         case GGML_TYPE_BF16:
-            nanoquant_launch_post<nv_bfloat16>(ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            if (mode == 3) {
+                nanoquant_launch_get_rows_post<nv_bfloat16>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else {
+                nanoquant_launch_post<nv_bfloat16>(
+                        ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            }
             break;
         default:
             GGML_ABORT("unsupported NanoQuant pre-scale type");

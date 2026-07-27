@@ -2687,6 +2687,14 @@ extern "C" {
             struct ggml_tensor  * scale_pre,
             struct ggml_tensor  * scale_post);
 
+    GGML_API struct ggml_tensor * ggml_nanoquant_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_post);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

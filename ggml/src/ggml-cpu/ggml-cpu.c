@@ -3053,8 +3053,13 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_NANOQUANT_LINEAR:
                     {
+                        const int32_t mode = ggml_get_op_params_i32(node, 0);
+                        if (mode == 3) {
+                            cur = 0;
+                            break;
+                        }
                         const int64_t n_vectors = ggml_nrows(node->src[0]);
-                        const int64_t input_size = ggml_get_op_params_i32(node, 0) != 0 ?
+                        const int64_t input_size = mode == 1 ?
                                 node->src[4]->ne[0] : node->src[3]->ne[0];
                         const int64_t n_rank = node->src[1]->ne[1];
                         cur = sizeof(float)*n_vectors*(input_size + n_rank);
