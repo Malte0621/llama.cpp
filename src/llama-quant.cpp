@@ -893,7 +893,7 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 
 namespace nanoquant {
 
-static constexpr uint32_t CHECKPOINT_VERSION = 5;
+static constexpr uint32_t CHECKPOINT_VERSION = 6;
 static constexpr size_t PROJECTION_MEMORY_BUDGET = 256u * 1024u * 1024u;
 static constexpr size_t GRADIENT_MEMORY_BUDGET = 256u * 1024u * 1024u;
 static constexpr int32_t ADMM_LOG_INTERVAL = 25;
@@ -1776,25 +1776,94 @@ static void validate_state_shapes(
     }
 }
 
+static hash256 fingerprint_model_file(const std::string & path) {
+    std::error_code ec;
+    const uintmax_t raw_size = std::filesystem::file_size(path, ec);
+    if (ec || raw_size > uintmax_t(std::numeric_limits<uint64_t>::max())) {
+        throw std::runtime_error(format(
+                "NanoQuant: cannot determine the size of '%s' for identity fingerprinting",
+                path.c_str()));
+    }
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        throw std::runtime_error(format(
+                "NanoQuant: cannot determine the modification time of '%s' for identity fingerprinting",
+                path.c_str()));
+    }
+
+    const uint64_t file_size = uint64_t(raw_size);
+    const int64_t write_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            write_time.time_since_epoch()).count();
+    hash_builder hash;
+    hash.update_string("llama.cpp-nanoquant-source-file-v2");
+    hash.update_pod(file_size);
+    hash.update_pod(write_time_ns);
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(format(
+                "NanoQuant: cannot open '%s' for identity fingerprinting", path.c_str()));
+    }
+    static constexpr uint64_t CHUNK_SIZE = 1024u * 1024u;
+    static constexpr uint64_t CHUNK_COUNT = 4;
+    static constexpr uint64_t FULL_HASH_LIMIT = CHUNK_SIZE * CHUNK_COUNT;
+    std::vector<char> buffer(size_t(std::min(file_size, CHUNK_SIZE)));
+    if (file_size <= FULL_HASH_LIMIT) {
+        buffer.resize(size_t(file_size));
+        if (!buffer.empty()) {
+            input.read(buffer.data(), std::streamsize(buffer.size()));
+            if (input.gcount() != std::streamsize(buffer.size())) {
+                throw std::runtime_error(format(
+                        "NanoQuant: failed while fingerprinting '%s'", path.c_str()));
+            }
+            hash.update(buffer.data(), buffer.size());
+        }
+    } else {
+        const uint64_t last_offset = file_size - CHUNK_SIZE;
+        for (uint64_t chunk = 0; chunk < CHUNK_COUNT; ++chunk) {
+            const uint64_t offset =
+                    (last_offset / (CHUNK_COUNT - 1))*chunk +
+                    ((last_offset % (CHUNK_COUNT - 1))*chunk)/(CHUNK_COUNT - 1);
+            input.clear();
+            input.seekg(static_cast<std::streamoff>(offset));
+            input.read(buffer.data(), std::streamsize(buffer.size()));
+            if (input.gcount() != std::streamsize(buffer.size())) {
+                throw std::runtime_error(format(
+                        "NanoQuant: failed while fingerprinting '%s'", path.c_str()));
+            }
+            hash.update_pod(offset);
+            hash.update(buffer.data(), buffer.size());
+        }
+    }
+
+    const uintmax_t final_size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        throw std::runtime_error(format(
+                "NanoQuant: cannot recheck '%s' after identity fingerprinting", path.c_str()));
+    }
+    const auto final_write_time = std::filesystem::last_write_time(path, ec);
+    if (ec || final_size != raw_size || final_write_time != write_time) {
+        throw std::runtime_error(format(
+                "NanoQuant: source model file '%s' changed while it was being fingerprinted",
+                path.c_str()));
+    }
+    return hash.value;
+}
+
 static hash256 hash_model_files(
         const std::string & input_path,
         const std::vector<std::string> & splits) {
     hash_builder hash;
-    hash.update_string("llama.cpp-nanoquant-source-v1");
+    hash.update_string("llama.cpp-nanoquant-source-v2");
+    const uint64_t file_count = splits.empty() ? 1 : splits.size();
+    hash.update_pod(file_count);
     if (splits.empty()) {
-        const hash256 digest = hash_file(input_path);
+        const hash256 digest = fingerprint_model_file(input_path);
         hash.update(digest.data(), sizeof(digest));
     } else {
-        std::vector<std::future<hash256>> digests;
-        digests.reserve(splits.size());
         for (const std::string & split : splits) {
-            digests.emplace_back(std::async(std::launch::async, [split] {
-                return hash_file(split);
-            }));
-        }
-        for (std::future<hash256> & digest : digests) {
-            const hash256 value = digest.get();
-            hash.update(value.data(), sizeof(value));
+            const hash256 digest = fingerprint_model_file(split);
+            hash.update(digest.data(), sizeof(digest));
         }
     }
     return hash.value;
@@ -5747,7 +5816,8 @@ static void quantize(
         throw std::runtime_error("NanoQuant: input and output files must differ");
     }
     LLAMA_LOG_INFO(
-            "NanoQuant: hashing %zu source model file(s) for checkpoint identity\n",
+            "NanoQuant: fingerprinting %zu source model file(s) for checkpoint identity "
+            "(at most 4 MiB read per file)\n",
             splits.empty() ? size_t(1) : splits.size());
     const hash256 source_hash = hash_model_files(input_path, splits);
     const hash256 dataset_hash = hash_file(params->nanoquant_calibration_dataset);
