@@ -548,6 +548,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
                 continue;
             }
+            if (!scalar_only &&
+                src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+                    ret = src_ss[i];
+                }
+                continue;
+            }
+            if (!scalar_only &&
+                ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                ret = src_ss[i];
+                continue;
+            }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
