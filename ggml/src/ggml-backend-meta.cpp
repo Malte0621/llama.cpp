@@ -471,9 +471,20 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static ggml_backend_buffer_t ggml_backend_meta_tensor_buffer(
+        const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+    return tensor->view_src == nullptr ?
+            tensor->buffer : tensor->view_src->buffer;
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    ggml_backend_buffer_t buffer = ggml_backend_meta_tensor_buffer(tensor);
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_buffer_context * buf_ctx =
+            (ggml_backend_meta_buffer_context *) buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
