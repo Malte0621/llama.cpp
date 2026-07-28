@@ -656,6 +656,44 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 ggml_backend_meta_split_axis_name(src_ss[1].axis),
                 tensor->name);
     };
+    auto handle_out_prod = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
+        if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[0].axis < GGML_MAX_DIMS &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            const int axis = src_ss[0].axis;
+            GGML_ASSERT(tensor->ne[axis] % tensor->src[0]->ne[axis] == 0);
+            const int64_t repeat =
+                    tensor->ne[axis]/tensor->src[0]->ne[axis];
+            ggml_backend_meta_split_state ret = src_ss[0];
+            for (size_t segment = 0; segment < ret.n_segments; ++segment) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    ret.ne[segment*n_bufs + j] *= repeat;
+                }
+            }
+            return ret;
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[1].axis < GGML_MAX_DIMS) {
+            return src_ss[1];
+        }
+        if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[0].axis < GGML_MAX_DIMS &&
+            src_ss[0].axis == src_ss[1].axis) {
+            GGML_ASSERT(split_states_proportional(src_ss[0], src_ss[1]));
+            return src_ss[1];
+        }
+        GGML_ABORT(
+                "unsupported out_prod split axes %s and %s for tensor %s",
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                tensor->name);
+    };
+
     auto handle_nanoquant = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const int32_t mode = ggml_get_op_params_i32(tensor, 0);
         const ggml_backend_meta_split_state mirrored = {
@@ -990,7 +1028,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_mul_mat(src_ss);
             } break;
             case GGML_OP_OUT_PROD: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_out_prod(src_ss);
             } break;
             case GGML_OP_SCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
