@@ -590,8 +590,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
-        GGML_ABORT("fatal error");
-        //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        GGML_ABORT(
+                "unsupported mul_mat split axes %s and %s for tensor %s",
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                tensor->name);
     };
     auto handle_nanoquant = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const int32_t mode = ggml_get_op_params_i32(tensor, 0);
