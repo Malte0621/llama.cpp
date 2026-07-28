@@ -3341,20 +3341,6 @@ struct compute_backend {
         return result;
     }
 };
-static ggml_backend_buffer_type_t reconstruction_parameter_buffer_type(
-        compute_backend & backend,
-        const ggml_tensor * source,
-        size_t parameter_bytes,
-        const char * name) {
-    GGML_ASSERT(source != nullptr && source->buffer != nullptr);
-    ggml_backend_buffer_type_t source_buft =
-            ggml_backend_buffer_get_type(source->buffer);
-    return ggml_backend_buft_get_device(source_buft) !=
-                   ggml_backend_get_device(backend.backend) ?
-            source_buft :
-            backend.optimizer_buffer_type(parameter_bytes, name);
-}
-
 
 static std::vector<float> transpose_matrix(
         const std::vector<float> & input,
@@ -4070,10 +4056,9 @@ static void run_nonfactor_reconstruction(
                 "NanoQuant: missing student tensor '%s'", item.name.c_str()));
     }
     training_tensor_storage storage(1);
-    ggml_tensor * weight =
-            storage.new_2d(item.n_in, item.n_out, item.name.c_str());
-    storage.allocate(reconstruction_parameter_buffer_type(
-            backend, source, ggml_nbytes(weight), item.name.c_str()));
+    ggml_tensor * weight = storage.new_2d(
+            item.n_in, item.n_out, "nanoquant_training_weight");
+    storage.allocate(backend.optimizer_buffer_type(ggml_nbytes(weight), item.name.c_str()));
     set_training_tensor(weight, state.weight);
     release_vector(state.weight);
 
@@ -4228,8 +4213,7 @@ static void run_factor_reconstruction(
     ggml_tensor * scale_post = storage.new_1d(item.n_out, "nanoquant_training_scale_post");
     const size_t parameter_bytes =
             ggml_nbytes(v) + ggml_nbytes(u) + ggml_nbytes(scale_pre) + ggml_nbytes(scale_post);
-    storage.allocate(reconstruction_parameter_buffer_type(
-            backend, source, parameter_bytes, item.name.c_str()));
+    storage.allocate(backend.optimizer_buffer_type(parameter_bytes, item.name.c_str()));
     set_training_tensor(v, state.v);
     set_training_tensor(u, state.u);
     set_training_tensor(scale_pre, state.scale_pre);
@@ -6136,26 +6120,27 @@ static void quantize(
             host_buft =
                     ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend.backend));
         }
+        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         if (host_buft != nullptr) {
-            teacher.reset();
             block_training_buft_overrides[0].buft = host_buft;
             block_training_buft_overrides[1].buft = host_buft;
-            model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             model_params.tensor_buft_overrides = block_training_buft_overrides.data();
-            teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
-            if (!teacher) {
-                throw std::runtime_error(
-                        "NanoQuant: failed to reload the block-training source model");
-            }
+        }
+        teacher.reset();
+        teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
+        if (!teacher) {
+            throw std::runtime_error(
+                    "NanoQuant: failed to reload the block-training source model");
+        }
+        LLAMA_LOG_INFO("NanoQuant: block training uses layer sharding\n");
+        if (host_buft != nullptr) {
             LLAMA_LOG_INFO(
                     "NanoQuant: block training keeps token embedding and output weights host-resident\n");
         }
     }
 
     llama_context_params projection_context_params = context_params;
-    projection_context_params.flash_attn_type =
-            model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR ?
-            LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    projection_context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     projection_context_params.cb_eval = calibration_callback;
     projection_context_params.cb_eval_user_data = &collector_set;
     std::unique_ptr<llama_context, decltype(&llama_free)> projection_context(
