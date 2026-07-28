@@ -1290,6 +1290,254 @@ static void atomic_replace(const std::filesystem::path & path, const std::functi
     std::filesystem::remove(backup, ec);
 }
 
+static std::filesystem::path expert_checkpoint_path(const std::filesystem::path & path) {
+    return path.string() + ".experts";
+}
+
+static size_t expert_packed_u_count(const group & item) {
+    return size_t((item.rank + 31)/32)*size_t(item.n_out);
+}
+
+static size_t expert_packed_v_count(const group & item) {
+    return size_t((item.n_in + 31)/32)*size_t(item.rank);
+}
+
+static size_t expert_checkpoint_record_size(const group & item) {
+    return sizeof(uint32_t) + sizeof(hash256) +
+            (size_t(item.n_in) + size_t(item.n_out))*sizeof(float) +
+            (expert_packed_u_count(item) + expert_packed_v_count(item))*sizeof(uint32_t);
+}
+
+static hash256 expert_checkpoint_hash(
+        const group & item,
+        uint32_t expert,
+        const float * scale_pre,
+        const float * scale_post,
+        const uint32_t * packed_u,
+        const uint32_t * packed_v) {
+    hash_builder hash;
+    hash.update_string("llama.cpp-nanoquant-expert-v1");
+    hash.update_pod(expert);
+    hash.update(scale_pre, size_t(item.n_in)*sizeof(float));
+    hash.update(scale_post, size_t(item.n_out)*sizeof(float));
+    hash.update(packed_u, expert_packed_u_count(item)*sizeof(uint32_t));
+    hash.update(packed_v, expert_packed_v_count(item)*sizeof(uint32_t));
+    return hash.value;
+}
+
+static uint64_t validate_expert_checkpoint(
+        std::istream & input,
+        const std::filesystem::path & path,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item) {
+    char magic[8];
+    input.read(magic, sizeof(magic));
+    static const char expected_magic[8] = { 'N', 'Q', 'E', 'X', 'P', 'R', '1', '\0' };
+    if (std::memcmp(magic, expected_magic, sizeof(magic)) != 0 ||
+        read_pod<uint32_t>(input) != CHECKPOINT_VERSION ||
+        read_pod<uint32_t>(input) != UINT32_C(0x01020304)) {
+        throw std::runtime_error(format(
+                "NanoQuant: invalid expert checkpoint '%s'", path.string().c_str()));
+    }
+    hash256 stored_source;
+    hash256 stored_config;
+    input.read(reinterpret_cast<char *>(stored_source.data()), sizeof(stored_source));
+    input.read(reinterpret_cast<char *>(stored_config.data()), sizeof(stored_config));
+    const std::string stored_name = read_string(input);
+    const int64_t stored_n_in = read_pod<int64_t>(input);
+    const int64_t stored_n_out = read_pod<int64_t>(input);
+    const int64_t stored_n_expert = read_pod<int64_t>(input);
+    const int64_t stored_rank = read_pod<int64_t>(input);
+    if (stored_source != source_hash || stored_config != config_hash ||
+        stored_name != item.name || stored_n_in != item.n_in ||
+        stored_n_out != item.n_out || stored_n_expert != item.n_expert ||
+        stored_rank != item.rank) {
+        throw std::runtime_error(format(
+                "NanoQuant: expert checkpoint identity mismatch for '%s'", item.name.c_str()));
+    }
+    const std::streampos position = input.tellg();
+    if (position < 0) {
+        throw std::runtime_error(format(
+                "NanoQuant: invalid expert checkpoint header for '%s'", item.name.c_str()));
+    }
+    return uint64_t(position);
+}
+
+static uint64_t create_expert_checkpoint(
+        const std::filesystem::path & path,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item) {
+    atomic_replace(path, [&](std::ostream & output) {
+        static const char magic[8] = { 'N', 'Q', 'E', 'X', 'P', 'R', '1', '\0' };
+        output.write(magic, sizeof(magic));
+        write_pod(output, CHECKPOINT_VERSION);
+        write_pod(output, UINT32_C(0x01020304));
+        output.write(reinterpret_cast<const char *>(source_hash.data()), sizeof(source_hash));
+        output.write(reinterpret_cast<const char *>(config_hash.data()), sizeof(config_hash));
+        write_string(output, item.name);
+        write_pod(output, item.n_in);
+        write_pod(output, item.n_out);
+        write_pod(output, item.n_expert);
+        write_pod(output, item.rank);
+        const size_t data_size =
+                expert_checkpoint_record_size(item)*size_t(item.n_expert);
+        if (data_size > 0) {
+            output.seekp(std::streamoff(data_size - 1), std::ios::cur);
+            output.put('\0');
+        }
+    });
+    std::ifstream input(path, std::ios::binary);
+    input.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    return validate_expert_checkpoint(
+            input, path, source_hash, config_hash, item);
+}
+
+static uint64_t open_expert_checkpoint(
+        const std::filesystem::path & path,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item) {
+    std::ifstream input(path, std::ios::binary);
+    input.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    const uint64_t data_offset = validate_expert_checkpoint(
+            input, path, source_hash, config_hash, item);
+    const uint64_t expected_size = data_offset +
+            uint64_t(expert_checkpoint_record_size(item))*uint64_t(item.n_expert);
+    if (std::filesystem::file_size(path) != expected_size) {
+        throw std::runtime_error(format(
+                "NanoQuant: expert checkpoint size mismatch for '%s'", item.name.c_str()));
+    }
+    return data_offset;
+}
+
+static void write_expert_checkpoint(
+        const std::filesystem::path & checkpoint,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item,
+        uint32_t expert,
+        const float * scale_pre,
+        const float * scale_post,
+        const uint32_t * packed_u,
+        const uint32_t * packed_v) {
+    const std::filesystem::path path = expert_checkpoint_path(checkpoint);
+    const uint64_t data_offset = std::filesystem::exists(path) ?
+            open_expert_checkpoint(path, source_hash, config_hash, item) :
+            create_expert_checkpoint(path, source_hash, config_hash, item);
+    const size_t record_size = expert_checkpoint_record_size(item);
+    const uint64_t record_offset = data_offset + uint64_t(expert)*record_size;
+    const hash256 digest = expert_checkpoint_hash(
+            item, expert, scale_pre, scale_post, packed_u, packed_v);
+
+    std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
+    output.exceptions(std::fstream::failbit | std::fstream::badbit);
+    output.seekp(std::streamoff(record_offset + sizeof(uint32_t) + sizeof(hash256)));
+    output.write(reinterpret_cast<const char *>(scale_pre), size_t(item.n_in)*sizeof(float));
+    output.write(reinterpret_cast<const char *>(scale_post), size_t(item.n_out)*sizeof(float));
+    output.write(reinterpret_cast<const char *>(packed_u),
+            expert_packed_u_count(item)*sizeof(uint32_t));
+    output.write(reinterpret_cast<const char *>(packed_v),
+            expert_packed_v_count(item)*sizeof(uint32_t));
+    output.seekp(std::streamoff(record_offset + sizeof(uint32_t)));
+    output.write(reinterpret_cast<const char *>(digest.data()), sizeof(digest));
+    output.flush();
+    output.seekp(std::streamoff(record_offset));
+    write_pod(output, expert + 1);
+    output.flush();
+}
+
+static void restore_completed_experts(
+        const std::filesystem::path & checkpoint,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item,
+        checkpoint_state & state) {
+    if (item.n_expert <= 1 || state.expert == 0 ||
+        state.stage >= checkpoint_stage::GROUP_DONE) {
+        return;
+    }
+    const size_t n_completed = state.expert;
+    const size_t n_scale_pre = n_completed*size_t(item.n_in);
+    const size_t n_scale_post = n_completed*size_t(item.n_out);
+    const size_t n_packed_u = n_completed*expert_packed_u_count(item);
+    const size_t n_packed_v = n_completed*expert_packed_v_count(item);
+    const bool populated =
+            state.completed_scale_pre.size() == n_scale_pre &&
+            state.completed_scale_post.size() == n_scale_post &&
+            state.completed_packed_u.size() == n_packed_u &&
+            state.completed_packed_v.size() == n_packed_v;
+    const bool empty =
+            state.completed_scale_pre.empty() &&
+            state.completed_scale_post.empty() &&
+            state.completed_packed_u.empty() &&
+            state.completed_packed_v.empty();
+    if (!populated && !empty) {
+        throw std::runtime_error(format(
+                "NanoQuant: incomplete expert checkpoint state for '%s'", item.name.c_str()));
+    }
+
+    const std::filesystem::path path = expert_checkpoint_path(checkpoint);
+    if (populated) {
+        if (!std::filesystem::exists(path)) {
+            for (uint32_t expert = 0; expert < state.expert; ++expert) {
+                write_expert_checkpoint(
+                        checkpoint, source_hash, config_hash, item, expert,
+                        state.completed_scale_pre.data() + size_t(expert)*size_t(item.n_in),
+                        state.completed_scale_post.data() + size_t(expert)*size_t(item.n_out),
+                        state.completed_packed_u.data() + size_t(expert)*expert_packed_u_count(item),
+                        state.completed_packed_v.data() + size_t(expert)*expert_packed_v_count(item));
+            }
+        }
+        return;
+    }
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error(format(
+                "NanoQuant: missing expert checkpoint for '%s'", item.name.c_str()));
+    }
+
+    const uint64_t data_offset = open_expert_checkpoint(
+            path, source_hash, config_hash, item);
+    state.completed_scale_pre.resize(n_scale_pre);
+    state.completed_scale_post.resize(n_scale_post);
+    state.completed_packed_u.resize(n_packed_u);
+    state.completed_packed_v.resize(n_packed_v);
+    std::ifstream input(path, std::ios::binary);
+    input.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    const size_t record_size = expert_checkpoint_record_size(item);
+    for (uint32_t expert = 0; expert < state.expert; ++expert) {
+        input.seekg(std::streamoff(data_offset + uint64_t(expert)*record_size));
+        if (read_pod<uint32_t>(input) != expert + 1) {
+            throw std::runtime_error(format(
+                    "NanoQuant: incomplete expert %u checkpoint for '%s'",
+                    expert + 1, item.name.c_str()));
+        }
+        hash256 stored_digest;
+        input.read(reinterpret_cast<char *>(stored_digest.data()), sizeof(stored_digest));
+        float * scale_pre =
+                state.completed_scale_pre.data() + size_t(expert)*size_t(item.n_in);
+        float * scale_post =
+                state.completed_scale_post.data() + size_t(expert)*size_t(item.n_out);
+        uint32_t * packed_u =
+                state.completed_packed_u.data() + size_t(expert)*expert_packed_u_count(item);
+        uint32_t * packed_v =
+                state.completed_packed_v.data() + size_t(expert)*expert_packed_v_count(item);
+        input.read(reinterpret_cast<char *>(scale_pre), size_t(item.n_in)*sizeof(float));
+        input.read(reinterpret_cast<char *>(scale_post), size_t(item.n_out)*sizeof(float));
+        input.read(reinterpret_cast<char *>(packed_u),
+                expert_packed_u_count(item)*sizeof(uint32_t));
+        input.read(reinterpret_cast<char *>(packed_v),
+                expert_packed_v_count(item)*sizeof(uint32_t));
+        if (stored_digest != expert_checkpoint_hash(
+                item, expert, scale_pre, scale_post, packed_u, packed_v)) {
+            throw std::runtime_error(format(
+                    "NanoQuant: corrupt expert %u checkpoint for '%s'",
+                    expert + 1, item.name.c_str()));
+        }
+    }
+}
+
 static void save_checkpoint(
         const std::filesystem::path & directory,
         const hash256 & source_hash,
@@ -1335,10 +1583,17 @@ static void save_checkpoint(
         write_vector(output, state.scale_post_second_moment);
         write_vector(output, state.packed_u);
         write_vector(output, state.packed_v);
-        write_vector(output, state.completed_scale_pre);
-        write_vector(output, state.completed_scale_post);
-        write_vector(output, state.completed_packed_u);
-        write_vector(output, state.completed_packed_v);
+        if (item.n_expert > 1) {
+            write_pod(output, UINT64_C(0));
+            write_pod(output, UINT64_C(0));
+            write_pod(output, UINT64_C(0));
+            write_pod(output, UINT64_C(0));
+        } else {
+            write_vector(output, state.completed_scale_pre);
+            write_vector(output, state.completed_scale_post);
+            write_vector(output, state.completed_packed_u);
+            write_vector(output, state.completed_packed_v);
+        }
     });
 }
 
@@ -1416,6 +1671,8 @@ static bool load_checkpoint_file(
     if (input.peek() != std::ifstream::traits_type::eof()) {
         throw std::runtime_error(format("NanoQuant: trailing data in checkpoint for '%s'", item.name.c_str()));
     }
+    restore_completed_experts(
+            path, source_hash, config_hash, item, state);
     return true;
 }
 
@@ -3955,11 +4212,24 @@ static void run_factor_reconstruction(
     save_checkpoint(checkpoint_directory, source_hash, config_hash, item, state);
 }
 
-static void complete_expert(const group & item, checkpoint_state & state) {
+static void complete_expert(
+        const std::filesystem::path & checkpoint_directory,
+        const hash256 & source_hash,
+        const hash256 & config_hash,
+        const group & item,
+        checkpoint_state & state) {
     if (state.stage != checkpoint_stage::EXPERT_DONE ||
         state.expert >= uint32_t(item.n_expert)) {
         throw std::runtime_error(format(
                 "NanoQuant: invalid completed expert state for '%s'", item.name.c_str()));
+    }
+    validate_state_shapes(item, state);
+    if (item.n_expert > 1) {
+        write_expert_checkpoint(
+                checkpoint_path(checkpoint_directory, item.name),
+                source_hash, config_hash, item, state.expert,
+                state.scale_pre.data(), state.scale_post.data(),
+                state.packed_u.data(), state.packed_v.data());
     }
     state.completed_scale_pre.insert(
             state.completed_scale_pre.end(), state.scale_pre.begin(), state.scale_pre.end());
@@ -5548,7 +5818,8 @@ static void quantize(
             validate_state_shapes(item, state);
         }
         if (state.stage == checkpoint_stage::EXPERT_DONE) {
-            complete_expert(item, state);
+            complete_expert(
+                    checkpoint_directory, source_hash, config_hash, item, state);
             save_checkpoint(checkpoint_directory, source_hash, config_hash, item, state);
             validate_state_shapes(item, state);
         }
@@ -5682,7 +5953,8 @@ static void quantize(
             const bool reachable = projection_reachable[index];
             while (state.stage < checkpoint_stage::GROUP_DONE) {
                 if (state.stage == checkpoint_stage::EXPERT_DONE) {
-                    complete_expert(item, state);
+                    complete_expert(
+                            checkpoint_directory, source_hash, config_hash, item, state);
                     save_checkpoint(
                             checkpoint_directory, source_hash, config_hash, item, state);
                     continue;
@@ -5766,7 +6038,8 @@ static void quantize(
                             "NanoQuant: group '%s' expert %u did not complete reconstruction",
                             item.name.c_str(), expert));
                 }
-                complete_expert(item, state);
+                complete_expert(
+                        checkpoint_directory, source_hash, config_hash, item, state);
                 save_checkpoint(
                         checkpoint_directory, source_hash, config_hash, item, state);
                 validate_state_shapes(item, state);
