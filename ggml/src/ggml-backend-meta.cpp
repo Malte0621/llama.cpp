@@ -561,7 +561,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_ABORT(
+                    "unsupported split propagation for tensor %s (%s): %s, %s, %s, %s",
+                    tensor->name, ggml_op_name(tensor->op),
+                    ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[3].axis));
+        }
         return ret;
     };
 
@@ -1008,7 +1016,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DIAG_MASK_ZERO: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_SOFT_MAX:
+            case GGML_OP_SOFT_MAX: {
+                if (tensor->src[1] != nullptr &&
+                    src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                    GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+                    split_state = src_ss[0];
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                }
+            } break;
             case GGML_OP_SOFT_MAX_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
