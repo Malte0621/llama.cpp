@@ -7005,6 +7005,247 @@ struct test_nanoquant_linear : public test_case {
     }
 };
 
+struct test_nanoquant_linear_id : public test_case {
+    const int64_t n_in;
+    const int64_t n_out;
+    const int64_t n_rank;
+    const int64_t n_expert;
+    const int64_t n_selected;
+    const int64_t n_input_used;
+    const int64_t n_tokens;
+    const ggml_type scale_type;
+    const int mode;
+
+    std::vector<float> expected;
+
+    test_nanoquant_linear_id(
+            int64_t n_in,
+            int64_t n_out,
+            int64_t n_rank,
+            int64_t n_expert,
+            int64_t n_selected,
+            int64_t n_input_used,
+            int64_t n_tokens,
+            ggml_type scale_type,
+            int mode)
+        : n_in(n_in), n_out(n_out), n_rank(n_rank), n_expert(n_expert),
+          n_selected(n_selected), n_input_used(n_input_used), n_tokens(n_tokens),
+          scale_type(scale_type), mode(mode) {}
+
+    std::string vars() override {
+        return VARS_TO_STR9(
+                n_in, n_out, n_rank, n_expert, n_selected,
+                n_input_used, n_tokens, scale_type, mode);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != expected.size()) {
+            return INFINITY;
+        }
+        return std::max(nmse(a, expected.data(), n), nmse(b, expected.data(), n));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_input = mode == 2 ? n_out : n_in;
+        ggml_tensor * x = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_F32, n_input, mode == 2 ? n_selected : n_input_used, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_selected, n_tokens);
+        ggml_tensor * v = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_I32, (n_in + 31)/32, n_rank, n_expert);
+        ggml_tensor * u = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_I32, (n_rank + 31)/32, n_out, n_expert);
+        ggml_tensor * scale_pre = ggml_new_tensor_2d(ctx, scale_type, n_in, n_expert);
+        ggml_tensor * scale_post = ggml_new_tensor_2d(ctx, scale_type, n_out, n_expert);
+        ggml_set_name(x, "x");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(v, "v");
+        ggml_set_name(u, "u");
+        ggml_set_name(scale_pre, "scale_pre");
+        ggml_set_name(scale_post, "scale_post");
+
+        ggml_tensor * out;
+        if (mode == 2) {
+            out = ggml_nanoquant_linear_id_back(
+                    ctx, x, ids, v, u, scale_pre, scale_post, n_input_used);
+        } else if (mode == 1) {
+            ggml_tensor * weight = ggml_new_tensor_3d(
+                    ctx, GGML_TYPE_F32, n_in, n_out, n_expert);
+            ggml_set_nanoquant_weight(weight, v, u, scale_pre, scale_post);
+            out = ggml_mul_mat_id(ctx, weight, x, ids);
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+            ggml_mul_mat_set_hint(out, GGML_HINT_NONE);
+        } else {
+            out = ggml_nanoquant_linear_id(
+                    ctx, x, ids, v, u, scale_pre, scale_post);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+
+        ggml_tensor * x = ggml_get_tensor(ctx, "x");
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        ggml_tensor * v = ggml_get_tensor(ctx, "v");
+        ggml_tensor * u = ggml_get_tensor(ctx, "u");
+        ggml_tensor * scale_pre = ggml_get_tensor(ctx, "scale_pre");
+        ggml_tensor * scale_post = ggml_get_tensor(ctx, "scale_post");
+
+        const int64_t n_x_vectors = (mode == 2 ? n_selected : n_input_used)*n_tokens;
+        const int64_t n_x_columns = mode == 2 ? n_out : n_in;
+        std::vector<float> x_data(n_x_columns*n_x_vectors);
+        for (int64_t iv = 0; iv < n_x_vectors; ++iv) {
+            for (int64_t i = 0; i < n_x_columns; ++i) {
+                x_data[iv*n_x_columns + i] =
+                        float((i*13 + iv*7) % 17 - 8)*0.125f + 0.03125f;
+            }
+        }
+
+        std::vector<int32_t> ids_data(n_selected*n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_selected; ++slot) {
+                ids_data[token*n_selected + slot] =
+                        int32_t((token*n_selected + 2*slot + 1) % n_expert);
+            }
+        }
+
+        const int64_t v_words = (n_in + 31)/32;
+        const int64_t u_words = (n_rank + 31)/32;
+        std::vector<uint32_t> v_data(v_words*n_rank*n_expert);
+        std::vector<uint32_t> u_data(u_words*n_out*n_expert);
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            for (int64_t ir = 0; ir < n_rank; ++ir) {
+                for (int64_t i = 0; i < v_words*32; ++i) {
+                    if ((i + 3*ir + 5*expert) % 7 < 3) {
+                        v_data[(expert*n_rank + ir)*v_words + i/32] |=
+                                UINT32_C(1) << (i % 32);
+                    }
+                }
+            }
+            for (int64_t io = 0; io < n_out; ++io) {
+                for (int64_t ir = 0; ir < u_words*32; ++ir) {
+                    if ((2*ir + 5*io + 3*expert) % 11 < 5) {
+                        u_data[(expert*n_out + io)*u_words + ir/32] |=
+                                UINT32_C(1) << (ir % 32);
+                    }
+                }
+            }
+        }
+
+        std::vector<float> pre_data(n_in*n_expert);
+        std::vector<float> post_data(n_out*n_expert);
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            for (int64_t i = 0; i < n_in; ++i) {
+                pre_data[expert*n_in + i] =
+                        0.5f*float(UINT32_C(1) << ((i + expert) % 3));
+            }
+            for (int64_t i = 0; i < n_out; ++i) {
+                post_data[expert*n_out + i] =
+                        0.25f*float(UINT32_C(1) << ((i + expert) % 4));
+            }
+        }
+
+        ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size()*sizeof(float));
+        ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size()*sizeof(uint32_t));
+        ggml_backend_tensor_set(u, u_data.data(), 0, u_data.size()*sizeof(uint32_t));
+
+        const auto set_scale = [](ggml_tensor * tensor, const std::vector<float> & data) {
+            if (tensor->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+            } else if (tensor->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> converted(data.size());
+                ggml_fp32_to_fp16_row(data.data(), converted.data(), data.size());
+                ggml_backend_tensor_set(
+                        tensor, converted.data(), 0, converted.size()*sizeof(ggml_fp16_t));
+            } else if (tensor->type == GGML_TYPE_BF16) {
+                std::vector<ggml_bf16_t> converted(data.size());
+                ggml_fp32_to_bf16_row(data.data(), converted.data(), data.size());
+                ggml_backend_tensor_set(
+                        tensor, converted.data(), 0, converted.size()*sizeof(ggml_bf16_t));
+            } else {
+                GGML_ABORT("unsupported NanoQuant scale type");
+            }
+        };
+        set_scale(scale_pre, pre_data);
+        set_scale(scale_post, post_data);
+
+        if (mode != 2) {
+            expected.resize(n_out*n_selected*n_tokens);
+            std::vector<float> tmp(n_rank);
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                for (int64_t slot = 0; slot < n_selected; ++slot) {
+                    const int64_t iv = token*n_selected + slot;
+                    const int64_t input_vector =
+                            token*n_input_used + slot % n_input_used;
+                    const int64_t expert = ids_data[iv];
+                    for (int64_t ir = 0; ir < n_rank; ++ir) {
+                        float sum = 0.0f;
+                        for (int64_t i = 0; i < n_in; ++i) {
+                            const float value =
+                                    x_data[input_vector*n_in + i]*pre_data[expert*n_in + i];
+                            const uint32_t bits =
+                                    v_data[(expert*n_rank + ir)*v_words + i/32];
+                            sum += (bits & (UINT32_C(1) << (i % 32))) ? -value : value;
+                        }
+                        tmp[ir] = sum;
+                    }
+                    for (int64_t io = 0; io < n_out; ++io) {
+                        float sum = 0.0f;
+                        for (int64_t ir = 0; ir < n_rank; ++ir) {
+                            const uint32_t bits =
+                                    u_data[(expert*n_out + io)*u_words + ir/32];
+                            sum += (bits & (UINT32_C(1) << (ir % 32))) ? -tmp[ir] : tmp[ir];
+                        }
+                        expected[iv*n_out + io] = sum*post_data[expert*n_out + io];
+                    }
+                }
+            }
+            return;
+        }
+
+        expected.assign(n_in*n_input_used*n_tokens, 0.0f);
+        std::vector<float> tmp(n_rank);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_selected; ++slot) {
+                const int64_t iv = token*n_selected + slot;
+                const int64_t expert = ids_data[iv];
+                for (int64_t ir = 0; ir < n_rank; ++ir) {
+                    float sum = 0.0f;
+                    for (int64_t io = 0; io < n_out; ++io) {
+                        const float value =
+                                x_data[iv*n_out + io]*post_data[expert*n_out + io];
+                        const uint32_t bits =
+                                u_data[(expert*n_out + io)*u_words + ir/32];
+                        sum += (bits & (UINT32_C(1) << (ir % 32))) ? -value : value;
+                    }
+                    tmp[ir] = sum;
+                }
+                const int64_t input_vector =
+                        token*n_input_used + slot % n_input_used;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    float sum = 0.0f;
+                    for (int64_t ir = 0; ir < n_rank; ++ir) {
+                        const uint32_t bits =
+                                v_data[(expert*n_rank + ir)*v_words + i/32];
+                        sum += (bits & (UINT32_C(1) << (i % 32))) ? -tmp[ir] : tmp[ir];
+                    }
+                    expected[input_vector*n_in + i] += sum*pre_data[expert*n_in + i];
+                }
+            }
+        }
+    }
+};
+
 // GGML_OP_TURBO_WHT
 struct test_turbo_wht : public test_case {
     const int64_t head_dim;
@@ -9907,6 +10148,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_nanoquant_linear(128, 96, 64, 7, scale_type));
     }
     test_cases.emplace_back(new test_nanoquant_linear(65, 43, 37, 3, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_nanoquant_linear_id(
+            65, 43, 37, 5, 3, 1, 4, GGML_TYPE_F16, 0));
+    test_cases.emplace_back(new test_nanoquant_linear_id(
+            65, 43, 37, 5, 3, 1, 4, GGML_TYPE_F16, 1));
+    test_cases.emplace_back(new test_nanoquant_linear_id(
+            65, 43, 37, 5, 3, 1, 4, GGML_TYPE_F32, 2));
+    test_cases.emplace_back(new test_nanoquant_linear_id(
+            128, 96, 64, 4, 2, 2, 3, GGML_TYPE_BF16, 0));
 
     // TURBO_WHT tests
     for (int dir : {0, 1}) {

@@ -1510,9 +1510,16 @@ static hash256 hash_model_files(
         const hash256 digest = hash_file(input_path);
         hash.update(digest.data(), sizeof(digest));
     } else {
+        std::vector<std::future<hash256>> digests;
+        digests.reserve(splits.size());
         for (const std::string & split : splits) {
-            const hash256 digest = hash_file(split);
-            hash.update(digest.data(), sizeof(digest));
+            digests.emplace_back(std::async(std::launch::async, [split] {
+                return hash_file(split);
+            }));
+        }
+        for (std::future<hash256> & digest : digests) {
+            const hash256 value = digest.get();
+            hash.update(value.data(), sizeof(value));
         }
     }
     return hash.value;
@@ -5433,6 +5440,9 @@ static void quantize(
     if (std::error_code ec; std::filesystem::equivalent(input_path, output_path, ec)) {
         throw std::runtime_error("NanoQuant: input and output files must differ");
     }
+    LLAMA_LOG_INFO(
+            "NanoQuant: hashing %zu source model file(s) for checkpoint identity\n",
+            splits.empty() ? size_t(1) : splits.size());
     const hash256 source_hash = hash_model_files(input_path, splits);
     const hash256 dataset_hash = hash_file(params->nanoquant_calibration_dataset);
     const hash256 config_hash =
