@@ -5976,11 +5976,6 @@ static void quantize(
     compute_backend backend(params->nanoquant_device);
     llama_model_params model_params = llama_model_default_params();
     std::vector<ggml_backend_dev_t> model_devices;
-    std::array<llama_model_tensor_buft_override, 3> block_training_buft_overrides = {{
-        { "^token_embd\\.weight$", nullptr },
-        { "^output\\.weight$", nullptr },
-        { nullptr, nullptr },
-    }};
     model_params.load_mode = load_mode;
     ggml_backend_dev_t training_device = ggml_backend_get_device(backend.backend);
     const bool cpu_training =
@@ -6108,24 +6103,7 @@ static void quantize(
     context_params.cb_eval_user_data = nullptr;
     if (ggml_backend_dev_type(ggml_backend_get_device(backend.backend)) !=
         GGML_BACKEND_DEVICE_TYPE_CPU) {
-        ggml_backend_buffer_type_t host_buft = nullptr;
-        for (ggml_backend_t candidate : backend.backends) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(candidate)) ==
-                GGML_BACKEND_DEVICE_TYPE_CPU) {
-                host_buft = ggml_backend_get_default_buffer_type(candidate);
-                break;
-            }
-        }
-        if (host_buft == nullptr) {
-            host_buft =
-                    ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend.backend));
-        }
         model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-        if (host_buft != nullptr) {
-            block_training_buft_overrides[0].buft = host_buft;
-            block_training_buft_overrides[1].buft = host_buft;
-            model_params.tensor_buft_overrides = block_training_buft_overrides.data();
-        }
         teacher.reset();
         teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
         if (!teacher) {
@@ -6133,10 +6111,6 @@ static void quantize(
                     "NanoQuant: failed to reload the block-training source model");
         }
         LLAMA_LOG_INFO("NanoQuant: block training uses layer sharding\n");
-        if (host_buft != nullptr) {
-            LLAMA_LOG_INFO(
-                    "NanoQuant: block training keeps token embedding and output weights host-resident\n");
-        }
     }
 
     llama_context_params projection_context_params = context_params;
