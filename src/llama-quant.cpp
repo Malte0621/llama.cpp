@@ -5686,7 +5686,7 @@ static model_fit_probe probe_model_fit(
         if (device == nullptr) {
             continue;
         }
-        const ggml_backend_dev_type type = ggml_backend_dev_type(device);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
         if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
             type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             continue;
