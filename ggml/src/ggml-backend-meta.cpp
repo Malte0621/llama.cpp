@@ -789,12 +789,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
+            split_states_equal(src_ss[0], src_ss[1]) &&
+            split_states_equal(src_ss[0], src_ss[2])) {
+            GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                        split_states_equal(src_ss[0], src_ss[3]));
+            return src_ss[0];
+        }
+        GGML_ABORT("unsupported flash attention split axes");
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -2030,7 +2039,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
-            GGML_ASSERT(i_start == cgraph->n_nodes);
+            if (i_start < cgraph->n_nodes) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    bcj.cgraphs[n_subgraphs].offset = i_start;
+                }
+                n_subgraphs++;
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;

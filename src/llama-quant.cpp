@@ -5658,7 +5658,8 @@ struct model_fit_probe {
 static model_fit_probe probe_model_fit(
         const std::string & path,
         llama_model_params model_params,
-        const llama_context_params & context_params) {
+        const llama_context_params & context_params,
+        size_t model_device_count) {
     model_params.no_alloc = true;
     model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     model_params.check_tensors = false;
@@ -5688,7 +5689,8 @@ static model_fit_probe probe_model_fit(
         }
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
         if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
-            type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+            type != GGML_BACKEND_DEVICE_TYPE_META) {
             continue;
         }
         const size_t bytes = memory.total();
@@ -5705,7 +5707,13 @@ static model_fit_probe probe_model_fit(
         size_t free = 0;
         size_t total = 0;
         ggml_backend_dev_memory(device, &free, &total);
-        const size_t reserve = std::max<size_t>(2u*GIB, total/8);
+        const size_t reserve_count =
+                ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META ?
+                model_device_count : 1;
+        if (reserve_count > std::numeric_limits<size_t>::max()/(2u*GIB)) {
+            throw std::runtime_error("NanoQuant: device reserve size overflow");
+        }
+        const size_t reserve = 2u*GIB*reserve_count;
         const size_t available = free > reserve ? free - reserve : 0;
         if (used > available) {
             result.fits = false;
@@ -5720,9 +5728,11 @@ static model_fit_probe probe_model_fit(
 static int32_t fit_model_gpu_layers(
         const std::string & path,
         llama_model_params model_params,
-        const llama_context_params & context_params) {
+        const llama_context_params & context_params,
+        size_t model_device_count) {
     model_params.n_gpu_layers = -1;
-    model_fit_probe probe = probe_model_fit(path, model_params, context_params);
+    model_fit_probe probe =
+            probe_model_fit(path, model_params, context_params, model_device_count);
     if (probe.fits) {
         return -1;
     }
@@ -5738,7 +5748,8 @@ static int32_t fit_model_gpu_layers(
                     probe.max_gpu_layers*std::clamp(probe.fit_ratio, 0.0, 1.0)))));
     while (true) {
         model_params.n_gpu_layers = candidate;
-        probe = probe_model_fit(path, model_params, context_params);
+        probe = probe_model_fit(
+                path, model_params, context_params, model_device_count);
         if (probe.fits) {
             LLAMA_LOG_INFO(
                     "NanoQuant: source model uses %d/%d GPU layers; %d remain host-resident\n",
@@ -5964,29 +5975,40 @@ static void quantize(
     calibration_collector_set collector_set;
     compute_backend backend(params->nanoquant_device);
     llama_model_params model_params = llama_model_default_params();
-    std::array<ggml_backend_dev_t, 2> model_devices = { nullptr, nullptr };
+    std::vector<ggml_backend_dev_t> model_devices;
     std::array<llama_model_tensor_buft_override, 3> block_training_buft_overrides = {{
         { "^token_embd\\.weight$", nullptr },
         { "^output\\.weight$", nullptr },
         { nullptr, nullptr },
     }};
     model_params.load_mode = load_mode;
-    if (params->nanoquant_device != nullptr && params->nanoquant_device[0] != '\0') {
-        model_devices[0] = ggml_backend_dev_by_name(params->nanoquant_device);
-        if (model_devices[0] == nullptr) {
-            throw std::runtime_error(format(
-                    "NanoQuant: unknown training device '%s'", params->nanoquant_device));
+    ggml_backend_dev_t training_device = ggml_backend_get_device(backend.backend);
+    const bool cpu_training =
+            ggml_backend_dev_type(training_device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    if (cpu_training) {
+        model_devices.push_back(training_device);
+    } else {
+        ggml_backend_reg_t training_reg = ggml_backend_dev_backend_reg(training_device);
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(training_reg); ++i) {
+            ggml_backend_dev_t device = ggml_backend_reg_dev_get(training_reg, i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                model_devices.push_back(device);
+            }
         }
-        if (ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            model_params.devices = model_devices.data();
-        } else {
-            LLAMA_LOG_INFO(
-                    "NanoQuant: training on %s; model layers use the normal multi-device distribution\n",
-                    params->nanoquant_device);
+        if (model_devices.empty()) {
+            throw std::runtime_error(
+                    "NanoQuant: training backend has no model devices");
         }
+        model_params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        LLAMA_LOG_INFO(
+                "NanoQuant: source tensors are sharded across %zu devices from backend %s\n",
+                model_devices.size(), ggml_backend_reg_name(training_reg));
     }
-    const bool cpu_training = model_devices[0] != nullptr &&
-            ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const size_t model_device_count = model_devices.size();
+    model_devices.push_back(nullptr);
+    model_params.devices = model_devices.data();
     const int32_t configured_model_gpu_layers =
             cpu_training ? 0 : params->nanoquant_n_gpu_layers;
     model_params.n_gpu_layers = configured_model_gpu_layers;
@@ -6000,8 +6022,8 @@ static void quantize(
     context_params.n_threads_batch = nthread;
     context_params.no_perf = true;
     if (model_params.n_gpu_layers < 0) {
-        model_params.n_gpu_layers =
-                fit_model_gpu_layers(input_path, model_params, context_params);
+        model_params.n_gpu_layers = fit_model_gpu_layers(
+                input_path, model_params, context_params, model_device_count);
     }
     std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(
             llama_model_load_from_file(input_path.c_str(), model_params), llama_model_free);
@@ -6318,6 +6340,7 @@ static void quantize(
         release_vector(conversion);
 
         model_params.tensor_buft_overrides = nullptr;
+        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         model_params.n_gpu_layers = configured_model_gpu_layers;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> student(
                 llama_model_load_from_file(
