@@ -11440,6 +11440,117 @@ void ggml_compute_forward_nanoquant_linear(
         }
         return;
     }
+
+    if (mode == 4 || mode == 5) {
+        const bool backward = mode == 5;
+        const ggml_tensor * id_tensor = dst->src[5];
+        GGML_ASSERT(id_tensor != nullptr && id_tensor->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(id_tensor));
+
+        const int64_t n_in = scale_pre->ne[0];
+        const int64_t n_rank = v_bits->ne[1];
+        const int64_t n_out = scale_post->ne[0];
+        const int64_t n_expert = v_bits->ne[2];
+        const int64_t n_selected = id_tensor->ne[0];
+        const int64_t n_tokens = id_tensor->ne[1];
+        const int64_t n_input_used = backward ? dst->ne[1] : x->ne[1];
+        const int64_t n_vectors = n_selected*n_tokens;
+        const int64_t n_words_v = v_bits->ne[0];
+        const int64_t n_words_u = u_bits->ne[0];
+        const int32_t * ids = (const int32_t *) id_tensor->data;
+        const uint32_t * v_data = (const uint32_t *) v_bits->data;
+        const uint32_t * u_data = (const uint32_t *) u_bits->data;
+        const float * x_data = (const float *) x->data;
+        float * dst_data = (float *) dst->data;
+        float * tmp = (float *) params->wdata;
+
+        const int64_t ith = params->ith;
+        const int64_t nth = params->nth;
+        const int64_t nt0 = (n_vectors*n_rank*ith)/nth;
+        const int64_t nt1 = (n_vectors*n_rank*(ith + 1))/nth;
+        for (int64_t i = nt0; i < nt1; ++i) {
+            const int64_t iv = i/n_rank;
+            const int64_t ir = i - iv*n_rank;
+            const int64_t expert = ids[iv];
+            GGML_ASSERT(expert >= 0 && expert < n_expert);
+            float sum = 0.0f;
+            if (backward) {
+                const float * xv = x_data + iv*n_out;
+                const uint32_t * expert_u =
+                        u_data + expert*n_out*n_words_u;
+                const int64_t scale_offset = expert*n_out;
+                for (int64_t io = 0; io < n_out; ++io) {
+                    const uint32_t * bits = expert_u + io*n_words_u;
+                    const float value =
+                            xv[io]*nanoquant_get_scale(scale_post, scale_offset + io);
+                    sum += (bits[ir/32] & (UINT32_C(1) << (ir % 32))) ? -value : value;
+                }
+            } else {
+                const int64_t expert_slot = iv % n_selected;
+                const int64_t token = iv/n_selected;
+                const int64_t input_vector =
+                        token*n_input_used + expert_slot % n_input_used;
+                const float * xv = x_data + input_vector*n_in;
+                const uint32_t * bits =
+                        v_data + (expert*n_rank + ir)*n_words_v;
+                const int64_t scale_offset = expert*n_in;
+                for (int64_t ii = 0; ii < n_in; ++ii) {
+                    const float value =
+                            xv[ii]*nanoquant_get_scale(scale_pre, scale_offset + ii);
+                    sum += (bits[ii/32] & (UINT32_C(1) << (ii % 32))) ? -value : value;
+                }
+            }
+            tmp[i] = sum;
+        }
+        ggml_barrier(params->threadpool);
+
+        const int64_t no0 = (ggml_nelements(dst)*ith)/nth;
+        const int64_t no1 = (ggml_nelements(dst)*(ith + 1))/nth;
+        for (int64_t i = no0; i < no1; ++i) {
+            if (backward) {
+                const int64_t input_vector = i/n_in;
+                const int64_t ii = i - input_vector*n_in;
+                const int64_t input_slot = input_vector % n_input_used;
+                const int64_t token = input_vector/n_input_used;
+                float sum = 0.0f;
+                for (int64_t expert_slot = input_slot;
+                     expert_slot < n_selected;
+                     expert_slot += n_input_used) {
+                    const int64_t iv = token*n_selected + expert_slot;
+                    const int64_t expert = ids[iv];
+                    const uint32_t * expert_v =
+                            v_data + expert*n_rank*n_words_v;
+                    const float * tv = tmp + iv*n_rank;
+                    float selected_sum = 0.0f;
+                    for (int64_t ir = 0; ir < n_rank; ++ir) {
+                        const uint32_t * bits = expert_v + ir*n_words_v;
+                        selected_sum +=
+                                (bits[ii/32] & (UINT32_C(1) << (ii % 32))) ?
+                                -tv[ir] : tv[ir];
+                    }
+                    sum += selected_sum*nanoquant_get_scale(
+                            scale_pre, expert*n_in + ii);
+                }
+                dst_data[i] = sum;
+            } else {
+                const int64_t iv = i/n_out;
+                const int64_t io = i - iv*n_out;
+                const int64_t expert = ids[iv];
+                const uint32_t * bits =
+                        u_data + (expert*n_out + io)*n_words_u;
+                const float * tv = tmp + iv*n_rank;
+                float sum = 0.0f;
+                for (int64_t ir = 0; ir < n_rank; ++ir) {
+                    sum += (bits[ir/32] & (UINT32_C(1) << (ir % 32))) ?
+                            -tv[ir] : tv[ir];
+                }
+                dst_data[i] = sum*nanoquant_get_scale(
+                        scale_post, expert*n_out + io);
+            }
+        }
+        return;
+    }
+
     GGML_ASSERT(mode == 0 || mode == 1);
 
     const bool backward = mode == 1;

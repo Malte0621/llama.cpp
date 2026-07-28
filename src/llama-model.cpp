@@ -1668,7 +1668,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
 
-    if (tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0 && ne.size() == 2) {
+    if (tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0 &&
+        (ne.size() == 2 || ne.size() == 3)) {
         const LLM_TN_IMPL tn_v(tn.arch, tn.tensor, "nq_v", tn.bid, tn.xid);
         ggml_tensor * v_meta = ml.get_tensor_meta(tn_v.str().c_str());
         if (v_meta != nullptr) {
@@ -1678,9 +1679,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
 
             const int64_t n_in = ne.begin()[0];
             const int64_t n_out = ne.begin()[1];
+            const int64_t n_expert = ne.size() == 3 ? ne.begin()[2] : 1;
             const int64_t n_rank = v_meta->ne[1];
             if (v_meta->type != GGML_TYPE_I32 || v_meta->ne[0] != (n_in + 31)/32 ||
-                    v_meta->ne[2] != 1 || v_meta->ne[3] != 1 || n_rank <= 0) {
+                    v_meta->ne[2] != n_expert || v_meta->ne[3] != 1 || n_rank <= 0) {
                 throw std::runtime_error(format("invalid NanoQuant V tensor '%s'", tn_v.str().c_str()));
             }
 
@@ -1695,33 +1697,46 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
             };
             if (u_meta->type != GGML_TYPE_I32 || u_meta->ne[0] != (n_rank + 31)/32 ||
-                    u_meta->ne[1] != n_out || u_meta->ne[2] != 1 || u_meta->ne[3] != 1) {
+                    u_meta->ne[1] != n_out || u_meta->ne[2] != n_expert || u_meta->ne[3] != 1) {
                 throw std::runtime_error(format("invalid NanoQuant U tensor '%s'", tn_u.str().c_str()));
             }
-            if (!scale_type_valid(pre_meta->type) || pre_meta->ne[0] != n_in || ggml_nrows(pre_meta) != 1) {
+            if (!scale_type_valid(pre_meta->type) || pre_meta->ne[0] != n_in ||
+                    pre_meta->ne[1] != n_expert || pre_meta->ne[2] != 1 || pre_meta->ne[3] != 1) {
                 throw std::runtime_error(format("invalid NanoQuant pre-scale tensor '%s'", tn_scale_pre.str().c_str()));
             }
-            if (!scale_type_valid(post_meta->type) || post_meta->ne[0] != n_out || ggml_nrows(post_meta) != 1) {
+            if (!scale_type_valid(post_meta->type) || post_meta->ne[0] != n_out ||
+                    post_meta->ne[1] != n_expert || post_meta->ne[2] != 1 || post_meta->ne[3] != 1) {
                 throw std::runtime_error(format("invalid NanoQuant post-scale tensor '%s'", tn_scale_post.str().c_str()));
             }
 
             llama_nanoquant_weight nq;
             const int sidecar_flags = flags & TENSOR_DUPLICATED;
-            nq.v = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_v, { (n_in + 31)/32, n_rank }, sidecar_flags);
-            nq.u = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_u, { (n_rank + 31)/32, n_out }, sidecar_flags);
-            nq.scale_pre = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_scale_pre, { n_in }, sidecar_flags);
-            nq.scale_post = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
-                    buft_list_layer, tn_scale_post, { n_out }, sidecar_flags);
+            if (n_expert == 1) {
+                nq.v = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_v, { (n_in + 31)/32, n_rank }, sidecar_flags);
+                nq.u = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_u, { (n_rank + 31)/32, n_out }, sidecar_flags);
+                nq.scale_pre = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_scale_pre, { n_in }, sidecar_flags);
+                nq.scale_post = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_scale_post, { n_out }, sidecar_flags);
+            } else {
+                nq.v = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_v, { (n_in + 31)/32, n_rank, n_expert }, sidecar_flags);
+                nq.u = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_u, { (n_rank + 31)/32, n_out, n_expert }, sidecar_flags);
+                nq.scale_pre = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_scale_pre, { n_in, n_expert }, sidecar_flags);
+                nq.scale_post = ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list,
+                        buft_list_layer, tn_scale_post, { n_out, n_expert }, sidecar_flags);
+            }
 
             auto logical = std::make_unique<ggml_tensor>();
             memset(logical.get(), 0, sizeof(ggml_tensor));
             logical->type = GGML_TYPE_F32;
             logical->ne[0] = n_in;
             logical->ne[1] = n_out;
-            logical->ne[2] = 1;
+            logical->ne[2] = n_expert;
             logical->ne[3] = 1;
             logical->nb[0] = sizeof(float);
             for (int i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -1739,7 +1754,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 const uint64_t stored_elements = ggml_nelements(v_meta) + ggml_nelements(u_meta) +
                         ggml_nelements(pre_meta) + ggml_nelements(post_meta);
                 GGML_ASSERT(pimpl->n_elements >= stored_elements);
-                pimpl->n_elements += (uint64_t) n_in*n_out - stored_elements;
+                pimpl->n_elements += (uint64_t) n_in*n_out*n_expert - stored_elements;
             }
             return result;
         }

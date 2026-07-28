@@ -2663,7 +2663,7 @@ extern "C" {
             int                   group_size,
             struct ggml_tensor  * scale);
 
-    // Marks a logical F32 matrix as a packed NanoQuant weight. ggml_mul_mat expands it to ggml_nanoquant_linear.
+    // Marks a logical F32 matrix or expert stack as a packed NanoQuant weight.
     GGML_API void ggml_set_nanoquant_weight(
             struct ggml_tensor * weight,
             struct ggml_tensor * v_bits,
@@ -2680,6 +2680,16 @@ extern "C" {
             struct ggml_tensor  * scale_pre,
             struct ggml_tensor  * scale_post);
 
+    // Expert-routed variant of ggml_nanoquant_linear.
+    GGML_API struct ggml_tensor * ggml_nanoquant_linear_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_post);
+
     GGML_API struct ggml_tensor * ggml_nanoquant_linear_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * grad,
@@ -2687,6 +2697,16 @@ extern "C" {
             struct ggml_tensor  * u_bits,
             struct ggml_tensor  * scale_pre,
             struct ggml_tensor  * scale_post);
+
+    GGML_API struct ggml_tensor * ggml_nanoquant_linear_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_post,
+            int64_t               n_expert_used);
 
     GGML_API struct ggml_tensor * ggml_nanoquant_get_rows(
             struct ggml_context * ctx,

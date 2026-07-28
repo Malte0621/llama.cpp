@@ -893,7 +893,7 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 
 namespace nanoquant {
 
-static constexpr uint32_t CHECKPOINT_VERSION = 4;
+static constexpr uint32_t CHECKPOINT_VERSION = 5;
 static constexpr size_t PROJECTION_MEMORY_BUDGET = 256u * 1024u * 1024u;
 static constexpr size_t GRADIENT_MEMORY_BUDGET = 256u * 1024u * 1024u;
 static constexpr int32_t ADMM_LOG_INTERVAL = 25;
@@ -1043,22 +1043,24 @@ struct group {
     int block = -1;
     int64_t n_in = 0;
     int64_t n_out = 0;
+    int64_t n_expert = 1;
+    int64_t n_expert_used = 1;
     int64_t rank = 0;
 
     size_t v_size() const {
-        return size_t((n_in + 31) / 32) * size_t(rank) * sizeof(uint32_t);
+        return size_t((n_in + 31) / 32) * size_t(rank) * size_t(n_expert) * sizeof(uint32_t);
     }
 
     size_t u_size() const {
-        return size_t((rank + 31) / 32) * size_t(n_out) * sizeof(uint32_t);
+        return size_t((rank + 31) / 32) * size_t(n_out) * size_t(n_expert) * sizeof(uint32_t);
     }
 
     size_t scale_pre_size() const {
-        return size_t(n_in) * sizeof(ggml_fp16_t);
+        return size_t(n_in) * size_t(n_expert) * sizeof(ggml_fp16_t);
     }
 
     size_t scale_post_size() const {
-        return size_t(n_out) * sizeof(ggml_fp16_t);
+        return size_t(n_out) * size_t(n_expert) * sizeof(ggml_fp16_t);
     }
 
     size_t payload_size() const {
@@ -1108,7 +1110,7 @@ static size_t allocate_ranks(
             }
             const long double bits =
                     (long double) next_size*8.0L/
-                    ((long double) item.n_in*(long double) item.n_out);
+                    ((long double) item.n_in*(long double) item.n_out*(long double) item.n_expert);
             if (bits < best_bits || (bits == best_bits && i < best)) {
                 best = i;
                 best_size = increment;
@@ -1133,9 +1135,10 @@ enum class checkpoint_stage : uint32_t {
     NONFACTOR = 1,
     ADMM = 2,
     FACTOR = 3,
-    GROUP_DONE = 4,
-    MODEL = 5,
-    MODEL_DONE = 6,
+    EXPERT_DONE = 4,
+    GROUP_DONE = 5,
+    MODEL = 6,
+    MODEL_DONE = 7,
 };
 
 struct checkpoint_state {
@@ -1143,6 +1146,7 @@ struct checkpoint_state {
     uint32_t progress = 0;
     uint64_t rng_state = 0;
     uint64_t optimizer_step = 0;
+    uint32_t expert = 0;
     std::vector<float> weight;
     std::vector<float> u;
     std::vector<float> v;
@@ -1164,6 +1168,10 @@ struct checkpoint_state {
     std::vector<float> scale_post_second_moment;
     std::vector<uint32_t> packed_u;
     std::vector<uint32_t> packed_v;
+    std::vector<float> completed_scale_pre;
+    std::vector<float> completed_scale_post;
+    std::vector<uint32_t> completed_packed_u;
+    std::vector<uint32_t> completed_packed_v;
 };
 
 template<class T>
@@ -1299,11 +1307,13 @@ static void save_checkpoint(
         write_string(output, item.name);
         write_pod(output, item.n_in);
         write_pod(output, item.n_out);
+        write_pod(output, item.n_expert);
         write_pod(output, item.rank);
         write_pod(output, uint32_t(state.stage));
         write_pod(output, state.progress);
         write_pod(output, state.rng_state);
         write_pod(output, state.optimizer_step);
+        write_pod(output, state.expert);
         write_vector(output, state.weight);
         write_vector(output, state.u);
         write_vector(output, state.v);
@@ -1325,6 +1335,10 @@ static void save_checkpoint(
         write_vector(output, state.scale_post_second_moment);
         write_vector(output, state.packed_u);
         write_vector(output, state.packed_v);
+        write_vector(output, state.completed_scale_pre);
+        write_vector(output, state.completed_scale_post);
+        write_vector(output, state.completed_packed_u);
+        write_vector(output, state.completed_packed_v);
     });
 }
 
@@ -1358,10 +1372,11 @@ static bool load_checkpoint_file(
     const std::string stored_name = read_string(input);
     const int64_t stored_n_in = read_pod<int64_t>(input);
     const int64_t stored_n_out = read_pod<int64_t>(input);
+    const int64_t stored_n_expert = read_pod<int64_t>(input);
     const int64_t stored_rank = read_pod<int64_t>(input);
     if (stored_source != source_hash || stored_config != config_hash ||
         stored_name != item.name || stored_n_in != item.n_in ||
-        stored_n_out != item.n_out || stored_rank != item.rank) {
+        stored_n_out != item.n_out || stored_n_expert != item.n_expert || stored_rank != item.rank) {
         throw std::runtime_error(format("NanoQuant: checkpoint identity mismatch for '%s'", item.name.c_str()));
     }
     const uint32_t stored_stage = read_pod<uint32_t>(input);
@@ -1372,6 +1387,7 @@ static bool load_checkpoint_file(
     state.progress = read_pod<uint32_t>(input);
     state.rng_state = read_pod<uint64_t>(input);
     state.optimizer_step = read_pod<uint64_t>(input);
+    state.expert = read_pod<uint32_t>(input);
     state.weight = read_vector<float>(input);
     state.u = read_vector<float>(input);
     state.v = read_vector<float>(input);
@@ -1393,6 +1409,10 @@ static bool load_checkpoint_file(
     state.scale_post_second_moment = read_vector<float>(input);
     state.packed_u = read_vector<uint32_t>(input);
     state.packed_v = read_vector<uint32_t>(input);
+    state.completed_scale_pre = read_vector<float>(input);
+    state.completed_scale_post = read_vector<float>(input);
+    state.completed_packed_u = read_vector<uint32_t>(input);
+    state.completed_packed_v = read_vector<uint32_t>(input);
     if (input.peek() != std::ifstream::traits_type::eof()) {
         throw std::runtime_error(format("NanoQuant: trailing data in checkpoint for '%s'", item.name.c_str()));
     }
@@ -1418,6 +1438,24 @@ static void validate_state_shapes(
                     field, item.name.c_str(), actual, expected));
         }
     };
+    const bool group_done = state.stage >= checkpoint_stage::GROUP_DONE;
+    if ((!group_done && state.expert >= uint32_t(item.n_expert)) ||
+        (group_done && state.expert != uint32_t(item.n_expert))) {
+        throw std::runtime_error(format(
+                "NanoQuant: checkpoint expert index mismatch for '%s' (%u of %" PRId64 ")",
+                item.name.c_str(), state.expert, item.n_expert));
+    }
+    const size_t completed_experts = group_done ? 0 : state.expert;
+    require_size(state.completed_scale_pre.size(), completed_experts*size_t(item.n_in),
+            "completed scale_pre");
+    require_size(state.completed_scale_post.size(), completed_experts*size_t(item.n_out),
+            "completed scale_post");
+    require_size(state.completed_packed_u.size(),
+            completed_experts*size_t((item.rank + 31)/32)*size_t(item.n_out),
+            "completed packed_U");
+    require_size(state.completed_packed_v.size(),
+            completed_experts*size_t((item.n_in + 31)/32)*size_t(item.rank),
+            "completed packed_V");
     if (state.stage == checkpoint_stage::NONFACTOR ||
         state.stage == checkpoint_stage::ADMM) {
         require_size(state.weight.size(), weight_size, "weight");
@@ -1438,8 +1476,9 @@ static void validate_state_shapes(
         require_size(state.v.size(), v_size, "V");
     }
     if (state.stage >= checkpoint_stage::FACTOR) {
-        require_size(state.scale_pre.size(), item.n_in, "scale_pre");
-        require_size(state.scale_post.size(), item.n_out, "scale_post");
+        const size_t scale_experts = group_done ? size_t(item.n_expert) : 1;
+        require_size(state.scale_pre.size(), scale_experts*size_t(item.n_in), "scale_pre");
+        require_size(state.scale_post.size(), scale_experts*size_t(item.n_out), "scale_post");
     }
     if (state.stage == checkpoint_stage::FACTOR && state.progress > 0) {
         require_size(state.u_first_moment.size(), u_size, "U first moment");
@@ -1451,9 +1490,14 @@ static void validate_state_shapes(
         require_size(state.scale_post_first_moment.size(), item.n_out, "scale_post first moment");
         require_size(state.scale_post_second_moment.size(), item.n_out, "scale_post second moment");
     }
-    if (require_packed && state.stage >= checkpoint_stage::GROUP_DONE) {
-        require_size(state.packed_u.size(), item.u_size() / sizeof(uint32_t), "packed_U");
-        require_size(state.packed_v.size(), item.v_size() / sizeof(uint32_t), "packed_V");
+    if (require_packed && state.stage == checkpoint_stage::EXPERT_DONE) {
+        require_size(state.packed_u.size(),
+                size_t((item.rank + 31)/32)*size_t(item.n_out), "packed_U");
+        require_size(state.packed_v.size(),
+                size_t((item.n_in + 31)/32)*size_t(item.rank), "packed_V");
+    } else if (require_packed && state.stage >= checkpoint_stage::GROUP_DONE) {
+        require_size(state.packed_u.size(), item.u_size()/sizeof(uint32_t), "packed_U");
+        require_size(state.packed_v.size(), item.v_size()/sizeof(uint32_t), "packed_V");
     }
 }
 
@@ -1479,7 +1523,7 @@ static hash256 make_config_hash(
         const hash256 & dataset_hash,
         const std::vector<group> & groups) {
     hash_builder hash;
-    hash.update_string("llama.cpp-native-nanoquant-v12-parallel-spd");
+    hash.update_string("llama.cpp-native-nanoquant-v13-experts");
     hash.update(dataset_hash.data(), sizeof(dataset_hash));
     hash.update_pod(effective_nthread);
     hash.update_pod(params->nanoquant_sequence_length);
@@ -1526,6 +1570,7 @@ static hash256 make_config_hash(
         hash.update_string(item.name);
         hash.update_pod(item.n_in);
         hash.update_pod(item.n_out);
+        hash.update_pod(item.n_expert);
         hash.update_pod(item.rank);
     }
     return hash.value;
@@ -1551,6 +1596,7 @@ static void write_manifest(
             write_string(output, item.name);
             write_pod(output, item.n_in);
             write_pod(output, item.n_out);
+            write_pod(output, item.n_expert);
             write_pod(output, item.rank);
         }
     });
@@ -1599,8 +1645,10 @@ static void validate_manifest(
         const std::string name = read_string(input);
         const int64_t n_in = read_pod<int64_t>(input);
         const int64_t n_out = read_pod<int64_t>(input);
+        const int64_t n_expert = read_pod<int64_t>(input);
         const int64_t rank = read_pod<int64_t>(input);
-        if (name != item.name || n_in != item.n_in || n_out != item.n_out || rank != item.rank) {
+        if (name != item.name || n_in != item.n_in || n_out != item.n_out ||
+            n_expert != item.n_expert || rank != item.rank) {
             throw std::runtime_error(format("NanoQuant: checkpoint group mismatch at '%s'", item.name.c_str()));
         }
     }
@@ -1634,7 +1682,8 @@ struct projection_reachability {
     std::vector<bool> & reachable;
 
     bool collect(ggml_tensor * tensor, bool ask) {
-        if (!ask || tensor == nullptr || tensor->op != GGML_OP_MUL_MAT ||
+        if (!ask || tensor == nullptr ||
+            (tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_MUL_MAT_ID) ||
             tensor->src[0] == nullptr) {
             return false;
         }
@@ -1653,9 +1702,12 @@ static bool projection_reachability_callback(ggml_tensor * tensor, bool ask, voi
 struct calibration_collector {
     std::mutex mutex;
     const group * target = nullptr;
+    int64_t expert = 0;
     int64_t expected_rows = 0;
     int64_t observed_rows = 0;
+    size_t capacity = 0;
     size_t selection_cursor = 0;
+    uint64_t reservoir_seed = 0;
     bool captured_evaluation = false;
     bool repeated_use = false;
     std::vector<int64_t> selected_rows;
@@ -1665,35 +1717,58 @@ struct calibration_collector {
     std::vector<double> output_squares;
     double input_clip = 0.0;
     std::vector<float> output_row_norms;
-    std::vector<uint8_t> input_staging;
-    std::vector<uint8_t> output_staging;
     std::string error;
 
-    void reset(const group & item, int64_t total_rows, size_t memory_budget) {
+    bool routed() const {
+        return target != nullptr && target->n_expert > 1;
+    }
+
+    static uint64_t mix64(uint64_t value) {
+        value += UINT64_C(0x9e3779b97f4a7c15);
+        value = (value ^ (value >> 30))*UINT64_C(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27))*UINT64_C(0x94d049bb133111eb);
+        return value ^ (value >> 31);
+    }
+
+    void reset(
+            const group & item,
+            int64_t expert_index,
+            int64_t total_rows,
+            size_t memory_budget) {
         std::lock_guard<std::mutex> lock(mutex);
         target = &item;
-        expected_rows = total_rows;
+        expert = expert_index;
+        expected_rows = item.n_expert > 1 ? -1 : total_rows;
         observed_rows = 0;
         selection_cursor = 0;
         captured_evaluation = false;
         repeated_use = false;
         input_clip = 0.0;
         error.clear();
-        const size_t bytes_per_row = sizeof(float) * size_t(item.n_in + item.n_out);
-        const int64_t capacity = std::max<int64_t>(1, std::min<int64_t>(
-                total_rows, int64_t(memory_budget / std::max<size_t>(bytes_per_row, 1))));
-        selected_rows.resize(capacity);
-        for (int64_t i = 0; i < capacity; ++i) {
-            selected_rows[i] = ((2 * i + 1) * total_rows) / (2 * capacity);
+        const size_t bytes_per_row = sizeof(float)*size_t(item.n_in + item.n_out);
+        capacity = size_t(std::max<int64_t>(1, std::min<int64_t>(
+                total_rows, int64_t(memory_budget/std::max<size_t>(bytes_per_row, 1)))));
+        selected_rows.clear();
+        if (!routed()) {
+            selected_rows.resize(capacity);
+            for (size_t i = 0; i < capacity; ++i) {
+                selected_rows[i] = ((2*int64_t(i) + 1)*total_rows)/(2*int64_t(capacity));
+            }
+        }
+        reservoir_seed = UINT64_C(1469598103934665603) ^ uint64_t(expert);
+        for (unsigned char value : item.name) {
+            reservoir_seed = (reservoir_seed ^ value)*UINT64_C(1099511628211);
         }
         inputs.clear();
         outputs.clear();
-        inputs.reserve(size_t(capacity) * size_t(item.n_in));
-        outputs.reserve(size_t(capacity) * size_t(item.n_out));
+        inputs.reserve(capacity*size_t(item.n_in));
+        outputs.reserve(capacity*size_t(item.n_out));
         input_squares.assign(item.n_in, 0.0);
         output_squares.assign(item.n_out, 0.0);
         output_row_norms.clear();
-        output_row_norms.reserve(total_rows);
+        if (!routed()) {
+            output_row_norms.reserve(total_rows);
+        }
     }
 
     void begin_evaluation() {
@@ -1701,20 +1776,12 @@ struct calibration_collector {
         captured_evaluation = false;
     }
 
-    void disable() {
-        std::lock_guard<std::mutex> lock(mutex);
-        target = nullptr;
-        inputs.clear();
-        outputs.clear();
-        input_staging.clear();
-        output_staging.clear();
-    }
-
     bool matches(const ggml_tensor * tensor) const {
         if (target == nullptr || tensor == nullptr || tensor->src[0] == nullptr) {
             return false;
         }
-        return tensor->op == GGML_OP_MUL_MAT &&
+        const ggml_op expected_op = routed() ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT;
+        return tensor->op == expected_op &&
                graph_weight_name(tensor->src[0]->name) == target->name;
     }
 
@@ -1729,14 +1796,11 @@ struct calibration_collector {
         return staging.data();
     }
 
-    bool collect(ggml_tensor * tensor, bool ask) {
-        if (!matches(tensor)) {
-            return false;
-        }
-        if (ask) {
-            return true;
-        }
-
+    bool collect_data(
+            ggml_tensor * tensor,
+            const uint8_t * input_data,
+            const uint8_t * output_data,
+            const uint8_t * ids_data) {
         std::lock_guard<std::mutex> lock(mutex);
         if (captured_evaluation) {
             repeated_use = true;
@@ -1749,36 +1813,78 @@ struct calibration_collector {
             return false;
         }
         if (src->ne[0] != target->n_in || tensor->ne[0] != target->n_out ||
-            src->ne[1] != tensor->ne[1] || src->ne[2] != tensor->ne[2] || src->ne[3] != tensor->ne[3]) {
+            src->nb[0] != sizeof(float) || tensor->nb[0] != sizeof(float)) {
             error = format("projection shape mismatch for '%s'", target->name.c_str());
             return false;
         }
-        if (src->nb[0] != sizeof(float) || tensor->nb[0] != sizeof(float)) {
-            error = format("non-contiguous projection rows for '%s'", target->name.c_str());
-            return false;
+
+        std::vector<const float *> x_rows;
+        std::vector<const float *> y_rows;
+        if (!routed()) {
+            if (src->ne[1] != tensor->ne[1] || src->ne[2] != tensor->ne[2] ||
+                src->ne[3] != tensor->ne[3]) {
+                error = format("projection shape mismatch for '%s'", target->name.c_str());
+                return false;
+            }
+            const int64_t n_rows = src->ne[1]*src->ne[2]*src->ne[3];
+            x_rows.reserve(n_rows);
+            y_rows.reserve(n_rows);
+            for (int64_t row = 0; row < n_rows; ++row) {
+                const int64_t i1 = row % src->ne[1];
+                const int64_t i2 = (row/src->ne[1]) % src->ne[2];
+                const int64_t i3 = row/(src->ne[1]*src->ne[2]);
+                x_rows.push_back(reinterpret_cast<const float *>(
+                        input_data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]));
+                y_rows.push_back(reinterpret_cast<const float *>(
+                        output_data + i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3]));
+            }
+        } else {
+            const ggml_tensor * ids = tensor->src[2];
+            if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids_data == nullptr ||
+                ids->ne[0] != tensor->ne[1] || ids->ne[1] != tensor->ne[2] ||
+                ids->ne[2] != 1 || ids->ne[3] != 1 ||
+                src->ne[2] != ids->ne[1] || ids->ne[0] % src->ne[1] != 0) {
+                error = format("routed projection shape mismatch for '%s'", target->name.c_str());
+                return false;
+            }
+            x_rows.reserve(ids->ne[1]);
+            y_rows.reserve(ids->ne[1]);
+            for (int64_t token = 0; token < ids->ne[1]; ++token) {
+                for (int64_t slot = 0; slot < ids->ne[0]; ++slot) {
+                    const int32_t selected = *reinterpret_cast<const int32_t *>(
+                            ids_data + slot*ids->nb[0] + token*ids->nb[1]);
+                    if (selected < 0 || selected >= target->n_expert) {
+                        error = format("projection '%s' selected invalid expert %d",
+                                target->name.c_str(), selected);
+                        return false;
+                    }
+                    if (selected != expert) {
+                        continue;
+                    }
+                    x_rows.push_back(reinterpret_cast<const float *>(
+                            input_data + (slot % src->ne[1])*src->nb[1] + token*src->nb[2]));
+                    y_rows.push_back(reinterpret_cast<const float *>(
+                            output_data + slot*tensor->nb[1] + token*tensor->nb[2]));
+                }
+            }
+        }
+        if (x_rows.empty()) {
+            return true;
         }
 
-        const uint8_t * input_data = tensor_bytes(src, input_staging);
-        const uint8_t * output_data = tensor_bytes(tensor, output_staging);
-        const int64_t n_rows = src->ne[1] * src->ne[2] * src->ne[3];
-        std::vector<double> input_norms(size_t(n_rows), 0.0);
-        for (int64_t row = 0; row < n_rows; ++row) {
-            const int64_t i1 = row % src->ne[1];
-            const int64_t i2 = (row / src->ne[1]) % src->ne[2];
-            const int64_t i3 = row / (src->ne[1] * src->ne[2]);
-            const float * x = reinterpret_cast<const float *>(
-                    input_data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
-            const float * y = reinterpret_cast<const float *>(
-                    output_data + i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3]);
-            double norm_sq = 0.0;
+        std::vector<double> input_norms(x_rows.size(), 0.0);
+        for (size_t row = 0; row < x_rows.size(); ++row) {
+            const float * x = x_rows[row];
+            const float * y = y_rows[row];
+            double input_norm_sq = 0.0;
             for (int64_t j = 0; j < target->n_in; ++j) {
                 if (!std::isfinite(x[j])) {
                     error = format("non-finite calibration input for '%s'", target->name.c_str());
                     return false;
                 }
-                norm_sq += double(x[j])*double(x[j]);
+                input_norm_sq += double(x[j])*double(x[j]);
             }
-            input_norms[size_t(row)] = std::sqrt(norm_sq);
+            input_norms[row] = std::sqrt(input_norm_sq);
             double output_norm_sq = 0.0;
             for (int64_t j = 0; j < target->n_out; ++j) {
                 if (!std::isfinite(y[j])) {
@@ -1791,13 +1897,13 @@ struct calibration_collector {
             }
             output_row_norms.push_back(float(std::sqrt(output_norm_sq)));
         }
+
         std::vector<double> sorted_input_norms = input_norms;
         const size_t kth_largest = std::max<size_t>(
-                1, size_t(double(n_rows)*(1.0 - 0.999)));
+                1, size_t(double(sorted_input_norms.size())*(1.0 - 0.999)));
         const auto clip_it =
-                sorted_input_norms.begin() + size_t(n_rows) - kth_largest;
-        std::nth_element(
-                sorted_input_norms.begin(), clip_it, sorted_input_norms.end());
+                sorted_input_norms.begin() + sorted_input_norms.size() - kth_largest;
+        std::nth_element(sorted_input_norms.begin(), clip_it, sorted_input_norms.end());
         const double batch_clip = *clip_it;
         if (input_clip == 0.0) {
             input_clip = batch_clip;
@@ -1808,33 +1914,48 @@ struct calibration_collector {
             }
             input_clip = batch_clip;
         }
-        for (int64_t row = 0; row < n_rows; ++row) {
-            if (observed_rows >= expected_rows) {
+
+        for (size_t row = 0; row < x_rows.size(); ++row) {
+            if (expected_rows >= 0 && observed_rows >= expected_rows) {
                 error = format("projection '%s' was evaluated more than once per calibration token", target->name.c_str());
                 return false;
             }
-            const int64_t i1 = row % src->ne[1];
-            const int64_t i2 = (row / src->ne[1]) % src->ne[2];
-            const int64_t i3 = row / (src->ne[1] * src->ne[2]);
-            const float * x = reinterpret_cast<const float *>(
-                    input_data + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3]);
-            const float * y = reinterpret_cast<const float *>(
-                    output_data + i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
-
+            const float * x = x_rows[row];
+            const float * y = y_rows[row];
             const double input_scale =
-                    input_norms[size_t(row)] > input_clip &&
-                    input_norms[size_t(row)] > 0.0 ?
-                    input_clip/input_norms[size_t(row)] : 1.0;
+                    input_norms[row] > input_clip && input_norms[row] > 0.0 ?
+                    input_clip/input_norms[row] : 1.0;
             for (int64_t j = 0; j < target->n_in; ++j) {
                 const double value = double(x[j])*input_scale;
                 input_squares[j] += value*value;
             }
 
-            if (selection_cursor < selected_rows.size() &&
-                observed_rows == selected_rows[selection_cursor]) {
-                inputs.insert(inputs.end(), x, x + target->n_in);
-                outputs.insert(outputs.end(), y, y + target->n_out);
-                ++selection_cursor;
+            size_t selected = capacity;
+            if (!routed()) {
+                if (selection_cursor < selected_rows.size() &&
+                    observed_rows == selected_rows[selection_cursor]) {
+                    selected = selection_cursor++;
+                }
+            } else if (size_t(observed_rows) < capacity) {
+                selected = size_t(observed_rows);
+            } else {
+                const size_t candidate =
+                        size_t(mix64(reservoir_seed ^ uint64_t(observed_rows)) %
+                               uint64_t(observed_rows + 1));
+                if (candidate < capacity) {
+                    selected = candidate;
+                }
+            }
+            if (selected < capacity) {
+                if (selected*size_t(target->n_in) == inputs.size()) {
+                    inputs.insert(inputs.end(), x, x + target->n_in);
+                    outputs.insert(outputs.end(), y, y + target->n_out);
+                } else {
+                    std::copy_n(x, target->n_in,
+                            inputs.begin() + selected*size_t(target->n_in));
+                    std::copy_n(y, target->n_out,
+                            outputs.begin() + selected*size_t(target->n_out));
+                }
             }
             ++observed_rows;
         }
@@ -1846,18 +1967,31 @@ struct calibration_collector {
         if (!error.empty()) {
             throw std::runtime_error("NanoQuant: " + error);
         }
-        if (observed_rows != expected_rows) {
+        if (observed_rows == 0) {
+            throw std::runtime_error(format(
+                    "NanoQuant: projection '%s' expert %" PRId64
+                    " received no calibration rows; increase --nanoquant-sample-count",
+                    target->name.c_str(), expert));
+        }
+        if (expected_rows >= 0 && observed_rows != expected_rows) {
             throw std::runtime_error(format(
                     "NanoQuant: projection '%s' produced %" PRId64 " rows, expected %" PRId64,
                     target->name.c_str(), observed_rows, expected_rows));
         }
-        if (selection_cursor != selected_rows.size()) {
-            throw std::runtime_error(format("NanoQuant: incomplete deterministic projection sample for '%s'",
+        if (!routed() && selection_cursor != selected_rows.size()) {
+            throw std::runtime_error(format(
+                    "NanoQuant: incomplete deterministic projection sample for '%s'",
                     target->name.c_str()));
         }
 
         calibration_data result;
-        result.rows = selected_rows.size();
+        result.rows = int64_t(inputs.size()/size_t(target->n_in));
+        if (result.rows <= 0 ||
+            inputs.size() != size_t(result.rows)*size_t(target->n_in) ||
+            outputs.size() != size_t(result.rows)*size_t(target->n_out)) {
+            throw std::runtime_error(format(
+                    "NanoQuant: invalid routed calibration sample for '%s'", target->name.c_str()));
+        }
         result.repeated_use = repeated_use;
         result.inputs = std::move(inputs);
         result.teacher_outputs = std::move(outputs);
@@ -1865,16 +1999,17 @@ struct calibration_collector {
         result.input_norm.resize(target->n_in);
         result.output_norm.resize(target->n_out);
         for (int64_t i = 0; i < target->n_in; ++i) {
-            result.input_norm[i] = float(input_squares[i] / double(expected_rows));
+            result.input_norm[i] = float(input_squares[i]/double(observed_rows));
         }
         for (int64_t i = 0; i < target->n_out; ++i) {
-            result.output_norm[i] = float(output_squares[i] / double(expected_rows));
+            result.output_norm[i] = float(output_squares[i]/double(observed_rows));
         }
         auto shrink = [](std::vector<float> & values) {
-            const double mean = std::accumulate(values.begin(), values.end(), 0.0) / double(values.size());
+            const double mean = std::accumulate(values.begin(), values.end(), 0.0)/double(values.size());
             for (float & value : values) {
                 value = std::max(NUMERIC_EPSILON,
-                        (1.0f - CALIBRATION_SHRINKAGE) * value + CALIBRATION_SHRINKAGE * float(mean));
+                        (1.0f - CALIBRATION_SHRINKAGE)*value +
+                        CALIBRATION_SHRINKAGE*float(mean));
             }
         };
         shrink(result.input_norm);
@@ -1882,25 +2017,24 @@ struct calibration_collector {
 
         const double position = 0.999*double(output_row_norms.size() - 1);
         const size_t lower = size_t(position);
-        const size_t upper =
-                std::min(lower + 1, output_row_norms.size() - 1);
+        const size_t upper = std::min(lower + 1, output_row_norms.size() - 1);
         auto lower_it = output_row_norms.begin() + lower;
-        std::nth_element(
-                output_row_norms.begin(), lower_it, output_row_norms.end());
+        std::nth_element(output_row_norms.begin(), lower_it, output_row_norms.end());
         const float lower_value = *lower_it;
         const float upper_value = upper == lower ? lower_value :
                 *std::min_element(lower_it + 1, output_row_norms.end());
         const float tau = lower_value +
                 float(position - double(lower))*(upper_value - lower_value);
         for (int64_t row = 0; row < result.rows; ++row) {
-            float * y = result.nonfactor_outputs.data() + size_t(row) * size_t(target->n_out);
+            float * y = result.nonfactor_outputs.data() +
+                    size_t(row)*size_t(target->n_out);
             double norm_sq = 0.0;
             for (int64_t j = 0; j < target->n_out; ++j) {
-                norm_sq += double(y[j]) * double(y[j]);
+                norm_sq += double(y[j])*double(y[j]);
             }
             const float norm = float(std::sqrt(norm_sq));
             if (norm > tau && norm > 0.0f) {
-                const float scale = tau / norm;
+                const float scale = tau/norm;
                 for (int64_t j = 0; j < target->n_out; ++j) {
                     y[j] *= scale;
                 }
@@ -1911,15 +2045,37 @@ struct calibration_collector {
 };
 
 struct calibration_collector_set {
+    std::mutex mutex;
     std::vector<calibration_collector *> active;
+    std::vector<uint8_t> input_staging;
+    std::vector<uint8_t> output_staging;
+    std::vector<uint8_t> ids_staging;
 
     bool collect(ggml_tensor * tensor, bool ask) {
+        std::vector<calibration_collector *> matches;
         for (calibration_collector * collector : active) {
             if (collector->matches(tensor)) {
-                return collector->collect(tensor, ask);
+                matches.push_back(collector);
             }
         }
-        return false;
+        if (matches.empty()) {
+            return false;
+        }
+        if (ask) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint8_t * input_data =
+                calibration_collector::tensor_bytes(tensor->src[1], input_staging);
+        const uint8_t * output_data =
+                calibration_collector::tensor_bytes(tensor, output_staging);
+        const uint8_t * ids_data = tensor->op == GGML_OP_MUL_MAT_ID ?
+                calibration_collector::tensor_bytes(tensor->src[2], ids_staging) : nullptr;
+        for (calibration_collector * collector : matches) {
+            collector->collect_data(tensor, input_data, output_data, ids_data);
+        }
+        return true;
     }
 };
 
@@ -2195,7 +2351,7 @@ static std::vector<std::vector<float>> collect_output_importance(
             const group & item = groups[target_indices[cursor]];
             const size_t item_bytes =
                     size_t(params->nanoquant_sequence_length) *
-                    size_t(item.n_out) * sizeof(float);
+                    size_t(item.n_out) * size_t(item.n_expert_used) * sizeof(float);
             if (cursor != batch_begin &&
                 gradient_bytes + item_bytes > gradient_memory_budget) {
                 break;
@@ -2251,7 +2407,7 @@ static std::vector<std::vector<float>> collect_output_importance(
     return result;
 }
 
-static std::vector<calibration_data> collect_projections(
+static std::vector<std::vector<calibration_data>> collect_projections(
         llama_context * context,
         calibration_collector_set & collector_set,
         const std::vector<group> & groups,
@@ -2266,17 +2422,17 @@ static std::vector<calibration_data> collect_projections(
     const int32_t sequence_length = params->nanoquant_sequence_length;
     const int64_t expected_rows =
             int64_t(params->nanoquant_sample_count)*int64_t(sequence_length);
-    std::vector<std::unique_ptr<calibration_collector>> collectors(
+    std::vector<std::vector<std::unique_ptr<calibration_collector>>> collectors(
             block_end - block_begin);
     collector_set.active.clear();
-    collector_set.active.reserve(block_end - block_begin);
     size_t active_count = 0;
     for (size_t index = block_begin; index < block_end; ++index) {
         if (states[index].stage < checkpoint_stage::GROUP_DONE &&
             reachable[index]) {
-            ++active_count;
+            active_count += size_t(groups[index].n_expert - states[index].expert);
         }
     }
+    collector_set.active.reserve(active_count);
     const size_t collector_budget =
             PROJECTION_MEMORY_BUDGET/std::max<size_t>(active_count, 1);
     for (size_t index = block_begin; index < block_end; ++index) {
@@ -2284,11 +2440,17 @@ static std::vector<calibration_data> collect_projections(
             !reachable[index]) {
             continue;
         }
-        std::unique_ptr<calibration_collector> & collector =
+        std::vector<std::unique_ptr<calibration_collector>> & group_collectors =
                 collectors[index - block_begin];
-        collector = std::make_unique<calibration_collector>();
-        collector->reset(groups[index], expected_rows, collector_budget);
-        collector_set.active.push_back(collector.get());
+        group_collectors.resize(groups[index].n_expert);
+        for (int64_t expert = states[index].expert;
+             expert < groups[index].n_expert;
+             ++expert) {
+            group_collectors[expert] = std::make_unique<calibration_collector>();
+            group_collectors[expert]->reset(
+                    groups[index], expert, expected_rows, collector_budget);
+            collector_set.active.push_back(group_collectors[expert].get());
+        }
     }
 
     for (int32_t sample = 0; sample < params->nanoquant_sample_count; ++sample) {
@@ -2314,25 +2476,28 @@ static std::vector<calibration_data> collect_projections(
     }
 
     collector_set.active.clear();
-    std::vector<calibration_data> results(collectors.size());
+    std::vector<std::vector<calibration_data>> results(collectors.size());
     for (size_t index = 0; index < collectors.size(); ++index) {
-        if (!collectors[index]) {
-            continue;
+        results[index].resize(collectors[index].size());
+        for (size_t expert = 0; expert < collectors[index].size(); ++expert) {
+            if (!collectors[index][expert]) {
+                continue;
+            }
+            calibration_data result = collectors[index][expert]->finish();
+            result.output_norm = output_importance[block_begin + index];
+            if (result.output_norm.empty()) {
+                throw std::runtime_error("NanoQuant: output-gradient calibration is incomplete");
+            }
+            const double mean = std::accumulate(
+                    result.output_norm.begin(), result.output_norm.end(), 0.0)/
+                    double(result.output_norm.size());
+            for (float & value : result.output_norm) {
+                value = std::max(NUMERIC_EPSILON,
+                        (1.0f - CALIBRATION_SHRINKAGE)*value +
+                        CALIBRATION_SHRINKAGE*float(mean));
+            }
+            results[index][expert] = std::move(result);
         }
-        calibration_data result = collectors[index]->finish();
-        result.output_norm = output_importance[block_begin + index];
-        if (result.output_norm.empty()) {
-            throw std::runtime_error("NanoQuant: output-gradient calibration is incomplete");
-        }
-        const double mean = std::accumulate(
-                result.output_norm.begin(), result.output_norm.end(), 0.0)/
-                double(result.output_norm.size());
-        for (float & value : result.output_norm) {
-            value = std::max(NUMERIC_EPSILON,
-                    (1.0f - CALIBRATION_SHRINKAGE)*value +
-                    CALIBRATION_SHRINKAGE*float(mean));
-        }
-        results[index] = std::move(result);
     }
     return results;
 }
@@ -3660,12 +3825,13 @@ static void run_factor_reconstruction(
             (params->nanoquant_seed ^ uint64_t(item.block + 1) * UINT64_C(0x2545f4914f6cdd1d)));
     if (skip_factor_tuning) {
         LLAMA_LOG_INFO(
-                "NanoQuant: block %d %s is shared; keeping ADMM factors without factor tuning\n",
-                item.block, item.name.c_str());
+                "NanoQuant: block %d %s expert %u/%" PRId64
+                " keeps ADMM factors without factor tuning\n",
+                item.block, item.name.c_str(), state.expert + 1, item.n_expert);
         harden_latent(state.u);
         harden_latent(state.v);
         pack_factors(item, state);
-        state.stage = checkpoint_stage::GROUP_DONE;
+        state.stage = checkpoint_stage::EXPERT_DONE;
         state.progress = 0;
         release_completed_state(state);
         save_checkpoint(
@@ -3774,11 +3940,46 @@ static void run_factor_reconstruction(
     harden_latent(state.u);
     harden_latent(state.v);
     pack_factors(item, state);
-    state.stage = checkpoint_stage::GROUP_DONE;
+
+    state.stage = checkpoint_stage::EXPERT_DONE;
     state.progress = 0;
     state.rng_state = rng.state;
     release_completed_state(state);
     save_checkpoint(checkpoint_directory, source_hash, config_hash, item, state);
+}
+
+static void complete_expert(const group & item, checkpoint_state & state) {
+    if (state.stage != checkpoint_stage::EXPERT_DONE ||
+        state.expert >= uint32_t(item.n_expert)) {
+        throw std::runtime_error(format(
+                "NanoQuant: invalid completed expert state for '%s'", item.name.c_str()));
+    }
+    state.completed_scale_pre.insert(
+            state.completed_scale_pre.end(), state.scale_pre.begin(), state.scale_pre.end());
+    state.completed_scale_post.insert(
+            state.completed_scale_post.end(), state.scale_post.begin(), state.scale_post.end());
+    state.completed_packed_u.insert(
+            state.completed_packed_u.end(), state.packed_u.begin(), state.packed_u.end());
+    state.completed_packed_v.insert(
+            state.completed_packed_v.end(), state.packed_v.begin(), state.packed_v.end());
+    ++state.expert;
+
+    release_completed_state(state);
+    release_vector(state.scale_pre);
+    release_vector(state.scale_post);
+    release_attached_state(state);
+    state.progress = 0;
+    state.optimizer_step = 0;
+    if (state.expert < uint32_t(item.n_expert)) {
+        state.stage = checkpoint_stage::NONE;
+        return;
+    }
+
+    state.scale_pre = std::move(state.completed_scale_pre);
+    state.scale_post = std::move(state.completed_scale_post);
+    state.packed_u = std::move(state.completed_packed_u);
+    state.packed_v = std::move(state.completed_packed_v);
+    state.stage = checkpoint_stage::GROUP_DONE;
 }
 
 
@@ -3798,14 +3999,18 @@ static void set_student_scales(
     if (nanoquant_weight->scale_pre->type != GGML_TYPE_F16 ||
         nanoquant_weight->scale_post->type != GGML_TYPE_F16 ||
         nanoquant_weight->scale_pre->ne[0] != item.n_in ||
-        nanoquant_weight->scale_post->ne[0] != item.n_out) {
+        nanoquant_weight->scale_post->ne[0] != item.n_out ||
+        nanoquant_weight->scale_pre->ne[1] != item.n_expert ||
+        nanoquant_weight->scale_post->ne[1] != item.n_expert) {
         throw std::runtime_error(format(
                 "NanoQuant: student model scale contract mismatch for '%s'", item.name.c_str()));
     }
-    std::vector<ggml_fp16_t> scale_pre(item.n_in);
-    std::vector<ggml_fp16_t> scale_post(item.n_out);
-    ggml_fp32_to_fp16_row(state.scale_pre.data(), scale_pre.data(), item.n_in);
-    ggml_fp32_to_fp16_row(state.scale_post.data(), scale_post.data(), item.n_out);
+    const size_t n_scale_pre = size_t(item.n_in)*size_t(item.n_expert);
+    const size_t n_scale_post = size_t(item.n_out)*size_t(item.n_expert);
+    std::vector<ggml_fp16_t> scale_pre(n_scale_pre);
+    std::vector<ggml_fp16_t> scale_post(n_scale_post);
+    ggml_fp32_to_fp16_row(state.scale_pre.data(), scale_pre.data(), n_scale_pre);
+    ggml_fp32_to_fp16_row(state.scale_post.data(), scale_post.data(), n_scale_post);
     ggml_backend_tensor_set(
             nanoquant_weight->scale_pre, scale_pre.data(), 0, scale_pre.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(
@@ -4018,17 +4223,21 @@ static bool load_model_checkpoint(
         states[i].scale_pre_second_moment = read_vector<float>(input);
         states[i].scale_post_first_moment = read_vector<float>(input);
         states[i].scale_post_second_moment = read_vector<float>(input);
-        if (states[i].scale_pre.size() != size_t(groups[i].n_in) ||
-            states[i].scale_post.size() != size_t(groups[i].n_out)) {
+        const size_t n_scale_pre =
+                size_t(groups[i].n_in)*size_t(groups[i].n_expert);
+        const size_t n_scale_post =
+                size_t(groups[i].n_out)*size_t(groups[i].n_expert);
+        if (states[i].scale_pre.size() != n_scale_pre ||
+            states[i].scale_post.size() != n_scale_post) {
             throw std::runtime_error(format(
                     "NanoQuant: model-tuning scale shape mismatch for '%s'",
                     groups[i].name.c_str()));
         }
         if (progress > 0 && reachable[i] &&
-            (states[i].scale_pre_first_moment.size() != size_t(groups[i].n_in) ||
-             states[i].scale_pre_second_moment.size() != size_t(groups[i].n_in) ||
-             states[i].scale_post_first_moment.size() != size_t(groups[i].n_out) ||
-             states[i].scale_post_second_moment.size() != size_t(groups[i].n_out))) {
+            (states[i].scale_pre_first_moment.size() != n_scale_pre ||
+             states[i].scale_pre_second_moment.size() != n_scale_pre ||
+             states[i].scale_post_first_moment.size() != n_scale_post ||
+             states[i].scale_post_second_moment.size() != n_scale_post)) {
             throw std::runtime_error(format(
                     "NanoQuant: model-tuning moment shape mismatch for '%s'",
                     groups[i].name.c_str()));
@@ -4267,10 +4476,10 @@ static void run_model_scale_kl(
         }
 
         auto storage = std::make_unique<training_tensor_storage>(2);
-        scale_pre_tensors[i] = storage->new_1d(
-                groups[i].n_in, "nanoquant_model_scale_pre");
-        scale_post_tensors[i] = storage->new_1d(
-                groups[i].n_out, "nanoquant_model_scale_post");
+        scale_pre_tensors[i] = storage->new_2d(
+                groups[i].n_in, groups[i].n_expert, "nanoquant_model_scale_pre");
+        scale_post_tensors[i] = storage->new_2d(
+                groups[i].n_out, groups[i].n_expert, "nanoquant_model_scale_post");
         storage->allocate(training_buft(override.scale_pre));
         set_training_tensor(scale_pre_tensors[i], states[i].scale_pre);
         set_training_tensor(scale_post_tensors[i], states[i].scale_post);
@@ -4435,7 +4644,7 @@ static void validate_options(const llama_model_quantize_params * params) {
     }
 }
 
-static bool is_dense_projection(const std::string & name) {
+static bool is_supported_projection(const std::string & name, int n_dims) {
     static constexpr const char * suffix = ".weight";
     const size_t suffix_size = std::strlen(suffix);
     if (name.size() <= suffix_size ||
@@ -4443,13 +4652,19 @@ static bool is_dense_projection(const std::string & name) {
         return false;
     }
     llm_tensor_info info;
-    return llm_tensor_info_for_name(name.substr(0, name.size() - suffix_size), info) &&
-           info.op == GGML_OP_MUL_MAT;
+    if (!llm_tensor_info_for_name(name.substr(0, name.size() - suffix_size), info)) {
+        return false;
+    }
+    return (n_dims == 2 && info.op == GGML_OP_MUL_MAT) ||
+           (n_dims == 3 && info.op == GGML_OP_MUL_MAT_ID);
 }
 
 static std::vector<group> find_groups(
         llama_model_loader & loader,
         bool allow_requantize) {
+    uint32_t model_n_expert_used = 1;
+    loader.get_key(LLM_KV_EXPERT_USED_COUNT, model_n_expert_used, false);
+    model_n_expert_used = std::max<uint32_t>(model_n_expert_used, 1);
     std::unordered_set<std::string> source_names;
     source_names.reserve(loader.weights_map.size());
     for (const auto & entry : loader.weights_map) {
@@ -4461,9 +4676,10 @@ static std::vector<group> find_groups(
         ggml_tensor * tensor = entry.second.tensor;
         const std::string name = ggml_get_name(tensor);
         const int block = decoder_block(name);
-        if (ggml_n_dims(tensor) != 2 ||
+        const int n_dims = ggml_n_dims(tensor);
+        if ((n_dims != 2 && n_dims != 3) ||
             block < 0 ||
-            !is_dense_projection(name)) {
+            !is_supported_projection(name, n_dims)) {
             continue;
         }
         if (ggml_is_quantized(tensor->type) && !allow_requantize) {
@@ -4486,6 +4702,8 @@ static std::vector<group> find_groups(
         item.block = block;
         item.n_in = tensor->ne[0];
         item.n_out = tensor->ne[1];
+        item.n_expert = n_dims == 3 ? tensor->ne[2] : 1;
+        item.n_expert_used = n_dims == 3 ? model_n_expert_used : 1;
         item.rank = 1;
         const std::string names[] = {
             item.name_v, item.name_u, item.name_scale_pre, item.name_scale_post,
@@ -4500,7 +4718,7 @@ static std::vector<group> find_groups(
     }
     if (groups.empty()) {
         throw std::runtime_error(format(
-                "NanoQuant: architecture '%s' has no eligible dense 2D decoder projections",
+                "NanoQuant: architecture '%s' has no eligible decoder projections",
                 loader.get_arch_name().c_str()));
     }
     std::sort(groups.begin(), groups.end(), [](const group & left, const group & right) {
@@ -4574,26 +4792,32 @@ static void apply_kv_overrides(
 static std::vector<float> load_weight(
         const llama_model * model,
         const group & item,
+        int64_t expert,
         std::vector<no_init<uint8_t>> & read_data,
         std::vector<std::thread> & workers,
         int nthread) {
     const ggml_tensor * tensor = model->get_tensor(item.name.c_str());
     if (tensor == nullptr ||
-        tensor->ne[0] != item.n_in || tensor->ne[1] != item.n_out) {
+        tensor->ne[0] != item.n_in || tensor->ne[1] != item.n_out ||
+        tensor->ne[2] != item.n_expert || tensor->ne[3] != 1 ||
+        expert < 0 || expert >= item.n_expert) {
         throw std::runtime_error(format(
                 "NanoQuant: resident source tensor '%s' is missing or has the wrong shape",
                 item.name.c_str()));
     }
-    const int64_t elements = item.n_in * item.n_out;
+    const int64_t elements = item.n_in*item.n_out;
+    const size_t slice_bytes = ggml_row_size(tensor->type, item.n_in)*size_t(item.n_out);
+    const size_t offset = size_t(expert)*slice_bytes;
     std::vector<float> result(elements);
     if (tensor->type == GGML_TYPE_F32) {
+        GGML_ASSERT(slice_bytes == result.size()*sizeof(float));
         ggml_backend_tensor_get(
-                tensor, result.data(), 0, result.size()*sizeof(float));
+                tensor, result.data(), offset, result.size()*sizeof(float));
     } else {
-        read_data.resize(ggml_nbytes(tensor));
-        ggml_backend_tensor_get(
-                tensor, read_data.data(), 0, read_data.size());
+        read_data.resize(slice_bytes);
+        ggml_backend_tensor_get(tensor, read_data.data(), offset, read_data.size());
         ggml_tensor staging = *tensor;
+        staging.ne[2] = 1;
         staging.buffer = nullptr;
         staging.data = read_data.data();
         llama_tensor_dequantize_to_f32(
@@ -4602,8 +4826,9 @@ static std::vector<float> load_weight(
     for (float value : result) {
         if (!std::isfinite(value)) {
             throw std::runtime_error(format(
-                    "NanoQuant: source tensor '%s' contains a non-finite value",
-                    item.name.c_str()));
+                    "NanoQuant: source tensor '%s' expert %" PRId64
+                    " contains a non-finite value",
+                    item.name.c_str(), expert));
         }
     }
     return result;
@@ -4847,14 +5072,16 @@ static gguf_context_ptr make_output_metadata(
             continue;
         }
         const group & item = groups[found->second];
-        ggml_tensor * v = ggml_new_tensor_2d(
-                descriptor_context, GGML_TYPE_I32, (item.n_in + 31) / 32, item.rank);
-        ggml_tensor * u = ggml_new_tensor_2d(
-                descriptor_context, GGML_TYPE_I32, (item.rank + 31) / 32, item.n_out);
-        ggml_tensor * scale_pre = ggml_new_tensor_1d(
-                descriptor_context, GGML_TYPE_F16, item.n_in);
-        ggml_tensor * scale_post = ggml_new_tensor_1d(
-                descriptor_context, GGML_TYPE_F16, item.n_out);
+        ggml_tensor * v = ggml_new_tensor_3d(
+                descriptor_context, GGML_TYPE_I32,
+                (item.n_in + 31) / 32, item.rank, item.n_expert);
+        ggml_tensor * u = ggml_new_tensor_3d(
+                descriptor_context, GGML_TYPE_I32,
+                (item.rank + 31) / 32, item.n_out, item.n_expert);
+        ggml_tensor * scale_pre = ggml_new_tensor_2d(
+                descriptor_context, GGML_TYPE_F16, item.n_in, item.n_expert);
+        ggml_tensor * scale_post = ggml_new_tensor_2d(
+                descriptor_context, GGML_TYPE_F16, item.n_out, item.n_expert);
         ggml_set_name(v, item.name_v.c_str());
         ggml_set_name(u, item.name_u.c_str());
         ggml_set_name(scale_pre, item.name_scale_pre.c_str());
@@ -4998,10 +5225,12 @@ static void write_grouped_gguf(
                     "NanoQuant: refusing partial output; '%s' has stage %u, required %u",
                     item.name.c_str(), uint32_t(state.stage), uint32_t(required_stage)));
         }
-        std::vector<ggml_fp16_t> scale_pre(item.n_in);
-        std::vector<ggml_fp16_t> scale_post(item.n_out);
-        ggml_fp32_to_fp16_row(state.scale_pre.data(), scale_pre.data(), item.n_in);
-        ggml_fp32_to_fp16_row(state.scale_post.data(), scale_post.data(), item.n_out);
+        const size_t n_scale_pre = size_t(item.n_in)*size_t(item.n_expert);
+        const size_t n_scale_post = size_t(item.n_out)*size_t(item.n_expert);
+        std::vector<ggml_fp16_t> scale_pre(n_scale_pre);
+        std::vector<ggml_fp16_t> scale_post(n_scale_post);
+        ggml_fp32_to_fp16_row(state.scale_pre.data(), scale_pre.data(), n_scale_pre);
+        ggml_fp32_to_fp16_row(state.scale_post.data(), scale_post.data(), n_scale_post);
 
         auto write_sidecar = [&](const std::string & sidecar, const void * data, size_t size) {
             const int64_t tensor_index = gguf_find_tensor(metadata_context, sidecar.c_str());
@@ -5071,7 +5300,11 @@ static void quantize(
         original_payload = checked_size_sum(original_payload, ggml_nbytes(weight->tensor));
     }
     for (const group & item : groups) {
-        const uint64_t elements = uint64_t(item.n_in)*uint64_t(item.n_out);
+        const uint64_t matrix_elements = uint64_t(item.n_in)*uint64_t(item.n_out);
+        if (matrix_elements > std::numeric_limits<uint64_t>::max()/uint64_t(item.n_expert)) {
+            throw std::runtime_error("NanoQuant: projection element count overflow");
+        }
+        const uint64_t elements = matrix_elements*uint64_t(item.n_expert);
         if (elements > std::numeric_limits<uint64_t>::max() - projection_elements) {
             throw std::runtime_error("NanoQuant: projection element count overflow");
         }
@@ -5172,9 +5405,9 @@ static void quantize(
 
     for (const group & item : groups) {
         LLAMA_LOG_INFO(
-                "NanoQuant dry-layout: %-36s [%6" PRId64 ", %6" PRId64 "] rank=%5" PRId64
+                "NanoQuant dry-layout: %-36s [%6" PRId64 ", %6" PRId64 ", %4" PRId64 "] rank=%5" PRId64
                 " payload=%zu bytes physical=%zu bytes\n",
-                item.name.c_str(), item.n_in, item.n_out, item.rank,
+                item.name.c_str(), item.n_in, item.n_out, item.n_expert, item.rank,
                 item.payload_size(), item.physical_size(alignment));
     }
     LLAMA_LOG_INFO(
@@ -5304,6 +5537,11 @@ static void quantize(
                     source_hash, config_hash, item, state)) {
             validate_state_shapes(item, state);
         }
+        if (state.stage == checkpoint_stage::EXPERT_DONE) {
+            complete_expert(item, state);
+            save_checkpoint(checkpoint_directory, source_hash, config_hash, item, state);
+            validate_state_shapes(item, state);
+        }
         if (state.stage >= checkpoint_stage::GROUP_DONE) {
             release_completed_state(state);
             release_attached_state(state);
@@ -5408,7 +5646,7 @@ static void quantize(
             }
         }
         block_training_data training_data;
-        std::vector<calibration_data> calibrations;
+        std::vector<std::vector<calibration_data>> calibrations;
         if (reconstruct_block) {
             training_data = collect_block_training_data(
                     block_context.get(), block_collector,
@@ -5431,66 +5669,97 @@ static void quantize(
         for (size_t index = block_begin; index < block_end; ++index) {
             const group & item = groups[index];
             checkpoint_state & state = model_states[index];
-            if (state.stage >= checkpoint_stage::GROUP_DONE) {
-                continue;
-            }
-            if (state.stage < checkpoint_stage::FACTOR && state.weight.empty()) {
-                state.weight = load_weight(
-                        teacher.get(), item, read_data, workers, nthread);
-                release_vector(read_data);
-            }
-            calibration_data fallback_calibration;
             const bool reachable = projection_reachable[index];
-            const calibration_data * calibration = nullptr;
-            if (reachable) {
-                calibration = &calibrations[index - block_begin];
-                LLAMA_LOG_INFO("NanoQuant: block %d group %s captured %" PRId64 " of %" PRId64 " projection rows\n",
-                        item.block, item.name.c_str(), calibration->rows,
-                        int64_t(params->nanoquant_sample_count)*params->nanoquant_sequence_length);
-            } else {
-                fallback_calibration.input_norm.assign(size_t(item.n_in), 1.0f);
-                fallback_calibration.output_norm.assign(size_t(item.n_out), 1.0f);
-                fallback_calibration.repeated_use = true;
-                calibration = &fallback_calibration;
-                if (state.stage < checkpoint_stage::ADMM) {
+            while (state.stage < checkpoint_stage::GROUP_DONE) {
+                if (state.stage == checkpoint_stage::EXPERT_DONE) {
+                    complete_expert(item, state);
+                    save_checkpoint(
+                            checkpoint_directory, source_hash, config_hash, item, state);
+                    continue;
+                }
+                const uint32_t expert = state.expert;
+                if (state.stage < checkpoint_stage::FACTOR && state.weight.empty()) {
+                    state.weight = load_weight(
+                            teacher.get(), item, expert, read_data, workers, nthread);
+                    release_vector(read_data);
+                }
+
+                calibration_data fallback_calibration;
+                const calibration_data * calibration = nullptr;
+                if (reachable) {
+                    calibration = &calibrations.at(index - block_begin).at(expert);
+                    if (item.n_expert > 1) {
+                        LLAMA_LOG_INFO(
+                                "NanoQuant: block %d group %s expert %u/%" PRId64
+                                " captured %" PRId64 " routed projection rows\n",
+                                item.block, item.name.c_str(), expert + 1,
+                                item.n_expert, calibration->rows);
+                    } else {
+                        LLAMA_LOG_INFO(
+                                "NanoQuant: block %d group %s captured %" PRId64
+                                " of %" PRId64 " projection rows\n",
+                                item.block, item.name.c_str(), calibration->rows,
+                                int64_t(params->nanoquant_sample_count)*
+                                        params->nanoquant_sequence_length);
+                    }
+                } else {
+                    fallback_calibration.input_norm.assign(size_t(item.n_in), 1.0f);
+                    fallback_calibration.output_norm.assign(size_t(item.n_out), 1.0f);
+                    fallback_calibration.repeated_use = true;
+                    calibration = &fallback_calibration;
+                }
+
+                const auto nonfactor_start = std::chrono::steady_clock::now();
+                if (reachable && item.n_expert == 1) {
+                    run_nonfactor_reconstruction(
+                            backend, item, samples, training_data, params, teacher.get(),
+                            block_context.get(), block_collector, state);
+                } else if (state.stage < checkpoint_stage::ADMM) {
                     state.stage = checkpoint_stage::NONFACTOR;
                     state.progress = uint32_t(params->nanoquant_nonfactor_epochs);
                     state.optimizer_step = 0;
                     release_vector(state.weight_first_moment);
                     release_vector(state.weight_second_moment);
+                    if (item.n_expert > 1) {
+                        LLAMA_LOG_INFO(
+                                "NanoQuant: block %d group %s expert %u/%" PRId64
+                                " uses the source expert weight for factorization\n",
+                                item.block, item.name.c_str(), expert + 1, item.n_expert);
+                    } else {
+                        LLAMA_LOG_INFO(
+                                "NanoQuant: block %d group %s is absent from the primary graph; "
+                                "using uniform factorization weights\n",
+                                item.block, item.name.c_str());
+                    }
                 }
+                const auto admm_start = std::chrono::steady_clock::now();
+                run_admm(backend, item, *calibration, params, state);
+                const auto factor_start = std::chrono::steady_clock::now();
+                run_factor_reconstruction(
+                        backend, item, samples, training_data, params,
+                        checkpoint_directory, source_hash, config_hash,
+                        teacher.get(), block_context.get(), block_collector,
+                        item.n_expert > 1 || !reachable || calibration->repeated_use, state);
+                const auto factor_end = std::chrono::steady_clock::now();
+                const auto seconds = [](auto begin, auto end) {
+                    return std::chrono::duration<double>(end - begin).count();
+                };
                 LLAMA_LOG_INFO(
-                        "NanoQuant: block %d group %s is absent from the primary graph; using uniform factorization weights\n",
-                        item.block, item.name.c_str());
-            }
-            const auto nonfactor_start = std::chrono::steady_clock::now();
-            if (reachable) {
-                run_nonfactor_reconstruction(
-                        backend, item, samples, training_data, params, teacher.get(),
-                        block_context.get(), block_collector, state);
-            }
-            const auto admm_start = std::chrono::steady_clock::now();
-            run_admm(backend, item, *calibration, params, state);
-            const auto factor_start = std::chrono::steady_clock::now();
-            run_factor_reconstruction(
-                    backend, item, samples, training_data, params,
-                    checkpoint_directory, source_hash, config_hash,
-                    teacher.get(), block_context.get(),
-                    block_collector, !reachable || calibration->repeated_use, state);
-            const auto factor_end = std::chrono::steady_clock::now();
-            const auto seconds = [](auto begin, auto end) {
-                return std::chrono::duration<double>(end - begin).count();
-            };
-            LLAMA_LOG_INFO(
-                    "NanoQuant profile: %s nonfactor=%.3fs ADMM=%.3fs factor=%.3fs\n",
-                    item.name.c_str(),
-                    seconds(nonfactor_start, admm_start),
-                    seconds(admm_start, factor_start),
-                    seconds(factor_start, factor_end));
-            if (state.stage != checkpoint_stage::GROUP_DONE) {
-                throw std::runtime_error(format(
-                        "NanoQuant: group '%s' did not complete block reconstruction",
-                        item.name.c_str()));
+                        "NanoQuant profile: %s expert %u/%" PRId64
+                        " nonfactor=%.3fs ADMM=%.3fs factor=%.3fs\n",
+                        item.name.c_str(), expert + 1, item.n_expert,
+                        seconds(nonfactor_start, admm_start),
+                        seconds(admm_start, factor_start),
+                        seconds(factor_start, factor_end));
+                if (state.stage != checkpoint_stage::EXPERT_DONE) {
+                    throw std::runtime_error(format(
+                            "NanoQuant: group '%s' expert %u did not complete reconstruction",
+                            item.name.c_str(), expert));
+                }
+                complete_expert(item, state);
+                save_checkpoint(
+                        checkpoint_directory, source_hash, config_hash, item, state);
+                validate_state_shapes(item, state);
             }
             release_attached_state(state);
         }
@@ -5560,14 +5829,28 @@ static void quantize(
                     "NanoQuant: failed to create the reconstructed student context");
         }
 
+        std::vector<bool> scale_tuning_reachable = projection_reachable;
+        size_t fixed_expert_groups = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (groups[i].n_expert > 1 && scale_tuning_reachable[i]) {
+                scale_tuning_reachable[i] = false;
+                ++fixed_expert_groups;
+            }
+        }
+        if (fixed_expert_groups > 0) {
+            LLAMA_LOG_INFO(
+                    "NanoQuant: keeping %zu routed expert scale groups fixed during global KL tuning\n",
+                    fixed_expert_groups);
+        }
         owned_batch kl_batch(params->nanoquant_sequence_length);
         LLAMA_LOG_INFO(
                 "NanoQuant phase 3/3: packed-student full-model KL scale tuning "
                 "(%d tokens/evaluation; source teacher released)\n",
                 params->nanoquant_sample_count * params->nanoquant_sequence_length);
+        GGML_ASSERT(scale_tuning_reachable.size() == groups.size());
         run_model_scale_kl(
                 *teacher_cache, student.get(), student_context.get(),
-                kl_batch, samples, groups, projection_reachable, params,
+                kl_batch, samples, groups, scale_tuning_reachable, params,
                 checkpoint_directory, source_hash, config_hash, model_states);
         const double final_model_kl = full_model_kl(
                 student_context.get(), *teacher_cache, samples, params, kl_batch);

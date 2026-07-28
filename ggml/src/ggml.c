@@ -3388,6 +3388,7 @@ struct ggml_tensor * ggml_mul_mat(
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
     if (ggml_is_nanoquant_weight(a)) {
+        GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
         return ggml_nanoquant_linear(ctx, b, a->src[0], a->src[1], a->src[2], a->src[3]);
     }
 
@@ -3455,6 +3456,10 @@ struct ggml_tensor * ggml_mul_mat_id(
     GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+    if (ggml_is_nanoquant_weight(as)) {
+        return ggml_nanoquant_linear_id(
+                ctx, b, ids, as->src[0], as->src[1], as->src[2], as->src[3]);
+    }
 
     const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -6629,20 +6634,24 @@ void ggml_set_nanoquant_weight(
         struct ggml_tensor * scale_pre,
         struct ggml_tensor * scale_post) {
     GGML_ASSERT(weight->type == GGML_TYPE_F32);
-    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(weight->ne[2] > 0 && weight->ne[3] == 1);
     GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
     GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
     GGML_ASSERT(scale_pre->type == GGML_TYPE_F32 || scale_pre->type == GGML_TYPE_F16 || scale_pre->type == GGML_TYPE_BF16);
     GGML_ASSERT(scale_post->type == GGML_TYPE_F32 || scale_post->type == GGML_TYPE_F16 || scale_post->type == GGML_TYPE_BF16);
     const int64_t n_in = weight->ne[0];
     const int64_t n_out = weight->ne[1];
+    const int64_t n_expert = weight->ne[2];
     const int64_t n_rank = v_bits->ne[1];
     GGML_ASSERT(n_rank > 0);
-    GGML_ASSERT(v_bits->ne[0] == (n_in + 31)/32 && v_bits->ne[2] == 1 && v_bits->ne[3] == 1);
+    GGML_ASSERT(v_bits->ne[0] == (n_in + 31)/32 &&
+            v_bits->ne[2] == n_expert && v_bits->ne[3] == 1);
     GGML_ASSERT(u_bits->ne[0] == (n_rank + 31)/32 && u_bits->ne[1] == n_out &&
-            u_bits->ne[2] == 1 && u_bits->ne[3] == 1);
-    GGML_ASSERT(scale_pre->ne[0] == n_in && ggml_nrows(scale_pre) == 1);
-    GGML_ASSERT(scale_post->ne[0] == n_out && ggml_nrows(scale_post) == 1);
+            u_bits->ne[2] == n_expert && u_bits->ne[3] == 1);
+    GGML_ASSERT(scale_pre->ne[0] == n_in && scale_pre->ne[1] == n_expert &&
+            scale_pre->ne[2] == 1 && scale_pre->ne[3] == 1);
+    GGML_ASSERT(scale_post->ne[0] == n_out && scale_post->ne[1] == n_expert &&
+            scale_post->ne[2] == 1 && scale_post->ne[3] == 1);
     weight->op = GGML_OP_NANOQUANT_LINEAR;
     weight->src[0] = v_bits;
     weight->src[1] = u_bits;
@@ -6691,6 +6700,56 @@ struct ggml_tensor * ggml_nanoquant_linear(
     return result;
 }
 
+struct ggml_tensor * ggml_nanoquant_linear_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * v_bits,
+        struct ggml_tensor  * u_bits,
+        struct ggml_tensor  * scale_pre,
+        struct ggml_tensor  * scale_post) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale_pre->type == GGML_TYPE_F32 || scale_pre->type == GGML_TYPE_F16 || scale_pre->type == GGML_TYPE_BF16);
+    GGML_ASSERT(scale_post->type == GGML_TYPE_F32 || scale_post->type == GGML_TYPE_F16 || scale_post->type == GGML_TYPE_BF16);
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+    if (!ggml_is_contiguous(ids)) {
+        ids = ggml_cont(ctx, ids);
+    }
+
+    const int64_t n_in = x->ne[0];
+    const int64_t n_rank = v_bits->ne[1];
+    const int64_t n_out = u_bits->ne[1];
+    const int64_t n_expert = v_bits->ne[2];
+    GGML_ASSERT(n_rank > 0 && n_expert > 0);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] % x->ne[1] == 0 && ids->ne[1] == x->ne[2] &&
+            ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(v_bits->ne[0] == (n_in + 31)/32 && v_bits->ne[3] == 1);
+    GGML_ASSERT(u_bits->ne[0] == (n_rank + 31)/32 &&
+            u_bits->ne[2] == n_expert && u_bits->ne[3] == 1);
+    GGML_ASSERT(scale_pre->ne[0] == n_in && scale_pre->ne[1] == n_expert &&
+            scale_pre->ne[2] == 1 && scale_pre->ne[3] == 1);
+    GGML_ASSERT(scale_post->ne[0] == n_out && scale_post->ne[1] == n_expert &&
+            scale_post->ne[2] == 1 && scale_post->ne[3] == 1);
+
+    const int64_t ne[GGML_MAX_DIMS] = { n_out, ids->ne[0], ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+    result->op = GGML_OP_NANOQUANT_LINEAR;
+    result->src[0] = x;
+    result->src[1] = v_bits;
+    result->src[2] = u_bits;
+    result->src[3] = scale_pre;
+    result->src[4] = scale_post;
+    result->src[5] = ids;
+    ggml_set_op_params_i32(result, 0, 4);
+    return result;
+}
+
 struct ggml_tensor * ggml_nanoquant_linear_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * grad,
@@ -6728,6 +6787,55 @@ struct ggml_tensor * ggml_nanoquant_linear_back(
     result->src[3] = scale_pre;
     result->src[4] = scale_post;
     ggml_set_op_params_i32(result, 0, 1);
+    return result;
+}
+
+struct ggml_tensor * ggml_nanoquant_linear_id_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * v_bits,
+        struct ggml_tensor  * u_bits,
+        struct ggml_tensor  * scale_pre,
+        struct ggml_tensor  * scale_post,
+        int64_t               n_expert_used) {
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_expert_used > 0 && ids->ne[0] % n_expert_used == 0);
+    if (!ggml_is_contiguous(grad)) {
+        grad = ggml_cont(ctx, grad);
+    }
+    if (!ggml_is_contiguous(ids)) {
+        ids = ggml_cont(ctx, ids);
+    }
+
+    const int64_t n_in = scale_pre->ne[0];
+    const int64_t n_rank = v_bits->ne[1];
+    const int64_t n_out = scale_post->ne[0];
+    const int64_t n_expert = v_bits->ne[2];
+    GGML_ASSERT(n_rank > 0 && n_expert > 0);
+    GGML_ASSERT(grad->ne[0] == n_out && grad->ne[1] == ids->ne[0] &&
+            grad->ne[2] == ids->ne[1] && grad->ne[3] == 1);
+    GGML_ASSERT(v_bits->ne[0] == (n_in + 31)/32 && v_bits->ne[3] == 1);
+    GGML_ASSERT(u_bits->ne[0] == (n_rank + 31)/32 && u_bits->ne[1] == n_out &&
+            u_bits->ne[2] == n_expert && u_bits->ne[3] == 1);
+    GGML_ASSERT(scale_pre->ne[1] == n_expert &&
+            scale_pre->ne[2] == 1 && scale_pre->ne[3] == 1);
+    GGML_ASSERT(scale_post->ne[1] == n_expert &&
+            scale_post->ne[2] == 1 && scale_post->ne[3] == 1);
+
+    const int64_t ne[GGML_MAX_DIMS] = { n_in, n_expert_used, ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+    result->op = GGML_OP_NANOQUANT_LINEAR;
+    result->src[0] = grad;
+    result->src[1] = v_bits;
+    result->src[2] = u_bits;
+    result->src[3] = scale_pre;
+    result->src[4] = scale_post;
+    result->src[5] = ids;
+    ggml_set_op_params_i32(result, 0, 5);
     return result;
 }
 struct ggml_tensor * ggml_nanoquant_get_rows(
@@ -7724,9 +7832,18 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_NANOQUANT_LINEAR: {
             const int32_t mode = ggml_get_op_params_i32(tensor, 0);
-            if (mode == 3) {
+            if (mode == 1 || mode == 3 || mode == 5) {
                 GGML_ASSERT(!src0_needs_grads && !src1_needs_grads &&
                             !src2_needs_grads && !src3_needs_grads && !src4_needs_grads);
+                break;
+            }
+            if (mode == 4) {
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_nanoquant_linear_id_back(
+                            ctx, grad, tensor->src[5], src1, src2, src3, src4, src0->ne[1]));
+                }
+                GGML_ASSERT(!src1_needs_grads && !src2_needs_grads &&
+                            !src3_needs_grads && !src4_needs_grads);
                 break;
             }
             GGML_ASSERT(mode == 0);

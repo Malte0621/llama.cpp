@@ -1456,7 +1456,20 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    const llama_nanoquant_weight * nq =
+            model == nullptr ? nullptr : model->get_nanoquant_weight(w);
+    ggml_tensor * res;
+    if (nq && (nq->training_scale_pre != nullptr ||
+               nq->training_scale_post != nullptr)) {
+        GGML_ASSERT(nq->enabled() &&
+                    nq->training_scale_pre != nullptr &&
+                    nq->training_scale_post != nullptr);
+        res = ggml_nanoquant_linear_id(
+                ctx0, cur, ids, nq->v, nq->u,
+                nq->training_scale_pre, nq->training_scale_post);
+    } else {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

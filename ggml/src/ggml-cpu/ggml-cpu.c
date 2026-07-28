@@ -3060,6 +3060,10 @@ struct ggml_cplan ggml_graph_plan(
                             cur = 0;
                             break;
                         }
+                        if (mode == 4 || mode == 5) {
+                            cur = sizeof(float)*ggml_nelements(node->src[5])*node->src[1]->ne[1];
+                            break;
+                        }
                         const int64_t n_vectors = ggml_nrows(node->src[0]);
                         const int64_t input_size = mode == 1 ?
                                 node->src[4]->ne[0] : node->src[3]->ne[0];

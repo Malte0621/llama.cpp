@@ -164,6 +164,199 @@ static __global__ void nanoquant_stage2_back(
     }
 }
 
+template <int block_size, typename scale_t>
+static __global__ void nanoquant_stage1_id(
+        const float * x_ptr,
+        const int32_t * ids_ptr,
+        const uint32_t * v_bits_ptr,
+        const scale_t * scale_pre_ptr,
+        float * tmp_ptr,
+        int64_t n_in,
+        int64_t n_rank,
+        int64_t n_selected,
+        int64_t n_input_used,
+        int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT x         = x_ptr;
+    const int32_t  * GGML_CUDA_RESTRICT ids       = ids_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT v_bits    = v_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_pre = scale_pre_ptr;
+    float          * GGML_CUDA_RESTRICT tmp       = tmp_ptr;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int64_t ir = task % n_rank;
+        const int64_t iv = task / n_rank;
+        const int64_t expert_slot = iv % n_selected;
+        const int64_t token = iv / n_selected;
+        const int64_t input_vector =
+                token*n_input_used + expert_slot % n_input_used;
+        const int64_t expert = ids[iv];
+        const int64_t n_words = (n_in + 31)/32;
+        const float * xv = x + input_vector*n_in;
+        const uint32_t * bits =
+                v_bits + (expert*n_rank + ir)*n_words;
+        const scale_t * expert_scale = scale_pre + expert*n_in;
+
+        float sum = 0.0f;
+        for (int64_t i = threadIdx.x; i < n_in; i += block_size) {
+            const float value = xv[i] * nanoquant_to_float(expert_scale[i]);
+            sum += (bits[i/32] & (uint32_t(1) << (i % 32))) ? -value : value;
+        }
+
+        __shared__ float sums[block_size/WARP_SIZE];
+        sum = block_reduce<block_reduce_method::SUM, block_size>(sum, sums);
+        if (threadIdx.x == 0) {
+            tmp[task] = sum;
+        }
+        if (task + gridDim.x < n_tasks) {
+            __syncthreads();
+        }
+    }
+}
+
+template <int block_size, typename scale_t>
+static __global__ void nanoquant_stage2_id(
+        const float * tmp_ptr,
+        const int32_t * ids_ptr,
+        const uint32_t * u_bits_ptr,
+        const scale_t * scale_post_ptr,
+        float * dst_ptr,
+        int64_t n_rank,
+        int64_t n_out,
+        int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT tmp        = tmp_ptr;
+    const int32_t  * GGML_CUDA_RESTRICT ids        = ids_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT u_bits     = u_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_post = scale_post_ptr;
+    float          * GGML_CUDA_RESTRICT dst        = dst_ptr;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int64_t io = task % n_out;
+        const int64_t iv = task / n_out;
+        const int64_t expert = ids[iv];
+        const int64_t n_words = (n_rank + 31)/32;
+        const float * tv = tmp + iv*n_rank;
+        const uint32_t * bits =
+                u_bits + (expert*n_out + io)*n_words;
+
+        float sum = 0.0f;
+        for (int64_t i = threadIdx.x; i < n_rank; i += block_size) {
+            const float value = tv[i];
+            sum += (bits[i/32] & (uint32_t(1) << (i % 32))) ? -value : value;
+        }
+
+        __shared__ float sums[block_size/WARP_SIZE];
+        sum = block_reduce<block_reduce_method::SUM, block_size>(sum, sums);
+        if (threadIdx.x == 0) {
+            dst[task] = sum*nanoquant_to_float(scale_post[expert*n_out + io]);
+        }
+        if (task + gridDim.x < n_tasks) {
+            __syncthreads();
+        }
+    }
+}
+
+template <int block_size, typename scale_t>
+static __global__ void nanoquant_stage1_id_back(
+        const float * grad_ptr,
+        const int32_t * ids_ptr,
+        const uint32_t * u_bits_ptr,
+        const scale_t * scale_post_ptr,
+        float * tmp_ptr,
+        int64_t n_rank,
+        int64_t n_out,
+        int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT grad       = grad_ptr;
+    const int32_t  * GGML_CUDA_RESTRICT ids        = ids_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT u_bits     = u_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_post = scale_post_ptr;
+    float          * GGML_CUDA_RESTRICT tmp        = tmp_ptr;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int64_t ir = task % n_rank;
+        const int64_t iv = task / n_rank;
+        const int64_t expert = ids[iv];
+        const int64_t n_words = (n_rank + 31)/32;
+        const float * gv = grad + iv*n_out;
+        const uint32_t * expert_u =
+                u_bits + expert*n_out*n_words;
+        const scale_t * expert_scale = scale_post + expert*n_out;
+
+        float sum = 0.0f;
+        for (int64_t io = threadIdx.x; io < n_out; io += block_size) {
+            const uint32_t * bits = expert_u + io*n_words;
+            const float value = gv[io]*nanoquant_to_float(expert_scale[io]);
+            sum += (bits[ir/32] & (uint32_t(1) << (ir % 32))) ? -value : value;
+        }
+
+        __shared__ float sums[block_size/WARP_SIZE];
+        sum = block_reduce<block_reduce_method::SUM, block_size>(sum, sums);
+        if (threadIdx.x == 0) {
+            tmp[task] = sum;
+        }
+        if (task + gridDim.x < n_tasks) {
+            __syncthreads();
+        }
+    }
+}
+
+template <int block_size, typename scale_t>
+static __global__ void nanoquant_stage2_id_back(
+        const float * tmp_ptr,
+        const int32_t * ids_ptr,
+        const uint32_t * v_bits_ptr,
+        const scale_t * scale_pre_ptr,
+        float * dst_ptr,
+        int64_t n_in,
+        int64_t n_rank,
+        int64_t n_selected,
+        int64_t n_input_used,
+        int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT tmp       = tmp_ptr;
+    const int32_t  * GGML_CUDA_RESTRICT ids       = ids_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT v_bits    = v_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_pre = scale_pre_ptr;
+    float          * GGML_CUDA_RESTRICT dst       = dst_ptr;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int64_t ii = task % n_in;
+        const int64_t input_vector = task / n_in;
+        const int64_t input_slot = input_vector % n_input_used;
+        const int64_t token = input_vector / n_input_used;
+        const int64_t n_words = (n_in + 31)/32;
+
+        float sum = 0.0f;
+        for (int64_t expert_slot = input_slot;
+             expert_slot < n_selected;
+             expert_slot += n_input_used) {
+            const int64_t iv = token*n_selected + expert_slot;
+            const int64_t expert = ids[iv];
+            const uint32_t * expert_v =
+                    v_bits + expert*n_rank*n_words;
+            const float * tv = tmp + iv*n_rank;
+            const float scale =
+                    nanoquant_to_float(scale_pre[expert*n_in + ii]);
+            for (int64_t ir = threadIdx.x; ir < n_rank; ir += block_size) {
+                const uint32_t * bits = expert_v + ir*n_words;
+                const float value = tv[ir]*scale;
+                sum += (bits[ii/32] & (uint32_t(1) << (ii % 32))) ? -value : value;
+            }
+        }
+
+        __shared__ float sums[block_size/WARP_SIZE];
+        sum = block_reduce<block_reduce_method::SUM, block_size>(sum, sums);
+        if (threadIdx.x == 0) {
+            dst[task] = sum;
+        }
+        if (task + gridDim.x < n_tasks) {
+            __syncthreads();
+        }
+    }
+}
+
 template <int block_size, typename scale_pre_t, typename scale_post_t>
 static __global__ void nanoquant_get_rows(
         const int32_t * ids_ptr,
@@ -340,6 +533,98 @@ static void nanoquant_launch_back(
         (float *) dst->data, n_in, n_rank, n_tasks_stage2);
 }
 
+template <typename scale_pre_t, typename scale_post_t>
+static void nanoquant_launch_id(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x,
+        const ggml_tensor * ids,
+        const ggml_tensor * v_bits,
+        const ggml_tensor * u_bits,
+        const ggml_tensor * scale_pre,
+        const ggml_tensor * scale_post,
+        ggml_tensor * dst,
+        bool backward) {
+    const int64_t n_in = scale_pre->ne[0];
+    const int64_t n_rank = v_bits->ne[1];
+    const int64_t n_out = scale_post->ne[0];
+    const int64_t n_selected = ids->ne[0];
+    const int64_t n_vectors = ggml_nelements(ids);
+    const int64_t n_input_used = backward ? dst->ne[1] : x->ne[1];
+
+    ggml_cuda_pool_alloc<float> tmp(ctx.pool(), n_vectors*n_rank);
+    constexpr int block_size = 256;
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_tasks_stage1 = n_vectors*n_rank;
+    const int64_t n_tasks_stage2 = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params stage1_params(
+        dim3((unsigned int) MIN(n_tasks_stage1, int64_t(INT_MAX)), 1, 1), block_size, 0, stream);
+    if (backward) {
+        ggml_cuda_kernel_launch(nanoquant_stage1_id_back<block_size, scale_post_t>, stage1_params,
+            (const float *) x->data,
+            (const int32_t *) ids->data,
+            (const uint32_t *) u_bits->data,
+            (const scale_post_t *) scale_post->data,
+            tmp.get(), n_rank, n_out, n_tasks_stage1);
+    } else {
+        ggml_cuda_kernel_launch(nanoquant_stage1_id<block_size, scale_pre_t>, stage1_params,
+            (const float *) x->data,
+            (const int32_t *) ids->data,
+            (const uint32_t *) v_bits->data,
+            (const scale_pre_t *) scale_pre->data,
+            tmp.get(), n_in, n_rank, n_selected, n_input_used, n_tasks_stage1);
+    }
+
+    const ggml_cuda_kernel_launch_params stage2_params(
+        dim3((unsigned int) MIN(n_tasks_stage2, int64_t(INT_MAX)), 1, 1), block_size, 0, stream);
+    if (backward) {
+        ggml_cuda_kernel_launch(nanoquant_stage2_id_back<block_size, scale_pre_t>, stage2_params,
+            tmp.get(),
+            (const int32_t *) ids->data,
+            (const uint32_t *) v_bits->data,
+            (const scale_pre_t *) scale_pre->data,
+            (float *) dst->data,
+            n_in, n_rank, n_selected, n_input_used, n_tasks_stage2);
+    } else {
+        ggml_cuda_kernel_launch(nanoquant_stage2_id<block_size, scale_post_t>, stage2_params,
+            tmp.get(),
+            (const int32_t *) ids->data,
+            (const uint32_t *) u_bits->data,
+            (const scale_post_t *) scale_post->data,
+            (float *) dst->data,
+            n_rank, n_out, n_tasks_stage2);
+    }
+}
+
+template <typename scale_pre_t>
+static void nanoquant_launch_id_post(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x,
+        const ggml_tensor * ids,
+        const ggml_tensor * v_bits,
+        const ggml_tensor * u_bits,
+        const ggml_tensor * scale_pre,
+        const ggml_tensor * scale_post,
+        ggml_tensor * dst,
+        bool backward) {
+    switch (scale_post->type) {
+        case GGML_TYPE_F32:
+            nanoquant_launch_id<scale_pre_t, float>(
+                    ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            break;
+        case GGML_TYPE_F16:
+            nanoquant_launch_id<scale_pre_t, half>(
+                    ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            break;
+        case GGML_TYPE_BF16:
+            nanoquant_launch_id<scale_pre_t, nv_bfloat16>(
+                    ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
+            break;
+        default:
+            GGML_ABORT("unsupported NanoQuant post-scale type");
+    }
+}
+
 template <typename scale_pre_t>
 static void nanoquant_launch_post(
         ggml_backend_cuda_context & ctx,
@@ -385,6 +670,8 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * scale_post = dst->src[4];
 
     const int32_t mode = ggml_get_op_params_i32(dst, 0);
+    const bool id_mode = mode == 4 || mode == 5;
+    const ggml_tensor * ids = id_mode ? dst->src[5] : nullptr;
     GGML_ASSERT(x->type == (mode == 3 ? GGML_TYPE_I32 : GGML_TYPE_F32));
     GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
     GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
@@ -394,14 +681,19 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(ggml_is_contiguous(u_bits));
     GGML_ASSERT(ggml_is_contiguous(scale_pre));
     GGML_ASSERT(ggml_is_contiguous(scale_post));
+    GGML_ASSERT(!id_mode || (ids != nullptr && ids->type == GGML_TYPE_I32 &&
+            ggml_is_contiguous(ids)));
 
-    GGML_ASSERT(mode == 0 || mode == 1 || mode == 3);
-    const bool backward = mode == 1;
+    GGML_ASSERT(mode == 0 || mode == 1 || mode == 3 || mode == 4 || mode == 5);
+    const bool backward = mode == 1 || mode == 5;
     switch (scale_pre->type) {
         case GGML_TYPE_F32:
             if (mode == 3) {
                 nanoquant_launch_get_rows_post<float>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else if (id_mode) {
+                nanoquant_launch_id_post<float>(
+                        ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
             } else {
                 nanoquant_launch_post<float>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
@@ -411,6 +703,9 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
             if (mode == 3) {
                 nanoquant_launch_get_rows_post<half>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else if (id_mode) {
+                nanoquant_launch_id_post<half>(
+                        ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
             } else {
                 nanoquant_launch_post<half>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);
@@ -420,6 +715,9 @@ void ggml_cuda_nanoquant_linear(ggml_backend_cuda_context & ctx, ggml_tensor * d
             if (mode == 3) {
                 nanoquant_launch_get_rows_post<nv_bfloat16>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst);
+            } else if (id_mode) {
+                nanoquant_launch_id_post<nv_bfloat16>(
+                        ctx, x, ids, v_bits, u_bits, scale_pre, scale_post, dst, backward);
             } else {
                 nanoquant_launch_post<nv_bfloat16>(
                         ctx, x, v_bits, u_bits, scale_pre, scale_post, dst, backward);

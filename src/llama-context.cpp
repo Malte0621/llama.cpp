@@ -3541,7 +3541,7 @@ float llama_context::nanoquant_optimizer_step(
         if (!optimizer->output_gradient_targets.empty()) {
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
                 ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node->op != GGML_OP_MUL_MAT) {
+                if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
                     continue;
                 }
                 for (size_t target = 0;

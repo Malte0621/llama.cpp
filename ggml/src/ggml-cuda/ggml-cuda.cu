@@ -5197,8 +5197,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
                 };
                 const int32_t mode = ggml_get_op_params_i32(op, 0);
+                const bool id_mode = mode == 4 || mode == 5;
                 return (op->src[0]->type == (mode == 3 ? GGML_TYPE_I32 : GGML_TYPE_F32)) &&
-                       (mode == 0 || mode == 1 || mode == 3) &&
+                       (mode == 0 || mode == 1 || mode == 3 || id_mode) &&
                        op->src[1]->type == GGML_TYPE_I32 &&
                        op->src[2]->type == GGML_TYPE_I32 &&
                        is_scale(op->src[3]->type) &&
@@ -5209,6 +5210,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        ggml_is_contiguous(op->src[2]) &&
                        ggml_is_contiguous(op->src[3]) &&
                        ggml_is_contiguous(op->src[4]) &&
+                       (!id_mode || (op->src[5] != nullptr &&
+                               op->src[5]->type == GGML_TYPE_I32 &&
+                               ggml_is_contiguous(op->src[5]))) &&
                        ggml_is_contiguous(op);
             }
         case GGML_OP_ADD:
