@@ -5648,6 +5648,117 @@ static void write_grouped_gguf(
     }
 }
 
+struct model_fit_probe {
+    int32_t max_gpu_layers = 0;
+    size_t n_gpu_devices = 0;
+    double fit_ratio = 1.0;
+    bool fits = true;
+};
+
+static model_fit_probe probe_model_fit(
+        const std::string & path,
+        llama_model_params model_params,
+        const llama_context_params & context_params) {
+    model_params.no_alloc = true;
+    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    model_params.check_tensors = false;
+
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file(path.c_str(), model_params), llama_model_free);
+    if (!model) {
+        throw std::runtime_error("NanoQuant: failed to probe source model memory");
+    }
+    std::unique_ptr<llama_context, decltype(&llama_free)> context(
+            llama_init_from_model(model.get(), context_params), llama_free);
+    if (!context) {
+        throw std::runtime_error("NanoQuant: failed to probe source context memory");
+    }
+
+    model_fit_probe result;
+    result.max_gpu_layers =
+            llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get()) + 1;
+    std::unordered_map<ggml_backend_dev_t, size_t> device_usage;
+    for (const auto & [buft, memory] : llama_get_memory_breakdown(context.get())) {
+        if (ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+        ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+        if (device == nullptr) {
+            continue;
+        }
+        const ggml_backend_dev_type type = ggml_backend_dev_type(device);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const size_t bytes = memory.total();
+        size_t & used = device_usage[device];
+        if (bytes > std::numeric_limits<size_t>::max() - used) {
+            throw std::runtime_error("NanoQuant: source model memory size overflow");
+        }
+        used += bytes;
+    }
+
+    static constexpr size_t GIB = size_t(1024u)*1024u*1024u;
+    result.n_gpu_devices = device_usage.size();
+    for (const auto & [device, used] : device_usage) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        const size_t reserve = std::max<size_t>(2u*GIB, total/8);
+        const size_t available = free > reserve ? free - reserve : 0;
+        if (used > available) {
+            result.fits = false;
+        }
+        if (used > 0) {
+            result.fit_ratio = std::min(result.fit_ratio, available/double(used));
+        }
+    }
+    return result;
+}
+
+static int32_t fit_model_gpu_layers(
+        const std::string & path,
+        llama_model_params model_params,
+        const llama_context_params & context_params) {
+    model_params.n_gpu_layers = -1;
+    model_fit_probe probe = probe_model_fit(path, model_params, context_params);
+    if (probe.fits) {
+        return -1;
+    }
+    if (probe.max_gpu_layers <= 0 || probe.n_gpu_devices == 0) {
+        return 0;
+    }
+
+    LLAMA_LOG_INFO(
+            "NanoQuant: source model exceeds available device memory; auto-fitting GPU layers\n");
+    int32_t candidate = std::min<int32_t>(
+            probe.max_gpu_layers - 1,
+            std::max<int32_t>(0, int32_t(std::floor(
+                    probe.max_gpu_layers*std::clamp(probe.fit_ratio, 0.0, 1.0)))));
+    while (true) {
+        model_params.n_gpu_layers = candidate;
+        probe = probe_model_fit(path, model_params, context_params);
+        if (probe.fits) {
+            LLAMA_LOG_INFO(
+                    "NanoQuant: source model uses %d/%d GPU layers; %d remain host-resident\n",
+                    candidate, probe.max_gpu_layers, probe.max_gpu_layers - candidate);
+            return candidate;
+        }
+        if (candidate == 0) {
+            throw std::runtime_error(
+                    "NanoQuant: source context does not fit available device memory");
+        }
+        int32_t next = int32_t(std::floor(
+                candidate*std::clamp(probe.fit_ratio, 0.0, 1.0)));
+        if (next >= candidate) {
+            next = candidate - 1;
+        }
+        candidate = std::max<int32_t>(0, next);
+    }
+}
+
+
 static void quantize(
         const std::string & input_path,
         const std::string & output_path,
@@ -5854,17 +5965,12 @@ static void quantize(
     compute_backend backend(params->nanoquant_device);
     llama_model_params model_params = llama_model_default_params();
     std::array<ggml_backend_dev_t, 2> model_devices = { nullptr, nullptr };
-    std::array<llama_model_tensor_buft_override, 2> full_model_buft_overrides = {{
-        { "^token_embd\\.weight$", backend.training_buffer_type() },
-        { nullptr, nullptr },
-    }};
     std::array<llama_model_tensor_buft_override, 3> block_training_buft_overrides = {{
         { "^token_embd\\.weight$", nullptr },
         { "^output\\.weight$", nullptr },
         { nullptr, nullptr },
     }};
-    model_params.tensor_buft_overrides = full_model_buft_overrides.data();
-    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    model_params.load_mode = load_mode;
     if (params->nanoquant_device != nullptr && params->nanoquant_device[0] != '\0') {
         model_devices[0] = ggml_backend_dev_by_name(params->nanoquant_device);
         if (model_devices[0] == nullptr) {
@@ -5879,17 +5985,12 @@ static void quantize(
                     params->nanoquant_device);
         }
     }
-    model_params.n_gpu_layers = model_devices[0] != nullptr &&
-            ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU ?
-            0 : params->nanoquant_n_gpu_layers;
+    const bool cpu_training = model_devices[0] != nullptr &&
+            ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const int32_t configured_model_gpu_layers =
+            cpu_training ? 0 : params->nanoquant_n_gpu_layers;
+    model_params.n_gpu_layers = configured_model_gpu_layers;
     model_params.check_tensors = true;
-    std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(
-            llama_model_load_from_file(input_path.c_str(), model_params), llama_model_free);
-    if (!teacher) {
-        throw std::runtime_error("NanoQuant: failed to load the source teacher model");
-    }
-    std::vector<bool> projection_reachable(groups.size(), false);
-    projection_reachability reachability { group_by_name, projection_reachable };
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = params->nanoquant_sequence_length;
     context_params.n_batch = params->nanoquant_sequence_length;
@@ -5898,6 +5999,17 @@ static void quantize(
     context_params.n_threads = nthread;
     context_params.n_threads_batch = nthread;
     context_params.no_perf = true;
+    if (model_params.n_gpu_layers < 0) {
+        model_params.n_gpu_layers =
+                fit_model_gpu_layers(input_path, model_params, context_params);
+    }
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(
+            llama_model_load_from_file(input_path.c_str(), model_params), llama_model_free);
+    if (!teacher) {
+        throw std::runtime_error("NanoQuant: failed to load the source teacher model");
+    }
+    std::vector<bool> projection_reachable(groups.size(), false);
+    projection_reachability reachability { group_by_name, projection_reachable };
     context_params.cb_eval = projection_reachability_callback;
     context_params.cb_eval_user_data = &reachability;
     std::unique_ptr<llama_context, decltype(&llama_free)> teacher_context(
@@ -6205,7 +6317,8 @@ static void quantize(
         release_vector(read_data);
         release_vector(conversion);
 
-        model_params.tensor_buft_overrides = full_model_buft_overrides.data();
+        model_params.tensor_buft_overrides = nullptr;
+        model_params.n_gpu_layers = configured_model_gpu_layers;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> student(
                 llama_model_load_from_file(
                         intermediate_student.string().c_str(), model_params),
