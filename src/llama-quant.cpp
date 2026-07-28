@@ -900,6 +900,13 @@ static constexpr int32_t ADMM_LOG_INTERVAL = 25;
 static constexpr float CALIBRATION_SHRINKAGE = 0.4f;
 static constexpr float ADMM_REGULARIZATION = 3.0e-2f;
 static constexpr float NUMERIC_EPSILON = 1.0e-8f;
+static bool source_type_supports_f32(ggml_type type) {
+    return type == GGML_TYPE_F32 ||
+           type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_BF16 ||
+           (ggml_is_quantized(type) && ggml_get_type_traits(type)->to_float != nullptr);
+}
+
 
 using hash256 = std::array<uint64_t, 4>;
 
@@ -4275,13 +4282,13 @@ static void validate_options(const llama_model_quantize_params * params) {
     if (params->keep_split) {
         throw std::runtime_error("NanoQuant: --keep-split is not supported; output is one strict sidecar GGUF");
     }
-    if (params->only_copy || params->pure || params->allow_requantize ||
+    if (params->only_copy || params->pure ||
         params->imatrix != nullptr || params->tt_overrides != nullptr ||
         params->prune_layers != nullptr ||
         params->output_tensor_type != GGML_TYPE_COUNT ||
         params->token_embedding_type != GGML_TYPE_COUNT) {
         throw std::runtime_error(
-                "NanoQuant: copy/pure/requantize/imatrix/tensor-type/pruning/type-override options cannot be combined with NANOQUANT");
+                "NanoQuant: copy/pure/imatrix/tensor-type/pruning/type-override options cannot be combined with NANOQUANT");
     }
     if (!(params->nanoquant_target_bits > 0.0f) ||
         !std::isfinite(params->nanoquant_target_bits) ||
@@ -4335,7 +4342,9 @@ static bool is_dense_projection(const std::string & name) {
            info.op == GGML_OP_MUL_MAT;
 }
 
-static std::vector<group> find_groups(llama_model_loader & loader) {
+static std::vector<group> find_groups(
+        llama_model_loader & loader,
+        bool allow_requantize) {
     std::unordered_set<std::string> source_names;
     source_names.reserve(loader.weights_map.size());
     for (const auto & entry : loader.weights_map) {
@@ -4352,11 +4361,14 @@ static std::vector<group> find_groups(llama_model_loader & loader) {
             !is_dense_projection(name)) {
             continue;
         }
-        if (tensor->type != GGML_TYPE_F32 &&
-            tensor->type != GGML_TYPE_F16 &&
-            tensor->type != GGML_TYPE_BF16) {
+        if (ggml_is_quantized(tensor->type) && !allow_requantize) {
             throw std::runtime_error(format(
-                    "NanoQuant: selected tensor '%s' has unsupported source type %s; use F32, F16, or BF16 input",
+                    "NanoQuant: requantizing selected tensor '%s' from type %s is disabled; use --allow-requantize",
+                    name.c_str(), ggml_type_name(tensor->type)));
+        }
+        if (!source_type_supports_f32(tensor->type)) {
+            throw std::runtime_error(format(
+                    "NanoQuant: selected tensor '%s' has unsupported source type %s",
                     name.c_str(), ggml_type_name(tensor->type)));
         }
         group item;
@@ -4542,9 +4554,7 @@ static bool is_auxiliary_weight(const std::string & name) {
 
 static bool can_quantize_auxiliary(const ggml_tensor * tensor, ggml_type type) {
     return ggml_n_dims(tensor) == 2 &&
-           (tensor->type == GGML_TYPE_F32 ||
-            tensor->type == GGML_TYPE_F16 ||
-            tensor->type == GGML_TYPE_BF16) &&
+           source_type_supports_f32(tensor->type) &&
            ggml_is_quantized(type) &&
            tensor->ne[0] % ggml_blck_size(type) == 0;
 }
@@ -4605,6 +4615,7 @@ static auxiliary_type_map select_auxiliary_types(
         size_t maximum_projection_size,
         uint64_t original_elements,
         float target_bits,
+        bool allow_requantize,
         size_t & fixed_physical_data) {
     std::vector<ggml_tensor *> auxiliaries;
     size_t immutable_physical_data = 0;
@@ -4615,9 +4626,8 @@ static auxiliary_type_map select_auxiliary_types(
             continue;
         }
         if (is_auxiliary_weight(name) &&
-            (tensor->type == GGML_TYPE_F32 ||
-             tensor->type == GGML_TYPE_F16 ||
-             tensor->type == GGML_TYPE_BF16) &&
+            source_type_supports_f32(tensor->type) &&
+            (!ggml_is_quantized(tensor->type) || allow_requantize) &&
             ggml_n_dims(tensor) == 2) {
             auxiliaries.push_back(tensor);
         } else {
@@ -4787,19 +4797,13 @@ static size_t write_quantized_auxiliary(
             f32_data = reinterpret_cast<const float *>(tensor->data) + element_offset;
         } else {
             conversion.resize(elements);
-            if (tensor->type == GGML_TYPE_F16) {
-                ggml_fp16_to_fp32_row(
-                        reinterpret_cast<const ggml_fp16_t *>(tensor->data) + element_offset,
-                        reinterpret_cast<float *>(conversion.data()), elements);
-            } else if (tensor->type == GGML_TYPE_BF16) {
-                ggml_bf16_to_fp32_row(
-                        reinterpret_cast<const ggml_bf16_t *>(tensor->data) + element_offset,
-                        reinterpret_cast<float *>(conversion.data()), elements);
-            } else {
-                throw std::runtime_error(format(
-                        "NanoQuant: unsupported auxiliary source type %s",
-                        ggml_type_name(tensor->type)));
-            }
+            ggml_tensor staging = *tensor;
+            staging.buffer = nullptr;
+            staging.data = reinterpret_cast<uint8_t *>(tensor->data) +
+                    size_t(first_row)*ggml_row_size(tensor->type, n_per_row);
+            llama_tensor_dequantize_to_f32(
+                    &staging, reinterpret_cast<float *>(conversion.data()),
+                    workers, elements, nthread);
             f32_data = reinterpret_cast<const float *>(conversion.data());
         }
         const size_t chunk_size = size_t(rows)*row_size;
@@ -4947,7 +4951,7 @@ static void quantize(
     llama_model_loader loader(
             nullptr, nullptr, nullptr, input_path, splits, nullptr,
             load_mode, true, false, params->kv_overrides, nullptr);
-    std::vector<group> groups = find_groups(loader);
+    std::vector<group> groups = find_groups(loader, params->allow_requantize);
     const std::vector<const llama_model_loader::llama_tensor_weight *> weights =
             ordered_weights(loader);
     std::unordered_map<std::string, size_t> group_by_name;
@@ -5002,7 +5006,7 @@ static void quantize(
             weights, group_by_name, alignment, metadata_size, target_file_size,
             minimum_projection_size, maximum_projection_size,
             loader.n_elements, params->nanoquant_target_bits,
-            fixed_physical_data);
+            params->allow_requantize, fixed_physical_data);
     for (const auto & auxiliary : auxiliary_types) {
         ggml_tensor * tensor = loader.get_tensor_meta(auxiliary.first.c_str());
         LLAMA_LOG_INFO(
