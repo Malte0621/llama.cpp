@@ -1300,7 +1300,9 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
 }
 
 size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
-    if (ggml_backend_buft_is_meta(buft)) {
+    struct ggml_tensor * first = ggml_get_first_tensor(ctx);
+    if (ggml_backend_buft_is_meta(buft) && first != NULL &&
+        ggml_backend_buffer_is_meta(first->buffer)) {
         return ggml_backend_meta_alloc_ctx_tensors_from_buft_size(ctx, buft);
     }
     size_t nbytes_total = 0;
