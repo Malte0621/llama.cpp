@@ -5801,7 +5801,13 @@ static void quantize(
             throw std::runtime_error(format(
                     "NanoQuant: unknown training device '%s'", params->nanoquant_device));
         }
-        model_params.devices = model_devices.data();
+        if (ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            model_params.devices = model_devices.data();
+        } else {
+            LLAMA_LOG_INFO(
+                    "NanoQuant: training on %s; model layers use the normal multi-device distribution\n",
+                    params->nanoquant_device);
+        }
     }
     model_params.n_gpu_layers = model_devices[0] != nullptr &&
             ggml_backend_dev_type(model_devices[0]) == GGML_BACKEND_DEVICE_TYPE_CPU ?
