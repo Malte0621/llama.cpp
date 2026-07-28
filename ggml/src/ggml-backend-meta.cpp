@@ -1559,6 +1559,58 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+size_t ggml_backend_meta_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    std::vector<size_t> sizes(n_simple_bufts, 0);
+
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        if (tensor->data != nullptr || tensor->view_src != nullptr) {
+            continue;
+        }
+        GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+        const ggml_backend_meta_split_state split_state =
+                ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+
+        for (size_t j = 0; j < n_simple_bufts; ++j) {
+            ggml_tensor slice = *tensor;
+            if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+                const int axis = split_state.axis;
+                slice.ne[axis] = 0;
+                for (size_t segment = 0; segment < split_state.n_segments; ++segment) {
+                    slice.ne[axis] +=
+                            split_state.ne[segment*n_simple_bufts + j] *
+                            split_state.nr[segment];
+                }
+                for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                    if (tensor->nb[dim] > tensor->nb[axis]) {
+                        slice.nb[dim] =
+                                tensor->nb[dim]*slice.ne[axis]/tensor->ne[axis];
+                    }
+                }
+            }
+
+            ggml_backend_buffer_type_t simple_buft =
+                    ggml_backend_meta_buft_simple_buft(buft, j);
+            const size_t size = GGML_PAD(
+                    ggml_backend_buft_get_alloc_size(simple_buft, &slice),
+                    ggml_backend_buft_get_alignment(simple_buft));
+            if (size > SIZE_MAX - sizes[j]) {
+                GGML_ABORT("meta buffer allocation size overflow");
+            }
+            sizes[j] += size;
+        }
+    }
+
+    size_t total = 0;
+    for (size_t size : sizes) {
+        if (size > SIZE_MAX - total) {
+            GGML_ABORT("meta buffer allocation size overflow");
+        }
+        total += size;
+    }
+    return total;
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
