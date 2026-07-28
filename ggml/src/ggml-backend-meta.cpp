@@ -590,6 +590,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+        if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[0].axis < GGML_MAX_DIMS &&
+            src_ss[0].axis == src_ss[1].axis) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return src_ss[0];
+        }
         GGML_ABORT(
                 "unsupported mul_mat split axes %s and %s for tensor %s",
                 ggml_backend_meta_split_axis_name(src_ss[0].axis),
