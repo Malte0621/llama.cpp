@@ -328,6 +328,25 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static void test_minimax_m3_dense_compat(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_MINIMAX_M3, true);
+    const LLM_KV kv(LLM_ARCH_MINIMAX_M3);
+    for (const llm_kv key : {
+            LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
+            LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+            LLM_KV_ATTENTION_INDEXER_TOP_K,
+            LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,
+            LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,
+        }) {
+        GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), kv(key).c_str()) >= 0);
+    }
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+    const std::vector<float> logits = get_logits(
+            model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    GGML_ASSERT(logits.size() == tokens.size()*128);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -511,6 +530,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
+
+    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_MINIMAX_M3) {
+        test_minimax_m3_dense_compat(seed);
+    }
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
 
