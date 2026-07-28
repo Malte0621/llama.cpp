@@ -2250,10 +2250,20 @@ struct calibration_collector {
             throw std::runtime_error("NanoQuant: " + error);
         }
         if (observed_rows == 0) {
-            throw std::runtime_error(format(
+            if (!routed()) {
+                throw std::runtime_error(format(
+                        "NanoQuant: projection '%s' received no calibration rows",
+                        target->name.c_str()));
+            }
+            LLAMA_LOG_WARN(
                     "NanoQuant: projection '%s' expert %" PRId64
-                    " received no calibration rows; increase --nanoquant-sample-count",
-                    target->name.c_str(), expert));
+                    " was not routed by calibration data; using uniform factorization weights\n",
+                    target->name.c_str(), expert);
+            calibration_data result;
+            result.repeated_use = true;
+            result.input_norm.assign(size_t(target->n_in), 1.0f);
+            result.output_norm.assign(size_t(target->n_out), 1.0f);
+            return result;
         }
         if (expected_rows >= 0 && observed_rows != expected_rows) {
             throw std::runtime_error(format(
