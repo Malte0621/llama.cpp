@@ -177,7 +177,7 @@ static void usage(const char * executable) {
     printf("  --nanoquant-device NAME\n");
     printf("                                      primary training device (default: best available backend)\n");
     printf("  --nanoquant-gpu-layers N\n");
-    printf("                                      transformer layers offloaded while training; negative means all (default: -1)\n");
+    printf("                                      transformer layers offloaded while training; negative auto-fits the source model (default: -1)\n");
     printf("  --nanoquant-sequence-length N\n");
     printf("                                      tokens per deterministic calibration sample (default: 2048)\n");
     printf("  --nanoquant-sample-count N\n");
