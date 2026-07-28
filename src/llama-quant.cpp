@@ -1629,6 +1629,27 @@ static std::string graph_weight_name(const char * name) {
     return end == nullptr ? std::string(begin) : std::string(begin, end);
 }
 
+struct projection_reachability {
+    const std::unordered_map<std::string, size_t> & group_by_name;
+    std::vector<bool> & reachable;
+
+    bool collect(ggml_tensor * tensor, bool ask) {
+        if (!ask || tensor == nullptr || tensor->op != GGML_OP_MUL_MAT ||
+            tensor->src[0] == nullptr) {
+            return false;
+        }
+        const auto found = group_by_name.find(graph_weight_name(tensor->src[0]->name));
+        if (found != group_by_name.end()) {
+            reachable[found->second] = true;
+        }
+        return false;
+    }
+};
+
+static bool projection_reachability_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    return static_cast<projection_reachability *>(user_data)->collect(tensor, ask);
+}
+
 struct calibration_collector {
     std::mutex mutex;
     const group * target = nullptr;
@@ -5242,6 +5263,8 @@ static void quantize(
     if (!teacher) {
         throw std::runtime_error("NanoQuant: failed to load the source teacher model");
     }
+    std::vector<bool> projection_reachable(groups.size(), false);
+    projection_reachability reachability { group_by_name, projection_reachable };
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = params->nanoquant_sequence_length;
     context_params.n_batch = params->nanoquant_sequence_length;
@@ -5250,6 +5273,8 @@ static void quantize(
     context_params.n_threads = nthread;
     context_params.n_threads_batch = nthread;
     context_params.no_perf = true;
+    context_params.cb_eval = projection_reachability_callback;
+    context_params.cb_eval_user_data = &reachability;
     std::unique_ptr<llama_context, decltype(&llama_free)> teacher_context(
             llama_init_from_model(teacher.get(), context_params), llama_free);
     if (!teacher_context) {
@@ -5290,14 +5315,32 @@ static void quantize(
     const size_t first_block = 0;
 
     owned_batch projection_batch(params->nanoquant_sequence_length);
-    std::vector<bool> projection_reachable(groups.size(), false);
     const std::vector<std::vector<float>> output_importance =
             collect_output_importance(
                     teacher_context.get(), groups, projection_targets,
                     projection_reachable,
                     samples, backend.gradient_memory_budget(),
                     params, projection_batch.value);
+    if (projection_targets.empty()) {
+        llama_batch & reachability_batch = projection_batch.value;
+        reachability_batch.n_tokens = params->nanoquant_sequence_length;
+        const llama_token * tokens = calibration_sample(samples, 0, params);
+        for (int32_t token = 0; token < reachability_batch.n_tokens; ++token) {
+            reachability_batch.token[token] = tokens[token];
+            reachability_batch.pos[token] = token;
+            reachability_batch.n_seq_id[token] = 1;
+            reachability_batch.seq_id[token][0] = 0;
+            reachability_batch.logits[token] = token + 1 == reachability_batch.n_tokens;
+        }
+        llama_memory_clear(llama_get_memory(teacher_context.get()), true);
+        if (const int result = llama_decode(teacher_context.get(), reachability_batch); result != 0) {
+            throw std::runtime_error(format(
+                    "NanoQuant: projection reachability probe failed (code %d)", result));
+        }
+    }
     teacher_context.reset();
+    context_params.cb_eval = nullptr;
+    context_params.cb_eval_user_data = nullptr;
     if (ggml_backend_dev_type(ggml_backend_get_device(backend.backend)) !=
         GGML_BACKEND_DEVICE_TYPE_CPU) {
         ggml_backend_buffer_type_t host_buft = nullptr;
