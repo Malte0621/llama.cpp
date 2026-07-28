@@ -1453,7 +1453,8 @@ static void restore_completed_experts(
         const hash256 & source_hash,
         const hash256 & config_hash,
         const group & item,
-        checkpoint_state & state) {
+        checkpoint_state & state,
+        bool retain) {
     if (item.n_expert <= 1 || state.expert == 0 ||
         state.stage >= checkpoint_stage::GROUP_DONE) {
         return;
@@ -1480,15 +1481,19 @@ static void restore_completed_experts(
 
     const std::filesystem::path path = expert_checkpoint_path(checkpoint);
     if (populated) {
-        if (!std::filesystem::exists(path)) {
-            for (uint32_t expert = 0; expert < state.expert; ++expert) {
-                write_expert_checkpoint(
-                        checkpoint, source_hash, config_hash, item, expert,
-                        state.completed_scale_pre.data() + size_t(expert)*size_t(item.n_in),
-                        state.completed_scale_post.data() + size_t(expert)*size_t(item.n_out),
-                        state.completed_packed_u.data() + size_t(expert)*expert_packed_u_count(item),
-                        state.completed_packed_v.data() + size_t(expert)*expert_packed_v_count(item));
-            }
+        for (uint32_t expert = 0; expert < state.expert; ++expert) {
+            write_expert_checkpoint(
+                    checkpoint, source_hash, config_hash, item, expert,
+                    state.completed_scale_pre.data() + size_t(expert)*size_t(item.n_in),
+                    state.completed_scale_post.data() + size_t(expert)*size_t(item.n_out),
+                    state.completed_packed_u.data() + size_t(expert)*expert_packed_u_count(item),
+                    state.completed_packed_v.data() + size_t(expert)*expert_packed_v_count(item));
+        }
+        if (!retain) {
+            release_vector(state.completed_scale_pre);
+            release_vector(state.completed_scale_post);
+            release_vector(state.completed_packed_u);
+            release_vector(state.completed_packed_v);
         }
         return;
     }
@@ -1535,6 +1540,12 @@ static void restore_completed_experts(
                     "NanoQuant: corrupt expert %u checkpoint for '%s'",
                     expert + 1, item.name.c_str()));
         }
+    }
+    if (!retain) {
+        release_vector(state.completed_scale_pre);
+        release_vector(state.completed_scale_post);
+        release_vector(state.completed_packed_u);
+        release_vector(state.completed_packed_v);
     }
 }
 
@@ -1672,7 +1683,7 @@ static bool load_checkpoint_file(
         throw std::runtime_error(format("NanoQuant: trailing data in checkpoint for '%s'", item.name.c_str()));
     }
     restore_completed_experts(
-            path, source_hash, config_hash, item, state);
+            path, source_hash, config_hash, item, state, false);
     return true;
 }
 
@@ -1703,16 +1714,23 @@ static void validate_state_shapes(
                 item.name.c_str(), state.expert, item.n_expert));
     }
     const size_t completed_experts = group_done ? 0 : state.expert;
-    require_size(state.completed_scale_pre.size(), completed_experts*size_t(item.n_in),
-            "completed scale_pre");
-    require_size(state.completed_scale_post.size(), completed_experts*size_t(item.n_out),
-            "completed scale_post");
-    require_size(state.completed_packed_u.size(),
-            completed_experts*size_t((item.rank + 31)/32)*size_t(item.n_out),
-            "completed packed_U");
-    require_size(state.completed_packed_v.size(),
-            completed_experts*size_t((item.n_in + 31)/32)*size_t(item.rank),
-            "completed packed_V");
+    const bool streamed_experts = item.n_expert > 1 &&
+            state.completed_scale_pre.empty() &&
+            state.completed_scale_post.empty() &&
+            state.completed_packed_u.empty() &&
+            state.completed_packed_v.empty();
+    if (!streamed_experts) {
+        require_size(state.completed_scale_pre.size(), completed_experts*size_t(item.n_in),
+                "completed scale_pre");
+        require_size(state.completed_scale_post.size(), completed_experts*size_t(item.n_out),
+                "completed scale_post");
+        require_size(state.completed_packed_u.size(),
+                completed_experts*size_t((item.rank + 31)/32)*size_t(item.n_out),
+                "completed packed_U");
+        require_size(state.completed_packed_v.size(),
+                completed_experts*size_t((item.n_in + 31)/32)*size_t(item.rank),
+                "completed packed_V");
+    }
     if (state.stage == checkpoint_stage::NONFACTOR ||
         state.stage == checkpoint_stage::ADMM) {
         require_size(state.weight.size(), weight_size, "weight");
@@ -4231,14 +4249,16 @@ static void complete_expert(
                 state.scale_pre.data(), state.scale_post.data(),
                 state.packed_u.data(), state.packed_v.data());
     }
-    state.completed_scale_pre.insert(
-            state.completed_scale_pre.end(), state.scale_pre.begin(), state.scale_pre.end());
-    state.completed_scale_post.insert(
-            state.completed_scale_post.end(), state.scale_post.begin(), state.scale_post.end());
-    state.completed_packed_u.insert(
-            state.completed_packed_u.end(), state.packed_u.begin(), state.packed_u.end());
-    state.completed_packed_v.insert(
-            state.completed_packed_v.end(), state.packed_v.begin(), state.packed_v.end());
+    if (item.n_expert == 1) {
+        state.completed_scale_pre.insert(
+                state.completed_scale_pre.end(), state.scale_pre.begin(), state.scale_pre.end());
+        state.completed_scale_post.insert(
+                state.completed_scale_post.end(), state.scale_post.begin(), state.scale_post.end());
+        state.completed_packed_u.insert(
+                state.completed_packed_u.end(), state.packed_u.begin(), state.packed_u.end());
+        state.completed_packed_v.insert(
+                state.completed_packed_v.end(), state.packed_v.begin(), state.packed_v.end());
+    }
     ++state.expert;
 
     release_completed_state(state);
@@ -4252,6 +4272,12 @@ static void complete_expert(
         return;
     }
 
+    if (item.n_expert > 1) {
+        state.stage = checkpoint_stage::NONE;
+        restore_completed_experts(
+                checkpoint_path(checkpoint_directory, item.name),
+                source_hash, config_hash, item, state, true);
+    }
     state.scale_pre = std::move(state.completed_scale_pre);
     state.scale_post = std::move(state.completed_scale_post);
     state.packed_u = std::move(state.completed_packed_u);
