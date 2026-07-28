@@ -3564,9 +3564,10 @@ float llama_context::nanoquant_optimizer_step(
                  target < optimizer->output_gradient_targets.size();
                  ++target) {
                 if (optimizer->output_gradients[target].empty()) {
-                    throw std::runtime_error(format(
-                            "NanoQuant: output-gradient target '%s' was not built",
-                            optimizer->output_gradient_targets[target].c_str()));
+                    LLAMA_LOG_WARN(
+                            "NanoQuant: output-gradient target '%s' is absent from this graph; using uniform importance\n",
+                            optimizer->output_gradient_targets[target].c_str());
+                    continue;
                 }
                 std::vector<ggml_tensor *> & candidates =
                         optimizer->output_gradients[target];
@@ -3889,7 +3890,7 @@ std::vector<std::vector<float>> llama_context::nanoquant_optimizer_output_import
     std::vector<std::vector<float>> result(optimizer->output_importance.size());
     for (size_t target = 0; target < result.size(); ++target) {
         if (optimizer->output_importance[target].empty()) {
-            throw std::runtime_error("NanoQuant: output-gradient calibration is incomplete");
+            continue;
         }
         result[target].resize(optimizer->output_importance[target].size());
         for (size_t i = 0; i < result[target].size(); ++i) {

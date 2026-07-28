@@ -4624,19 +4624,36 @@ struct test_out_prod : public test_case {
 struct test_sqr : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool view;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, view);
     }
 
-    test_sqr(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+    test_sqr(
+            ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {10, 5, 4, 3},
+            bool view = false)
+        : type(type), ne(ne), view(view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a);
-        ggml_set_name(a, "a");
+        ggml_tensor * a;
+        if (view) {
+            std::array<int64_t, 4> source_ne = {
+                2*ne[0], 3*ne[1], 2*ne[2], 2*ne[3],
+            };
+            a = ggml_new_tensor(ctx, type, 4, source_ne.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+            a = ggml_view_4d(
+                    ctx, a, ne[0], ne[1], ne[2], ne[3],
+                    a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+        }
 
         ggml_tensor * out = ggml_sqr(ctx, a);
         ggml_set_name(out, "out");
@@ -9483,6 +9500,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_round     (type));
         test_cases.emplace_back(new test_trunc     (type));
         test_cases.emplace_back(new test_sqr       (type, {7, 1, 5, 3}));
+        test_cases.emplace_back(new test_sqr       (type, {7, 5, 3, 2}, true));
         test_cases.emplace_back(new test_sqr       (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_sqrt      (type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_sqrt      (type, {1024, 1024, 1, 1}));

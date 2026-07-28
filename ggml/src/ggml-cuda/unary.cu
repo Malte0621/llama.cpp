@@ -128,10 +128,63 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
 }
 
 template <float (*op)(float), typename T>
+static __global__ void unary_op_strided_kernel(
+        const char * x,
+        char * dst,
+        const int64_t k,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne2,
+        const uint64_t nb00,
+        const uint64_t nb01,
+        const uint64_t nb02,
+        const uint64_t nb03,
+        const uint64_t nb10,
+        const uint64_t nb11,
+        const uint64_t nb12,
+        const uint64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t i3 = i/(ne0*ne1*ne2);
+    const int64_t i2 = (i - i3*ne0*ne1*ne2)/(ne0*ne1);
+    const int64_t i1 = (i - i3*ne0*ne1*ne2 - i2*ne0*ne1)/ne0;
+    const int64_t i0 = i - i3*ne0*ne1*ne2 - i2*ne0*ne1 - i1*ne0;
+    const T * src = reinterpret_cast<const T *>(
+            x + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+    T * out = reinterpret_cast<T *>(
+            dst + i0*nb10 + i1*nb11 + i2*nb12 + i3*nb13);
+    ggml_cuda_pdl_sync();
+    *out = T(op(float(*src)));
+}
+
+template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
+}
+
+template <float (*op)(float), typename T>
+static void unary_strided_cuda(
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        cudaStream_t stream) {
+    const int64_t k = ggml_nelements(src);
+    const int64_t num_blocks =
+            (k + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(
+                    (dim3) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(
+            unary_op_strided_kernel<op, T>, launch_params,
+            static_cast<const char *>(src->data),
+            static_cast<char *>(dst->data),
+            k, src->ne[0], src->ne[1], src->ne[2],
+            src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
 }
 
 template <float (*op)(float)>
@@ -141,16 +194,22 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
+    const bool contiguous = ggml_is_contiguous(src0) && ggml_is_contiguous(dst);
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
 
     if (src0->type == GGML_TYPE_F16) {
-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
-    } else {
+        if (contiguous) {
+            unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_strided_cuda<op, half>(src0, dst, stream);
+        }
+    } else if (contiguous) {
         unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+    } else {
+        unary_strided_cuda<op, float>(src0, dst, stream);
     }
 }
 

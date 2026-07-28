@@ -2157,9 +2157,14 @@ static std::vector<std::vector<float>> collect_output_importance(
         llama_context * context,
         const std::vector<group> & groups,
         const std::vector<size_t> & target_indices,
+        std::vector<bool> & reachable,
         const std::vector<llama_token> & samples,
+        size_t gradient_memory_budget,
         const llama_model_quantize_params * params,
         llama_batch & batch) {
+    LLAMA_LOG_INFO(
+            "NanoQuant: task-gradient batching budget = %zu bytes\n",
+            gradient_memory_budget);
     std::vector<std::vector<float>> result(groups.size());
     size_t cursor = 0;
     while (cursor < target_indices.size()) {
@@ -2171,7 +2176,7 @@ static std::vector<std::vector<float>> collect_output_importance(
                     size_t(params->nanoquant_sequence_length) *
                     size_t(item.n_out) * sizeof(float);
             if (cursor != batch_begin &&
-                gradient_bytes + item_bytes > GRADIENT_MEMORY_BUDGET) {
+                gradient_bytes + item_bytes > gradient_memory_budget) {
                 break;
             }
             gradient_bytes += item_bytes;
@@ -2207,7 +2212,14 @@ static std::vector<std::vector<float>> collect_output_importance(
             throw std::runtime_error("NanoQuant: output-gradient target count changed");
         }
         for (size_t i = batch_begin; i < cursor; ++i) {
-            result[target_indices[i]] = std::move(batch_result[i - batch_begin]);
+            const size_t index = target_indices[i];
+            std::vector<float> & importance = batch_result[i - batch_begin];
+            if (importance.empty()) {
+                result[index].assign(size_t(groups[index].n_out), 1.0f);
+            } else {
+                reachable[index] = true;
+                result[index] = std::move(importance);
+            }
         }
         LLAMA_LOG_INFO(
                 "NanoQuant profile: task-gradient calibration=%.3fs targets=%zu cache=%zu bytes\n",
@@ -2223,6 +2235,7 @@ static std::vector<calibration_data> collect_projections(
         calibration_collector_set & collector_set,
         const std::vector<group> & groups,
         const std::vector<checkpoint_state> & states,
+        const std::vector<bool> & reachable,
         size_t block_begin,
         size_t block_end,
         const std::vector<llama_token> & samples,
@@ -2236,15 +2249,18 @@ static std::vector<calibration_data> collect_projections(
             block_end - block_begin);
     collector_set.active.clear();
     collector_set.active.reserve(block_end - block_begin);
-    const size_t active_count = size_t(std::count_if(
-            states.begin() + block_begin, states.begin() + block_end,
-            [](const checkpoint_state & state) {
-                return state.stage < checkpoint_stage::GROUP_DONE;
-            }));
+    size_t active_count = 0;
+    for (size_t index = block_begin; index < block_end; ++index) {
+        if (states[index].stage < checkpoint_stage::GROUP_DONE &&
+            reachable[index]) {
+            ++active_count;
+        }
+    }
     const size_t collector_budget =
             PROJECTION_MEMORY_BUDGET/std::max<size_t>(active_count, 1);
     for (size_t index = block_begin; index < block_end; ++index) {
-        if (states[index].stage >= checkpoint_stage::GROUP_DONE) {
+        if (states[index].stage >= checkpoint_stage::GROUP_DONE ||
+            !reachable[index]) {
             continue;
         }
         std::unique_ptr<calibration_collector> & collector =
@@ -2391,6 +2407,61 @@ struct compute_backend {
     }
     ggml_backend_buffer_type_t training_buffer_type() const {
         return ggml_backend_get_default_buffer_type(backend);
+    }
+
+    size_t gradient_memory_budget() const {
+        static constexpr size_t GIB = size_t(1024u)*1024u*1024u;
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return GRADIENT_MEMORY_BUDGET;
+        }
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        const size_t reserve = std::max<size_t>(2u*GIB, total/8);
+        const size_t available = free > reserve ? free - reserve : 0;
+        return std::clamp(
+                available/2, GRADIENT_MEMORY_BUDGET, 4u*GIB);
+    }
+
+    ggml_backend_buffer_type_t optimizer_buffer_type(
+            size_t parameter_bytes,
+            const char * name) const {
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return training_buffer_type();
+        }
+
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        static constexpr size_t MIB = 1024u*1024u;
+        const size_t reserve = std::max<size_t>(512u*MIB, total/16);
+        const size_t available = free > reserve ? free - reserve : 0;
+        if (parameter_bytes <= available/5) {
+            return training_buffer_type();
+        }
+
+        ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(device);
+        if (host == nullptr) {
+            for (ggml_backend_t candidate : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(candidate)) ==
+                    GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    host = ggml_backend_get_default_buffer_type(candidate);
+                    break;
+                }
+            }
+        }
+        if (host == nullptr) {
+            throw std::runtime_error(format(
+                    "NanoQuant: insufficient device memory for '%s' and no host fallback is available",
+                    name));
+        }
+        LLAMA_LOG_INFO(
+                "NanoQuant: %s optimizer uses host-backed parameters "
+                "(parameters=%.2f MiB free=%.2f MiB reserve=%.2f MiB)\n",
+                name, parameter_bytes/double(MIB), free/double(MIB), reserve/double(MIB));
+        return host;
     }
 
     cached_graph & get_graph(
@@ -3283,99 +3354,6 @@ static void set_training_tensor(ggml_tensor * tensor, const std::vector<float> &
     ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(float));
 }
 
-struct packed_override_storage {
-    struct entry {
-        llama_nanoquant_weight * override = nullptr;
-        ggml_tensor * v = nullptr;
-        ggml_tensor * u = nullptr;
-        ggml_tensor * scale_pre = nullptr;
-        ggml_tensor * scale_post = nullptr;
-        bool active = false;
-    };
-
-    training_tensor_storage storage;
-    std::vector<entry> entries;
-    bool enabled = false;
-
-    packed_override_storage(
-            llama_model * model,
-            const std::vector<group> & groups,
-            ggml_backend_buffer_type_t buft) :
-            storage(4*groups.size()),
-            entries(groups.size()) {
-        for (size_t i = 0; i < groups.size(); ++i) {
-            const group & item = groups[i];
-            ggml_tensor * source =
-                    const_cast<ggml_tensor *>(model->get_tensor(item.name.c_str()));
-            if (source == nullptr) {
-                throw std::runtime_error(format(
-                        "NanoQuant: packed override source '%s' is missing", item.name.c_str()));
-            }
-            llama_nanoquant_weight & override = model->nanoquant_weights[source];
-            if (override.enabled() || override.training_weight != nullptr ||
-                override.training_v != nullptr || override.training_u != nullptr ||
-                override.training_scale_pre != nullptr ||
-                override.training_scale_post != nullptr) {
-                throw std::runtime_error("NanoQuant: packed override is already active");
-            }
-            entry & current = entries[i];
-            current.override = &override;
-            current.v = storage.new_2d(
-                    GGML_TYPE_I32, (item.n_in + 31) / 32, item.rank,
-                    item.name_v.c_str());
-            current.u = storage.new_2d(
-                    GGML_TYPE_I32, (item.rank + 31) / 32, item.n_out,
-                    item.name_u.c_str());
-            current.scale_pre = storage.new_1d(
-                    GGML_TYPE_F16, item.n_in, item.name_scale_pre.c_str());
-            current.scale_post = storage.new_1d(
-                    GGML_TYPE_F16, item.n_out, item.name_scale_post.c_str());
-        }
-        storage.allocate(buft);
-    }
-
-    ~packed_override_storage() {
-        set_enabled(false);
-    }
-
-    void set_enabled(bool value) {
-        enabled = value;
-        for (entry & current : entries) {
-            if (!current.active) {
-                continue;
-            }
-            current.override->v = value ? current.v : nullptr;
-            current.override->u = value ? current.u : nullptr;
-            current.override->scale_pre = value ? current.scale_pre : nullptr;
-            current.override->scale_post = value ? current.scale_post : nullptr;
-        }
-    }
-
-    void attach(size_t index, const group & item, const checkpoint_state & state) {
-        entry & current = entries.at(index);
-        ggml_backend_tensor_set(
-                current.v, state.packed_v.data(), 0, item.v_size());
-        ggml_backend_tensor_set(
-                current.u, state.packed_u.data(), 0, item.u_size());
-        std::vector<ggml_fp16_t> scale_pre(item.n_in);
-        std::vector<ggml_fp16_t> scale_post(item.n_out);
-        ggml_fp32_to_fp16_row(state.scale_pre.data(), scale_pre.data(), item.n_in);
-        ggml_fp32_to_fp16_row(state.scale_post.data(), scale_post.data(), item.n_out);
-        ggml_backend_tensor_set(
-                current.scale_pre, scale_pre.data(), 0,
-                scale_pre.size()*sizeof(ggml_fp16_t));
-        ggml_backend_tensor_set(
-                current.scale_post, scale_post.data(), 0,
-                scale_post.size()*sizeof(ggml_fp16_t));
-        current.active = true;
-        if (enabled) {
-            current.override->v = current.v;
-            current.override->u = current.u;
-            current.override->scale_pre = current.scale_pre;
-            current.override->scale_post = current.scale_post;
-        }
-    }
-};
 
 static void get_training_tensor(const ggml_tensor * tensor, std::vector<float> & values) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_F32 ||
@@ -3533,7 +3511,7 @@ static void run_nonfactor_reconstruction(
     training_tensor_storage storage(1);
     ggml_tensor * weight = storage.new_2d(
             item.n_in, item.n_out, "nanoquant_training_weight");
-    storage.allocate(backend.training_buffer_type());
+    storage.allocate(backend.optimizer_buffer_type(ggml_nbytes(weight), item.name.c_str()));
     set_training_tensor(weight, state.weight);
     release_vector(state.weight);
 
@@ -3685,7 +3663,9 @@ static void run_factor_reconstruction(
     ggml_tensor * u = storage.new_2d(item.rank, item.n_out, "nanoquant_training_u");
     ggml_tensor * scale_pre = storage.new_1d(item.n_in, "nanoquant_training_scale_pre");
     ggml_tensor * scale_post = storage.new_1d(item.n_out, "nanoquant_training_scale_post");
-    storage.allocate(backend.training_buffer_type());
+    const size_t parameter_bytes =
+            ggml_nbytes(v) + ggml_nbytes(u) + ggml_nbytes(scale_pre) + ggml_nbytes(scale_post);
+    storage.allocate(backend.optimizer_buffer_type(parameter_bytes, item.name.c_str()));
     set_training_tensor(v, state.v);
     set_training_tensor(u, state.u);
     set_training_tensor(scale_pre, state.scale_pre);
@@ -3819,19 +3799,34 @@ static std::vector<float> collect_teacher_probabilities(
         int32_t n_tokens,
         llama_batch & batch);
 
+struct teacher_probability_cache {
+    std::filesystem::path path;
+    std::ifstream input;
+    size_t sample_values = 0;
+    int32_t sample_count = 0;
+    int32_t sequence_length = 0;
+    int32_t vocab_size = 0;
+
+    teacher_probability_cache(
+            const std::filesystem::path & path,
+            llama_context * teacher,
+            const std::vector<llama_token> & samples,
+            const llama_model_quantize_params * params);
+    ~teacher_probability_cache();
+
+    std::vector<float> load(int32_t sample);
+};
+
 static double full_model_kl(
-        llama_context * teacher,
         llama_context * student,
-        packed_override_storage & packed_student,
+        teacher_probability_cache & teacher_cache,
         const std::vector<llama_token> & samples,
         const llama_model_quantize_params * params,
         owned_batch & batch) {
     const int32_t sequence_length = params->nanoquant_sequence_length;
     const int32_t vocab_size = llama_vocab_n_tokens(
             llama_model_get_vocab(llama_get_model(student)));
-    const int32_t teacher_vocab_size = llama_vocab_n_tokens(
-            llama_model_get_vocab(llama_get_model(teacher)));
-    if (teacher_vocab_size != vocab_size) {
+    if (teacher_cache.vocab_size != vocab_size) {
         throw std::runtime_error("NanoQuant: teacher/student KL shape mismatch");
     }
     double total_kl = 0.0;
@@ -3839,16 +3834,7 @@ static double full_model_kl(
     for (int32_t sample = 0; sample < params->nanoquant_sample_count; ++sample) {
         const llama_token * sample_tokens =
                 calibration_sample(samples, sample, params);
-        std::vector<float> teacher_probabilities;
-        packed_student.set_enabled(false);
-        try {
-            teacher_probabilities = collect_teacher_probabilities(
-                    teacher, sample_tokens, sequence_length, batch.value);
-        } catch (...) {
-            packed_student.set_enabled(true);
-            throw;
-        }
-        packed_student.set_enabled(true);
+        std::vector<float> teacher_probabilities = teacher_cache.load(sample);
 
         batch.value.n_tokens = sequence_length;
         for (int32_t token = 0; token < sequence_length; ++token) {
@@ -4087,11 +4073,105 @@ static std::vector<float> collect_teacher_probabilities(
     return result;
 }
 
+teacher_probability_cache::teacher_probability_cache(
+        const std::filesystem::path & cache_path,
+        llama_context * teacher,
+        const std::vector<llama_token> & samples,
+        const llama_model_quantize_params * params) :
+        path(cache_path),
+        sample_count(params->nanoquant_sample_count),
+        sequence_length(params->nanoquant_sequence_length),
+        vocab_size(llama_vocab_n_tokens(
+                llama_model_get_vocab(llama_get_model(teacher)))) {
+    if (sample_count <= 0 || sequence_length <= 0 || vocab_size <= 0 ||
+        size_t(sequence_length) > std::numeric_limits<size_t>::max()/size_t(vocab_size)) {
+        throw std::runtime_error("NanoQuant: teacher probability cache shape is invalid");
+    }
+    sample_values = size_t(sequence_length)*size_t(vocab_size);
+    if (sample_values > std::numeric_limits<size_t>::max()/sizeof(float) ||
+        size_t(sample_count) > std::numeric_limits<size_t>::max()/
+                (sample_values*sizeof(float))) {
+        throw std::runtime_error("NanoQuant: teacher probability cache size overflow");
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    try {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+        owned_batch batch(sequence_length);
+        for (int32_t sample = 0; sample < sample_count; ++sample) {
+            const llama_token * tokens =
+                    calibration_sample(samples, sample, params);
+            const std::vector<float> probabilities =
+                    collect_teacher_probabilities(
+                            teacher, tokens, sequence_length, batch.value);
+            if (probabilities.size() != sample_values) {
+                throw std::runtime_error(
+                        "NanoQuant: teacher probability cache shape changed");
+            }
+            output.write(
+                    reinterpret_cast<const char *>(probabilities.data()),
+                    probabilities.size()*sizeof(float));
+        }
+        output.close();
+        const size_t expected =
+                size_t(sample_count)*sample_values*sizeof(float);
+        if (std::filesystem::file_size(path) != expected) {
+            throw std::runtime_error(
+                    "NanoQuant: teacher probability cache size mismatch");
+        }
+        input.open(path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                    "NanoQuant: failed to reopen teacher probability cache");
+        }
+        LLAMA_LOG_INFO(
+                "NanoQuant profile: cached teacher probabilities=%.3fs size=%zu bytes\n",
+                std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start).count(),
+                expected);
+    } catch (...) {
+        input.close();
+        std::filesystem::remove(path, ec);
+        throw;
+    }
+}
+
+teacher_probability_cache::~teacher_probability_cache() {
+    input.close();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+std::vector<float> teacher_probability_cache::load(int32_t sample) {
+    if (sample < 0 || sample >= sample_count) {
+        throw std::runtime_error(
+                "NanoQuant: teacher probability cache sample is out of range");
+    }
+    const size_t sample_bytes = sample_values*sizeof(float);
+    const size_t byte_offset = size_t(sample)*sample_bytes;
+    if (sample_bytes > size_t(std::numeric_limits<std::streamsize>::max()) ||
+        byte_offset > size_t(std::numeric_limits<std::streamoff>::max())) {
+        throw std::runtime_error(
+                "NanoQuant: teacher probability cache offset is out of range");
+    }
+    std::vector<float> result(sample_values);
+    input.clear();
+    input.seekg(std::streamoff(byte_offset));
+    input.read(reinterpret_cast<char *>(result.data()), std::streamsize(sample_bytes));
+    if (!input || size_t(input.gcount()) != sample_bytes) {
+        throw std::runtime_error(
+                "NanoQuant: failed to read teacher probability cache");
+    }
+    return result;
+}
+
 
 
 static void run_model_scale_kl(
-        llama_context * teacher_context,
-        packed_override_storage & packed_student,
+        teacher_probability_cache & teacher_cache,
         llama_model * student_model,
         llama_context * student_context,
         owned_batch & batch,
@@ -4102,6 +4182,10 @@ static void run_model_scale_kl(
         const hash256 & source_hash,
         const hash256 & config_hash,
         std::vector<checkpoint_state> & states) {
+    if (teacher_cache.sample_count != params->nanoquant_sample_count ||
+        teacher_cache.sequence_length != params->nanoquant_sequence_length) {
+        throw std::runtime_error("NanoQuant: teacher probability cache contract mismatch");
+    }
     uint32_t progress = 0;
     deterministic_rng initial_rng(
             params->nanoquant_seed ^ UINT64_C(0xd1b54a32d192ed03));
@@ -4209,17 +4293,7 @@ static void run_model_scale_kl(
             for (int32_t sample : order) {
                 const llama_token * tokens =
                         calibration_sample(samples, sample, params);
-                std::vector<float> probabilities;
-                packed_student.set_enabled(false);
-                try {
-                    probabilities = collect_teacher_probabilities(
-                            teacher_context, tokens,
-                            params->nanoquant_sequence_length, batch.value);
-                } catch (...) {
-                    packed_student.set_enabled(true);
-                    throw;
-                }
-                packed_student.set_enabled(true);
+                std::vector<float> probabilities = teacher_cache.load(sample);
                 loss_sum += student_context->nanoquant_optimizer_step(
                         optimizer.get(), batch.value, tokens,
                         params->nanoquant_sequence_length,
@@ -4248,7 +4322,6 @@ static void run_model_scale_kl(
                     loss_sum/std::max<int32_t>(params->nanoquant_sample_count, 1));
         }
     } catch (...) {
-        packed_student.set_enabled(true);
         clear_overrides();
         throw;
     }
@@ -5130,11 +5203,16 @@ static void quantize(
     compute_backend backend(params->nanoquant_device);
     llama_model_params model_params = llama_model_default_params();
     std::array<ggml_backend_dev_t, 2> model_devices = { nullptr, nullptr };
-    std::array<llama_model_tensor_buft_override, 2> model_buft_overrides = {{
+    std::array<llama_model_tensor_buft_override, 2> full_model_buft_overrides = {{
         { "^token_embd\\.weight$", backend.training_buffer_type() },
         { nullptr, nullptr },
     }};
-    model_params.tensor_buft_overrides = model_buft_overrides.data();
+    std::array<llama_model_tensor_buft_override, 3> block_training_buft_overrides = {{
+        { "^token_embd\\.weight$", nullptr },
+        { "^output\\.weight$", nullptr },
+        { nullptr, nullptr },
+    }};
+    model_params.tensor_buft_overrides = full_model_buft_overrides.data();
     model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     if (params->nanoquant_device != nullptr && params->nanoquant_device[0] != '\0') {
         model_devices[0] = ggml_backend_dev_by_name(params->nanoquant_device);
@@ -5151,7 +5229,7 @@ static void quantize(
     std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(
             llama_model_load_from_file(input_path.c_str(), model_params), llama_model_free);
     if (!teacher) {
-        throw std::runtime_error("NanoQuant: failed to load the full-precision teacher model");
+        throw std::runtime_error("NanoQuant: failed to load the source teacher model");
     }
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = params->nanoquant_sequence_length;
@@ -5166,41 +5244,12 @@ static void quantize(
     if (!teacher_context) {
         throw std::runtime_error("NanoQuant: failed to create the teacher calibration context");
     }
-    llama_context_params projection_context_params = context_params;
-    projection_context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    projection_context_params.cb_eval = calibration_callback;
-    projection_context_params.cb_eval_user_data = &collector_set;
-    std::unique_ptr<llama_context, decltype(&llama_free)> projection_context(
-            llama_init_from_model(teacher.get(), projection_context_params), llama_free);
-    if (!projection_context) {
-        throw std::runtime_error("NanoQuant: failed to create the teacher projection context");
-    }
-    block_output_collector teacher_block_collector;
-    block_output_collector student_block_collector;
-    llama_context_params teacher_block_params = context_params;
-    teacher_block_params.cb_eval = block_output_callback;
-    teacher_block_params.cb_eval_user_data = &teacher_block_collector;
-    std::unique_ptr<llama_context, decltype(&llama_free)> teacher_block_context(
-            llama_init_from_model(teacher.get(), teacher_block_params), llama_free);
-    if (!teacher_block_context) {
-        throw std::runtime_error("NanoQuant: failed to create the teacher block context");
-    }
-    llama_context_params student_block_params = context_params;
-    student_block_params.cb_eval = block_output_callback;
-    student_block_params.cb_eval_user_data = &student_block_collector;
-    std::unique_ptr<llama_context, decltype(&llama_free)> student_block_context(
-            llama_init_from_model(teacher.get(), student_block_params), llama_free);
-    if (!student_block_context) {
-        throw std::runtime_error("NanoQuant: failed to create the student block context");
-    }
     const std::vector<llama_token> samples = make_calibration_samples(teacher.get(), params);
     LLAMA_LOG_INFO(
             "NanoQuant phase 1/3: calibrated %d deterministic samples x %d tokens; projection cache <= %zu bytes/block\n",
             params->nanoquant_sample_count, params->nanoquant_sequence_length,
             PROJECTION_MEMORY_BUDGET);
 
-    auto packed_student = std::make_unique<packed_override_storage>(
-            teacher.get(), groups, backend.training_buffer_type());
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<float>> conversion;
     std::vector<std::thread> workers;
@@ -5220,7 +5269,6 @@ static void quantize(
             validate_state_shapes(item, state);
         }
         if (state.stage >= checkpoint_stage::GROUP_DONE) {
-            packed_student->attach(index, item, state);
             release_completed_state(state);
             release_attached_state(state);
         }
@@ -5231,10 +5279,64 @@ static void quantize(
     const size_t first_block = 0;
 
     owned_batch projection_batch(params->nanoquant_sequence_length);
+    std::vector<bool> projection_reachable(groups.size(), false);
     const std::vector<std::vector<float>> output_importance =
             collect_output_importance(
                     teacher_context.get(), groups, projection_targets,
-                    samples, params, projection_batch.value);
+                    projection_reachable,
+                    samples, backend.gradient_memory_budget(),
+                    params, projection_batch.value);
+    teacher_context.reset();
+    if (ggml_backend_dev_type(ggml_backend_get_device(backend.backend)) !=
+        GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        for (ggml_backend_t candidate : backend.backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(candidate)) ==
+                GGML_BACKEND_DEVICE_TYPE_CPU) {
+                host_buft = ggml_backend_get_default_buffer_type(candidate);
+                break;
+            }
+        }
+        if (host_buft == nullptr) {
+            host_buft =
+                    ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend.backend));
+        }
+        if (host_buft != nullptr) {
+            teacher.reset();
+            block_training_buft_overrides[0].buft = host_buft;
+            block_training_buft_overrides[1].buft = host_buft;
+            model_params.tensor_buft_overrides = block_training_buft_overrides.data();
+            teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
+            if (!teacher) {
+                throw std::runtime_error(
+                        "NanoQuant: failed to reload the block-training source model");
+            }
+            LLAMA_LOG_INFO(
+                    "NanoQuant: block training keeps token embedding and output weights host-resident\n");
+        }
+    }
+
+    llama_context_params projection_context_params = context_params;
+    projection_context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    projection_context_params.cb_eval = calibration_callback;
+    projection_context_params.cb_eval_user_data = &collector_set;
+    std::unique_ptr<llama_context, decltype(&llama_free)> projection_context(
+            llama_init_from_model(teacher.get(), projection_context_params), llama_free);
+    if (!projection_context) {
+        throw std::runtime_error("NanoQuant: failed to create the teacher projection context");
+    }
+    block_output_collector block_collector;
+    llama_context_params block_context_params = context_params;
+    block_context_params.cb_eval = block_output_callback;
+    block_context_params.cb_eval_user_data = &block_collector;
+    std::unique_ptr<llama_context, decltype(&llama_free)> block_context(
+            llama_init_from_model(teacher.get(), block_context_params), llama_free);
+    if (!block_context) {
+        throw std::runtime_error("NanoQuant: failed to create the block reconstruction context");
+    }
+    LLAMA_LOG_INFO(
+            "NanoQuant: source and reconstructed weights use disjoint residency phases; "
+            "optimizer parameters are allocated one group at a time\n");
 
     for (size_t block_begin = first_block; block_begin < groups.size();) {
         size_t block_end = block_begin + 1;
@@ -5243,21 +5345,24 @@ static void quantize(
             ++block_end;
         }
 
-        const bool reconstruct_block = std::any_of(
-                model_states.begin() + block_begin,
-                model_states.begin() + block_end,
-                [](const checkpoint_state & state) {
-                    return state.stage < checkpoint_stage::GROUP_DONE;
-                });
+        bool reconstruct_block = false;
+        for (size_t index = block_begin; index < block_end; ++index) {
+            if (model_states[index].stage < checkpoint_stage::GROUP_DONE &&
+                projection_reachable[index]) {
+                reconstruct_block = true;
+                break;
+            }
+        }
         block_training_data training_data;
         std::vector<calibration_data> calibrations;
         if (reconstruct_block) {
             training_data = collect_block_training_data(
-                    teacher_block_context.get(), teacher_block_collector,
+                    block_context.get(), block_collector,
                     groups[block_begin].block, samples, params);
             const auto projection_start = std::chrono::steady_clock::now();
             calibrations = collect_projections(
                     projection_context.get(), collector_set, groups, model_states,
+                    projection_reachable,
                     block_begin, block_end, samples, output_importance,
                     params, projection_batch.value);
             const auto projection_end = std::chrono::steady_clock::now();
@@ -5280,23 +5385,44 @@ static void quantize(
                         teacher.get(), item, read_data, workers, nthread);
                 release_vector(read_data);
             }
-            const calibration_data & calibration =
-                    calibrations[index - block_begin];
+            calibration_data fallback_calibration;
+            const bool reachable = projection_reachable[index];
+            const calibration_data * calibration = nullptr;
+            if (reachable) {
+                calibration = &calibrations[index - block_begin];
+                LLAMA_LOG_INFO("NanoQuant: block %d group %s captured %" PRId64 " of %" PRId64 " projection rows\n",
+                        item.block, item.name.c_str(), calibration->rows,
+                        int64_t(params->nanoquant_sample_count)*params->nanoquant_sequence_length);
+            } else {
+                fallback_calibration.input_norm.assign(size_t(item.n_in), 1.0f);
+                fallback_calibration.output_norm.assign(size_t(item.n_out), 1.0f);
+                fallback_calibration.repeated_use = true;
+                calibration = &fallback_calibration;
+                if (state.stage < checkpoint_stage::ADMM) {
+                    state.stage = checkpoint_stage::NONFACTOR;
+                    state.progress = uint32_t(params->nanoquant_nonfactor_epochs);
+                    state.optimizer_step = 0;
+                    release_vector(state.weight_first_moment);
+                    release_vector(state.weight_second_moment);
+                }
+                LLAMA_LOG_INFO(
+                        "NanoQuant: block %d group %s is absent from the primary graph; using uniform factorization weights\n",
+                        item.block, item.name.c_str());
+            }
             const auto nonfactor_start = std::chrono::steady_clock::now();
-            LLAMA_LOG_INFO("NanoQuant: block %d group %s captured %" PRId64 " of %" PRId64 " projection rows\n",
-                    item.block, item.name.c_str(), calibration.rows,
-                    int64_t(params->nanoquant_sample_count)*params->nanoquant_sequence_length);
-            run_nonfactor_reconstruction(
-                    backend, item, samples, training_data, params, teacher.get(),
-                    student_block_context.get(), student_block_collector, state);
+            if (reachable) {
+                run_nonfactor_reconstruction(
+                        backend, item, samples, training_data, params, teacher.get(),
+                        block_context.get(), block_collector, state);
+            }
             const auto admm_start = std::chrono::steady_clock::now();
-            run_admm(backend, item, calibration, params, state);
+            run_admm(backend, item, *calibration, params, state);
             const auto factor_start = std::chrono::steady_clock::now();
             run_factor_reconstruction(
                     backend, item, samples, training_data, params,
                     checkpoint_directory, source_hash, config_hash,
-                    teacher.get(), student_block_context.get(),
-                    student_block_collector, calibration.repeated_use, state);
+                    teacher.get(), block_context.get(),
+                    block_collector, !reachable || calibration->repeated_use, state);
             const auto factor_end = std::chrono::steady_clock::now();
             const auto seconds = [](auto begin, auto end) {
                 return std::chrono::duration<double>(end - begin).count();
@@ -5312,10 +5438,8 @@ static void quantize(
                         "NanoQuant: group '%s' did not complete block reconstruction",
                         item.name.c_str()));
             }
-            packed_student->attach(index, item, state);
             release_attached_state(state);
         }
-        packed_student->set_enabled(false);
         write_block_checkpoint(
                 checkpoint_directory, groups[block_begin].block, source_hash, config_hash);
         LLAMA_LOG_INFO(
@@ -5323,23 +5447,9 @@ static void quantize(
         block_begin = block_end;
     }
 
-    owned_batch kl_batch(params->nanoquant_sequence_length);
     projection_context.reset();
-    student_block_context.reset();
-    teacher_block_context.reset();
+    block_context.reset();
     collector_set.active.clear();
-    packed_student->set_enabled(true);
-
-    llama_context_params student_context_params = context_params;
-    student_context_params.cb_eval = nullptr;
-    student_context_params.cb_eval_user_data = nullptr;
-    std::unique_ptr<llama_context, decltype(&llama_free)> student_context(
-            llama_init_from_model(teacher.get(), student_context_params), llama_free);
-    if (!student_context) {
-        throw std::runtime_error(
-                "NanoQuant: failed to create the reconstructed student context");
-    }
-
     for (size_t i = 0; i < groups.size(); ++i) {
         validate_state_shapes(groups[i], model_states[i], false);
         if (model_states[i].stage < checkpoint_stage::GROUP_DONE) {
@@ -5349,24 +5459,75 @@ static void quantize(
         }
     }
 
-    LLAMA_LOG_INFO(
-            "NanoQuant phase 3/3: global full-model teacher/student KL scale tuning (%d tokens/evaluation)\n",
-            params->nanoquant_sample_count * params->nanoquant_sequence_length);
-    run_model_scale_kl(
-            teacher_context.get(), *packed_student, teacher.get(),
-            student_context.get(), kl_batch, samples, groups, params,
-            checkpoint_directory, source_hash, config_hash, model_states);
-    const double final_model_kl = full_model_kl(
-            teacher_context.get(), student_context.get(), *packed_student,
-            samples, params, kl_batch);
-    LLAMA_LOG_INFO("NanoQuant: final full-model teacher/student KL = %.9g\n", final_model_kl);
-
-    student_context.reset();
-    packed_student->set_enabled(false);
-    packed_student.reset();
+    teacher_context.reset(llama_init_from_model(teacher.get(), context_params));
+    if (!teacher_context) {
+        throw std::runtime_error(
+                "NanoQuant: failed to create the teacher probability context");
+    }
+    const std::filesystem::path teacher_cache_path =
+            output_path + ".nanoquant.teacher.tmp";
+    auto teacher_cache = std::make_unique<teacher_probability_cache>(
+            teacher_cache_path, teacher_context.get(), samples, params);
     teacher_context.reset();
     teacher.reset();
+    backend.reset_cache();
     loader.init_mappings(false);
+
+    const std::filesystem::path intermediate_student =
+            output_path + ".nanoquant.student.tmp";
+    std::error_code intermediate_remove_error;
+    std::filesystem::remove(intermediate_student, intermediate_remove_error);
+    try {
+        write_grouped_gguf(
+                loader, output_metadata.get(), weights, groups, group_by_name, auxiliary_types,
+                checkpoint_directory, source_hash, config_hash, intermediate_student,
+                checkpoint_stage::GROUP_DONE, projected_payload, projected_physical_data,
+                projected_file_size, metadata_size, alignment,
+                read_data, conversion, workers, nthread);
+        release_vector(read_data);
+        release_vector(conversion);
+
+        model_params.tensor_buft_overrides = full_model_buft_overrides.data();
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> student(
+                llama_model_load_from_file(
+                        intermediate_student.string().c_str(), model_params),
+                llama_model_free);
+        if (!student) {
+            throw std::runtime_error(
+                    "NanoQuant: failed to load the reconstructed student model");
+        }
+        llama_context_params student_context_params = context_params;
+        student_context_params.cb_eval = nullptr;
+        student_context_params.cb_eval_user_data = nullptr;
+        std::unique_ptr<llama_context, decltype(&llama_free)> student_context(
+                llama_init_from_model(student.get(), student_context_params), llama_free);
+        if (!student_context) {
+            throw std::runtime_error(
+                    "NanoQuant: failed to create the reconstructed student context");
+        }
+
+        owned_batch kl_batch(params->nanoquant_sequence_length);
+        LLAMA_LOG_INFO(
+                "NanoQuant phase 3/3: packed-student full-model KL scale tuning "
+                "(%d tokens/evaluation; source teacher released)\n",
+                params->nanoquant_sample_count * params->nanoquant_sequence_length);
+        run_model_scale_kl(
+                *teacher_cache, student.get(), student_context.get(),
+                kl_batch, samples, groups, params,
+                checkpoint_directory, source_hash, config_hash, model_states);
+        const double final_model_kl = full_model_kl(
+                student_context.get(), *teacher_cache, samples, params, kl_batch);
+        LLAMA_LOG_INFO(
+                "NanoQuant: final full-model teacher/student KL = %.9g\n",
+                final_model_kl);
+        student_context.reset();
+        student.reset();
+    } catch (...) {
+        std::filesystem::remove(intermediate_student, intermediate_remove_error);
+        throw;
+    }
+    std::filesystem::remove(intermediate_student, intermediate_remove_error);
+    teacher_cache.reset();
 
     const std::filesystem::path temporary_output = output_path + ".nanoquant.tmp";
     std::error_code remove_error;
