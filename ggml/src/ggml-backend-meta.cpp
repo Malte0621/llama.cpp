@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -818,8 +819,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
-        GGML_ABORT("view of permuted tensor not implemented");
-        //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        if (axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            tensor->src[0]->ne[3] == 1 &&
+            tensor->ne[2]*tensor->ne[3] == tensor->src[0]->ne[2] &&
+            tensor->nb[2] == tensor->src[0]->nb[2]*tensor->ne[3] &&
+            tensor->nb[3] == tensor->src[0]->nb[2]) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            GGML_ASSERT(ret.n_segments == 1);
+            for (size_t j = 0; j < n_bufs; ++j) {
+                GGML_ASSERT(ret.ne[j] % tensor->ne[3] == 0);
+                ret.ne[j] /= tensor->ne[3];
+            }
+            return ret;
+        }
+        GGML_ABORT(
+                "view %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "strides [%zu,%zu,%zu,%zu] of permuted tensor %s "
+                "[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "strides [%zu,%zu,%zu,%zu] with split axis %s is not implemented",
+                tensor->name,
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                tensor->src[0]->name,
+                tensor->src[0]->ne[0], tensor->src[0]->ne[1],
+                tensor->src[0]->ne[2], tensor->src[0]->ne[3],
+                tensor->src[0]->nb[0], tensor->src[0]->nb[1],
+                tensor->src[0]->nb[2], tensor->src[0]->nb[3],
+                ggml_backend_meta_split_axis_name(src_ss[0].axis));
     };
 
     auto handle_permute = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
