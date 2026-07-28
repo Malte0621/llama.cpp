@@ -3949,6 +3949,7 @@ static bool load_model_checkpoint(
         const hash256 & source_hash,
         const hash256 & config_hash,
         const std::vector<group> & groups,
+        const std::vector<bool> & reachable,
         std::vector<checkpoint_state> & states,
         uint32_t & progress,
         uint64_t & rng_state,
@@ -3982,7 +3983,8 @@ static bool load_model_checkpoint(
     rng_state = read_pod<uint64_t>(input);
     optimizer_step = read_pod<uint64_t>(input);
     const uint64_t count = read_pod<uint64_t>(input);
-    if (count != groups.size() || states.size() != groups.size()) {
+    if (count != groups.size() || reachable.size() != groups.size() ||
+        states.size() != groups.size()) {
         throw std::runtime_error("NanoQuant: model-tuning checkpoint group count mismatch");
     }
     for (size_t i = 0; i < groups.size(); ++i) {
@@ -4001,7 +4003,7 @@ static bool load_model_checkpoint(
                     "NanoQuant: model-tuning scale shape mismatch for '%s'",
                     groups[i].name.c_str()));
         }
-        if (progress > 0 &&
+        if (progress > 0 && reachable[i] &&
             (states[i].scale_pre_first_moment.size() != size_t(groups[i].n_in) ||
              states[i].scale_pre_second_moment.size() != size_t(groups[i].n_in) ||
              states[i].scale_post_first_moment.size() != size_t(groups[i].n_out) ||
@@ -4177,11 +4179,15 @@ static void run_model_scale_kl(
         owned_batch & batch,
         const std::vector<llama_token> & samples,
         const std::vector<group> & groups,
+        const std::vector<bool> & reachable,
         const llama_model_quantize_params * params,
         const std::filesystem::path & checkpoint_directory,
         const hash256 & source_hash,
         const hash256 & config_hash,
         std::vector<checkpoint_state> & states) {
+    if (reachable.size() != groups.size()) {
+        throw std::runtime_error("NanoQuant: global scale reachability shape mismatch");
+    }
     if (teacher_cache.sample_count != params->nanoquant_sample_count ||
         teacher_cache.sequence_length != params->nanoquant_sequence_length) {
         throw std::runtime_error("NanoQuant: teacher probability cache contract mismatch");
@@ -4192,7 +4198,7 @@ static void run_model_scale_kl(
     uint64_t rng_state = initial_rng.state;
     uint64_t optimizer_step = 0;
     const bool resumed = load_model_checkpoint(
-            checkpoint_directory, source_hash, config_hash, groups,
+            checkpoint_directory, source_hash, config_hash, groups, reachable,
             states, progress, rng_state, optimizer_step);
     if (!resumed) {
         for (size_t i = 0; i < groups.size(); ++i) {
@@ -4224,6 +4230,9 @@ static void run_model_scale_kl(
     opt_params.reserve(2*groups.size());
     for (size_t i = 0; i < groups.size(); ++i) {
         set_student_scales(student_model, groups[i], states[i]);
+        if (!reachable[i]) {
+            continue;
+        }
         ggml_tensor * virtual_weight =
                 const_cast<ggml_tensor *>(student_model->get_tensor(groups[i].name.c_str()));
         if (virtual_weight == nullptr) {
@@ -4305,8 +4314,10 @@ static void run_model_scale_kl(
             }
             student_context->nanoquant_optimizer_export(optimizer.get());
             for (size_t i = 0; i < groups.size(); ++i) {
-                get_training_tensor(scale_pre_tensors[i], states[i].scale_pre);
-                get_training_tensor(scale_post_tensors[i], states[i].scale_post);
+                if (reachable[i]) {
+                    get_training_tensor(scale_pre_tensors[i], states[i].scale_pre);
+                    get_training_tensor(scale_post_tensors[i], states[i].scale_post);
+                }
             }
             progress = epoch + 1;
             rng_state = rng.state;
@@ -5513,7 +5524,7 @@ static void quantize(
                 params->nanoquant_sample_count * params->nanoquant_sequence_length);
         run_model_scale_kl(
                 *teacher_cache, student.get(), student_context.get(),
-                kl_batch, samples, groups, params,
+                kl_batch, samples, groups, projection_reachable, params,
                 checkpoint_directory, source_hash, config_hash, model_states);
         const double final_model_kl = full_model_kl(
                 student_context.get(), *teacher_cache, samples, params, kl_batch);

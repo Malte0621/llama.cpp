@@ -10,13 +10,17 @@ static __device__ __forceinline__ float nanoquant_to_float(T value) {
 
 template <int block_size, typename scale_t>
 static __global__ void nanoquant_stage1(
-        const float * GGML_CUDA_RESTRICT x,
-        const uint32_t * GGML_CUDA_RESTRICT v_bits,
-        const scale_t * GGML_CUDA_RESTRICT scale_pre,
-        float * GGML_CUDA_RESTRICT tmp,
+        const float * x_ptr,
+        const uint32_t * v_bits_ptr,
+        const scale_t * scale_pre_ptr,
+        float * tmp_ptr,
         int64_t n_in,
         int64_t n_rank,
         int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT x         = x_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT v_bits    = v_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_pre = scale_pre_ptr;
+    float          * GGML_CUDA_RESTRICT tmp       = tmp_ptr;
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
@@ -45,13 +49,17 @@ static __global__ void nanoquant_stage1(
 
 template <int block_size, typename scale_t>
 static __global__ void nanoquant_stage2(
-        const float * GGML_CUDA_RESTRICT tmp,
-        const uint32_t * GGML_CUDA_RESTRICT u_bits,
-        const scale_t * GGML_CUDA_RESTRICT scale_post,
-        float * GGML_CUDA_RESTRICT dst,
+        const float * tmp_ptr,
+        const uint32_t * u_bits_ptr,
+        const scale_t * scale_post_ptr,
+        float * dst_ptr,
         int64_t n_rank,
         int64_t n_out,
         int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT tmp        = tmp_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT u_bits     = u_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_post = scale_post_ptr;
+    float          * GGML_CUDA_RESTRICT dst        = dst_ptr;
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
@@ -80,13 +88,17 @@ static __global__ void nanoquant_stage2(
 
 template <int block_size, typename scale_t>
 static __global__ void nanoquant_stage1_back(
-        const float * GGML_CUDA_RESTRICT grad,
-        const uint32_t * GGML_CUDA_RESTRICT u_bits,
-        const scale_t * GGML_CUDA_RESTRICT scale_post,
-        float * GGML_CUDA_RESTRICT tmp,
+        const float * grad_ptr,
+        const uint32_t * u_bits_ptr,
+        const scale_t * scale_post_ptr,
+        float * tmp_ptr,
         int64_t n_rank,
         int64_t n_out,
         int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT grad       = grad_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT u_bits     = u_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_post = scale_post_ptr;
+    float          * GGML_CUDA_RESTRICT tmp        = tmp_ptr;
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
@@ -115,13 +127,17 @@ static __global__ void nanoquant_stage1_back(
 
 template <int block_size, typename scale_t>
 static __global__ void nanoquant_stage2_back(
-        const float * GGML_CUDA_RESTRICT tmp,
-        const uint32_t * GGML_CUDA_RESTRICT v_bits,
-        const scale_t * GGML_CUDA_RESTRICT scale_pre,
-        float * GGML_CUDA_RESTRICT dst,
+        const float * tmp_ptr,
+        const uint32_t * v_bits_ptr,
+        const scale_t * scale_pre_ptr,
+        float * dst_ptr,
         int64_t n_in,
         int64_t n_rank,
         int64_t n_tasks) {
+    const float    * GGML_CUDA_RESTRICT tmp       = tmp_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT v_bits    = v_bits_ptr;
+    const scale_t  * GGML_CUDA_RESTRICT scale_pre = scale_pre_ptr;
+    float          * GGML_CUDA_RESTRICT dst       = dst_ptr;
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
@@ -150,16 +166,22 @@ static __global__ void nanoquant_stage2_back(
 
 template <int block_size, typename scale_pre_t, typename scale_post_t>
 static __global__ void nanoquant_get_rows(
-        const int32_t * GGML_CUDA_RESTRICT ids,
-        const uint32_t * GGML_CUDA_RESTRICT v_bits,
-        const uint32_t * GGML_CUDA_RESTRICT u_bits,
-        const scale_pre_t * GGML_CUDA_RESTRICT scale_pre,
-        const scale_post_t * GGML_CUDA_RESTRICT scale_post,
-        float * GGML_CUDA_RESTRICT dst,
+        const int32_t * ids_ptr,
+        const uint32_t * v_bits_ptr,
+        const uint32_t * u_bits_ptr,
+        const scale_pre_t * scale_pre_ptr,
+        const scale_post_t * scale_post_ptr,
+        float * dst_ptr,
         int64_t n_in,
         int64_t n_rank,
         int64_t n_out,
         int64_t n_tasks) {
+    const int32_t      * GGML_CUDA_RESTRICT ids        = ids_ptr;
+    const uint32_t     * GGML_CUDA_RESTRICT v_bits     = v_bits_ptr;
+    const uint32_t     * GGML_CUDA_RESTRICT u_bits     = u_bits_ptr;
+    const scale_pre_t  * GGML_CUDA_RESTRICT scale_pre  = scale_pre_ptr;
+    const scale_post_t * GGML_CUDA_RESTRICT scale_post = scale_post_ptr;
+    float              * GGML_CUDA_RESTRICT dst        = dst_ptr;
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     for (int64_t task = blockIdx.x; task < n_tasks; task += gridDim.x) {
