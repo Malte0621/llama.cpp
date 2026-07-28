@@ -1118,6 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
     "SOLVE_TRI",
+    "SOLVE_TRI_BACK",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
@@ -1142,7 +1143,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "NANOQUANT_LINEAR",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,6 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
+    "A^T X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
@@ -1259,14 +1261,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "nanoquant_linear(x,v,u,s_pre,s_post)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
 static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "ABS",
     "SGN",
-    "SGN_STE",
     "NEG",
     "STEP",
     "TANH",
@@ -1287,6 +1288,7 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "SGN_STE",
 };
 
 static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
@@ -6330,6 +6332,31 @@ struct ggml_tensor * ggml_opt_step_sgd(
 
 // solve_tri
 
+static struct ggml_tensor * ggml_solve_tri_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_op          op) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == a->ne[1]);
+    GGML_ASSERT(a->ne[1] == b->ne[1]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    GGML_ASSERT(a->ne[3] == b->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(op == GGML_OP_SOLVE_TRI || op == GGML_OP_SOLVE_TRI_BACK);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+
+    result->op     = op;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_solve_tri(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -6337,30 +6364,15 @@ struct ggml_tensor * ggml_solve_tri(
         bool                  left,
         bool                  lower,
         bool                  uni) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
-
-    // A must be square and lower diagonal
-    GGML_ASSERT(a->ne[0] == a->ne[1]);
-    // B must have same outer dimension as A
-    GGML_ASSERT(a->ne[1] == b->ne[1]);
-
-    // batch dimensions must be equal
-    GGML_ASSERT(a->ne[2] == b->ne[2]);
-    GGML_ASSERT(a->ne[3] == b->ne[3]);
-
-    GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(ggml_is_contiguous(b));
-
     GGML_ASSERT(lower && left && !uni); // TODO: support other variants
+    return ggml_solve_tri_impl(ctx, a, b, GGML_OP_SOLVE_TRI);
+}
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
-
-    result->op     = GGML_OP_SOLVE_TRI;
-    result->src[0] = a;
-    result->src[1] = b;
-
-    return result;
+static struct ggml_tensor * ggml_solve_tri_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_solve_tri_impl(ctx, a, b, GGML_OP_SOLVE_TRI_BACK);
 }
 
 // ggml_gated_delta_net
@@ -7089,7 +7101,11 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -7109,7 +7125,11 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_SQR: {
@@ -7187,6 +7207,18 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
         } break;
+        case GGML_OP_L2_NORM: {
+            if (src0_needs_grads) {
+                const float eps = ggml_get_op_params_f32(tensor, 0);
+                struct ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0)));
+                struct ggml_tensor * denom = ggml_clamp(ctx, norm, eps, INFINITY);
+                struct ggml_tensor * active = ggml_step(ctx, ggml_scale_bias(ctx, norm, 1.0f, -eps));
+                struct ggml_tensor * projection =
+                    ggml_mul(ctx, tensor, ggml_sum_rows(ctx, ggml_mul(ctx, grad, tensor)));
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_div(ctx, ggml_sub(ctx, grad, ggml_mul(ctx, projection, active)), denom));
+            }
+        } break;
         case GGML_OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
@@ -7261,7 +7293,8 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float s;
                 memcpy(&s, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
+                struct ggml_tensor * grad_padded = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad_padded, s, 0.0, false));
             }
         } break;
         case GGML_OP_SET: {
@@ -7494,6 +7527,12 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_step(ctx, src0), grad));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_mul(ctx, grad, ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f))));
+                    }
+                } break;
                 case GGML_UNARY_OP_GELU: {
                     if (src0_needs_grads) {
                         const float gelu_coef_a = 0.044715f;
@@ -7551,6 +7590,68 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                struct ggml_tensor * src0_grad = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, src0_grad));
+            }
+            if (src1_needs_grads) {
+                struct ggml_tensor * src1_grad = ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], src0->ne[dim] * grad->nb[dim]);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, src1_grad));
+            }
+        } break;
+        case GGML_OP_CUMSUM: {
+            if (src0_needs_grads) {
+                struct ggml_tensor * total = ggml_repeat(ctx, ggml_sum_rows(ctx, grad), grad);
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_add(ctx, ggml_sub(ctx, total, ggml_cumsum(ctx, grad)), grad));
+            }
+        } break;
+        case GGML_OP_PAD: {
+            if (src0_needs_grads) {
+                GGML_ASSERT(ggml_get_op_params_i32(tensor, 8) == 0 && "backward pass for circular padding not implemented");
+                const size_t offset =
+                    ggml_get_op_params_i32(tensor, 0) * grad->nb[0] +
+                    ggml_get_op_params_i32(tensor, 2) * grad->nb[1] +
+                    ggml_get_op_params_i32(tensor, 4) * grad->nb[2] +
+                    ggml_get_op_params_i32(tensor, 6) * grad->nb[3];
+                struct ggml_tensor * src0_grad = grad;
+                if (!ggml_are_same_shape(src0, grad)) {
+                    src0_grad = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                    src0_grad = ggml_cont(ctx, src0_grad);
+                }
+                ggml_add_or_set(ctx, cgraph, isrc0, src0_grad);
+            }
+        } break;
+        case GGML_OP_TRI: {
+            if (src0_needs_grads) {
+                struct ggml_tensor * grad_cont = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_tri(ctx, grad_cont, (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0)));
+            }
+        } break;
+        case GGML_OP_SOLVE_TRI: {
+            struct ggml_tensor * rhs_grad = NULL;
+            if (src0_needs_grads || src1_needs_grads) {
+                rhs_grad = ggml_solve_tri_back(ctx, src0, grad);
+            }
+            if (src0_needs_grads) {
+                struct ggml_tensor * src0_grad =
+                    ggml_scale(ctx, ggml_mul_mat(ctx, tensor, rhs_grad), -1.0f);
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_tri(ctx, src0_grad, GGML_TRI_TYPE_LOWER_DIAG));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, rhs_grad);
+            }
+        } break;
         case GGML_OP_CLAMP: {
             if (src0_needs_grads) {
                 float min;
@@ -7561,6 +7662,42 @@ static void ggml_compute_backward(
                 struct ggml_tensor * lower = ggml_step(ctx, ggml_scale_bias(ctx, src0,  1.0f, -min));
                 struct ggml_tensor * upper = ggml_step(ctx, ggml_scale_bias(ctx, src0, -1.0f,  max));
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_mul(ctx, lower, upper)));
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            const int64_t d_conv  = src1->ne[0];
+            const int64_t d_inner = src1->ne[1];
+            const int64_t n_t     = tensor->ne[1];
+            const int64_t n_s     = tensor->ne[2];
+
+            if (src0_needs_grads) {
+                struct ggml_tensor * src0_padded = ggml_is_padded_1d(src0) ? src0 : ggml_cont(ctx, src0);
+                struct ggml_tensor * src0_grad = ggml_scale(ctx, src0_padded, 0.0f);
+                for (int64_t i = 0; i < d_conv; ++i) {
+                    struct ggml_tensor * coeff = ggml_view_2d(
+                        ctx, src1, 1, d_inner, src1->nb[1], i * src1->nb[0]);
+                    coeff = ggml_transpose(ctx, coeff);
+                    struct ggml_tensor * contribution =
+                        ggml_cont(ctx, ggml_transpose(ctx, ggml_mul(ctx, grad, coeff)));
+                    src0_grad = ggml_acc(ctx, src0_grad, contribution,
+                        src0_grad->nb[1], src0_grad->nb[2], src0_grad->nb[3], i * src0_grad->nb[0]);
+                }
+                ggml_add_or_set(ctx, cgraph, isrc0, src0_grad);
+            }
+
+            if (src1_needs_grads) {
+                struct ggml_tensor * src1_grad_t = NULL;
+                for (int64_t i = 0; i < d_conv; ++i) {
+                    struct ggml_tensor * window = ggml_view_3d(
+                        ctx, src0, n_t, d_inner, n_s, src0->nb[1], src0->nb[2], i * src0->nb[0]);
+                    struct ggml_tensor * coeff_grad =
+                        ggml_sum_batches(ctx, ggml_mul(ctx, grad, ggml_transpose(ctx, window)));
+                    coeff_grad = ggml_reshape_2d(ctx, coeff_grad, d_inner, 1);
+                    src1_grad_t = src1_grad_t
+                        ? ggml_concat(ctx, src1_grad_t, coeff_grad, 1)
+                        : coeff_grad;
+                }
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, ggml_transpose(ctx, src1_grad_t)));
             }
         } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {
@@ -7777,6 +7914,9 @@ void ggml_build_backward_expand(
         bool ignore_src[GGML_MAX_SRC] = {false};
         switch (node->op) {
             // gradients in node->src[0] for one reason or another have no effect on output gradients
+            case GGML_OP_FILL: // output is independent of the source values
+                ignore_src[0] = true;
+                break;
             case GGML_OP_IM2COL:      // only used for its shape
             case GGML_OP_IM2COL_BACK: // same as IM2COL
                 ignore_src[0] = true;
@@ -7816,9 +7956,10 @@ void ggml_build_backward_expand(
             continue;
         }
 
+        // inplace operations are currently not supported
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
-            node->op == GGML_OP_SET_ROWS);
+            node->op == GGML_OP_SET || node->op == GGML_OP_SET_ROWS);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

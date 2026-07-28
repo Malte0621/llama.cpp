@@ -10712,6 +10712,7 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->op == GGML_OP_SOLVE_TRI || dst->op == GGML_OP_SOLVE_TRI_BACK);
 
     GGML_ASSERT(ne00 == ne01); // A must be square
     GGML_ASSERT(ne0  == ne10); // solution cols == B cols
@@ -10724,19 +10725,16 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params 
     const int nth = params->nth;
 
     const int64_t k = ne10;   // number of RHS columns
-    const int64_t n = ne11;   // A is n×n
-    const int64_t nr = ne02 * ne03 * k; // we're parallelizing on columns here, so seq x token x column will be the unit
+    const int64_t n = ne11;   // A is n x n
+    const int64_t nr = ne02 * ne03 * k;
 
-    // chunks per thread
     const int64_t dr = (nr + nth - 1)/nth;
-
-    // chunk range for this thread
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
-    const float * A = (const float *) src0->data;  // [n, n, B1, B2]
-    const float * B = (const float *) src1->data;  // [n, k, B1, B2]
-          float * X = (      float *) dst->data;   // [n, k, B1, B2]
+    const float * A = (const float *) src0->data;
+    const float * B = (const float *) src1->data;
+          float * X = (      float *) dst->data;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i03 = ir/(ne02*k);
@@ -10745,19 +10743,30 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params 
 
         const float * A_batch = A + i02 * nb02 / sizeof(float) + i03 * nb03 / sizeof(float);
         const float * B_batch = B + i02 * nb12 / sizeof(float) + i03 * nb13 / sizeof(float);
+              float * X_batch = X + i02 * nb2  / sizeof(float) + i03 * nb3  / sizeof(float);
 
-        float * X_batch = X + i02 * nb2 / sizeof(float) + i03 * nb3 / sizeof(float);
+        if (dst->op == GGML_OP_SOLVE_TRI) {
+            for (int64_t row = 0; row < n; ++row) {
+                float sum = 0.0f;
+                for (int64_t col = 0; col < row; ++col) {
+                    sum += A_batch[row * n + col] * X_batch[col * k + i01];
+                }
 
-        for (int64_t i00 = 0; i00 < n; ++i00) {
-            float sum = 0.0f;
-            for (int64_t t = 0; t < i00; ++t) {
-                sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+                const float diag = A_batch[row * n + row];
+                GGML_ASSERT(diag != 0.0f);
+                X_batch[row * k + i01] = (B_batch[row * k + i01] - sum) / diag;
             }
+        } else {
+            for (int64_t row = n - 1; row >= 0; --row) {
+                float sum = 0.0f;
+                for (int64_t col = row + 1; col < n; ++col) {
+                    sum += A_batch[col * n + row] * X_batch[col * k + i01];
+                }
 
-            const float diag = A_batch[i00 * n + i00];
-            assert(diag != 0.0f && "Zero diagonal in triangular matrix");
-
-            X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / diag;
+                const float diag = A_batch[row * n + row];
+                GGML_ASSERT(diag != 0.0f);
+                X_batch[row * k + i01] = (B_batch[row * k + i01] - sum) / diag;
+            }
         }
     }
 }

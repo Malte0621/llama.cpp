@@ -41,6 +41,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
                                  size_t                      s13,
                                  size_t                      s2,
                                  size_t                      s3,
+                                 bool                        transpose,
                                  cudaStream_t                stream) {
     const float   alpha         = 1.0f;
     const int64_t total_batches = ne02 * ne03;
@@ -69,8 +70,9 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
 
     // Yes, this is necessary, without this we get RMSE errors
     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_DEFAULT_MATH));
-    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(id), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
-                                    CUBLAS_DIAG_NON_UNIT, k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
+    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(id), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
+                                    transpose ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                                    k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
 
     // revert to standard mode from common.cuh
     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_TF32_TENSOR_OP_MATH));
@@ -100,7 +102,8 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
                                           const size_t nb2,
                                           const size_t nb3,
                                           const int    n_arg,
-                                          const int    k_arg) {
+                                          const int    k_arg,
+                                          const bool   transpose) {
     const int n = n_template == 0 ? n_arg : n_template;
     const int k = k_template == 0 ? k_arg : k_template;
 
@@ -140,30 +143,63 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
     const int half      = WARP_SIZE;
     const int nrows_low = (n < half) ? n : half;
 
+    if (!transpose) {
 #pragma unroll
-    for (int row = 0; row < nrows_low; ++row) {
-        float sum = 0.0f;
-        if (lane < row) {
-            sum += sA[row * n + lane] * x_low;
-        }
-        sum = warp_reduce_sum(sum);
+        for (int row = 0; row < nrows_low; ++row) {
+            float sum = 0.0f;
+            if (lane < row) {
+                sum += sA[row * n + lane] * x_low;
+            }
+            sum = warp_reduce_sum(sum);
 
-        if (lane == row) {
-            x_low = (x_low - sum) / sA[row * n + row];
+            if (lane == row) {
+                x_low = (x_low - sum) / sA[row * n + row];
+            }
         }
-    }
 
 #pragma unroll
-    for (int row = half; row < n; ++row) {
-        float     sum = sA[row * n + lane] * x_low;
-        const int j   = half + lane;
-        if (j < row) {
-            sum += sA[row * n + j] * x_high;
-        }
-        sum = warp_reduce_sum(sum);
+        for (int row = half; row < n; ++row) {
+            float     sum = sA[row * n + lane] * x_low;
+            const int j   = half + lane;
+            if (j < row) {
+                sum += sA[row * n + j] * x_high;
+            }
+            sum = warp_reduce_sum(sum);
 
-        if (lane == row - half) {
-            x_high = (x_high - sum) / sA[row * n + row];
+            if (lane == row - half) {
+                x_high = (x_high - sum) / sA[row * n + row];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int row = n - 1; row >= half; --row) {
+            float     sum = 0.0f;
+            const int j   = half + lane;
+            if (j > row && j < n) {
+                sum += sA[j * n + row] * x_high;
+            }
+            sum = warp_reduce_sum(sum);
+
+            if (lane == row - half) {
+                x_high = (x_high - sum) / sA[row * n + row];
+            }
+        }
+
+#pragma unroll
+        for (int row = nrows_low - 1; row >= 0; --row) {
+            float sum = 0.0f;
+            if (lane > row && lane < nrows_low) {
+                sum += sA[lane * n + row] * x_low;
+            }
+            const int j = half + lane;
+            if (j < n) {
+                sum += sA[j * n + row] * x_high;
+            }
+            sum = warp_reduce_sum(sum);
+
+            if (lane == row) {
+                x_low = (x_low - sum) / sA[row * n + row];
+            }
         }
     }
 
@@ -193,6 +229,7 @@ static void solve_tri_f32_cuda(const float * A,
                                size_t        nb13,
                                size_t        nb2,
                                size_t        nb3,
+                               bool          transpose,
                                cudaStream_t  stream) {
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
     dim3        threads(WARP_SIZE, k);
@@ -201,75 +238,77 @@ static void solve_tri_f32_cuda(const float * A,
         switch (k) {
             case 32:
                 solve_tri_f32_fast<64, 32>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 16:
                 solve_tri_f32_fast<64, 16>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 14:
                 solve_tri_f32_fast<64, 14>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 12:
                 solve_tri_f32_fast<64, 12>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 10:
                 solve_tri_f32_fast<64, 10>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 8:
                 solve_tri_f32_fast<64, 8>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 6:
                 solve_tri_f32_fast<64, 6>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 4:
                 solve_tri_f32_fast<64, 4>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 2:
                 solve_tri_f32_fast<64, 2>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             case 1:
                 solve_tri_f32_fast<64, 1>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, 0, 0, transpose);
                 break;
             default:
                 solve_tri_f32_fast<0, 0>
-                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, n, k);
+                    <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, n, k, transpose);
         }
-    } else {  // run general case
+    } else {
         solve_tri_f32_fast<0, 0>
-            <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, n, k);
+            <<<grid, threads, 0, stream>>>(A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, n, k, transpose);
     }
 }
 
 void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];  // A (n×n, lower triangular)
-    const ggml_tensor * src1 = dst->src[1];  // B (n×k)
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
 
-    ggml_is_contiguous(src0);
-    ggml_is_contiguous(src1);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(dst->op == GGML_OP_SOLVE_TRI || dst->op == GGML_OP_SOLVE_TRI_BACK);
 
-    const int64_t n    = src0->ne[0];
-    const int64_t k    = src1->ne[0];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
+    const int64_t n         = src0->ne[0];
+    const int64_t k         = src1->ne[0];
+    const int64_t ne02      = src0->ne[2];
+    const int64_t ne03      = src0->ne[3];
+    const bool    transpose = dst->op == GGML_OP_SOLVE_TRI_BACK;
 
     if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
         solve_tri_f32_cuda((const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                            src0->ne[2], src0->ne[3], src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
-                           dst->nb[3] / sizeof(float), ctx.stream());
+                           dst->nb[3] / sizeof(float), transpose, ctx.stream());
     } else {
         solve_tri_f32_cublas(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                              ne02, ne03, src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
-                             dst->nb[3] / sizeof(float), ctx.stream());
+                             dst->nb[3] / sizeof(float), transpose, ctx.stream());
     }
 }
