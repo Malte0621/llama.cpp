@@ -512,6 +512,35 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         return true;
     };
+    auto split_states_proportional = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
+        if (a.axis != b.axis) {
+            return false;
+        }
+        std::vector<int64_t> sums_a(n_bufs, 0);
+        std::vector<int64_t> sums_b(n_bufs, 0);
+        int64_t total_a = 0;
+        int64_t total_b = 0;
+        for (size_t j = 0; j < n_bufs; ++j) {
+            for (size_t s = 0; s < a.n_segments; ++s) {
+                sums_a[j] += a.ne[s*n_bufs + j]*a.nr[s];
+            }
+            for (size_t s = 0; s < b.n_segments; ++s) {
+                sums_b[j] += b.ne[s*n_bufs + j]*b.nr[s];
+            }
+            total_a += sums_a[j];
+            total_b += sums_b[j];
+        }
+        if (total_a == 0 || total_b == 0) {
+            return total_a == total_b;
+        }
+        for (size_t j = 0; j < n_bufs; ++j) {
+            if (sums_a[j]*total_b != sums_b[j]*total_a) {
+                return false;
+            }
+        }
+        return true;
+    };
+
 
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
@@ -593,7 +622,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
             src_ss[0].axis < GGML_MAX_DIMS &&
             src_ss[0].axis == src_ss[1].axis) {
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            GGML_ASSERT(split_states_proportional(src_ss[0], src_ss[1]));
+            const int axis = src_ss[0].axis;
+            if (tensor->src[1]->ne[axis] == tensor->ne[axis]) {
+                return src_ss[1];
+            }
+            GGML_ASSERT(tensor->src[0]->ne[axis] == tensor->ne[axis]);
             return src_ss[0];
         }
         GGML_ABORT(
