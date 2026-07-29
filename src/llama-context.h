@@ -233,6 +233,7 @@ struct llama_context {
 
     llama_nanoquant_optimizer * nanoquant_optimizer_init(
             llama_nanoquant_opt_loss loss,
+            int32_t block_begin,
             int32_t block,
             const std::vector<llama_nanoquant_opt_param> & params,
             uint64_t step,
@@ -247,6 +248,8 @@ struct llama_context {
             llama_batch & batch,
             const llama_token * tokens,
             int32_t n_tokens,
+            const float * input_states,
+            size_t n_input_states,
             const float * labels,
             size_t n_labels,
             const llama_token * sparse_labels,
@@ -258,12 +261,17 @@ struct llama_context {
     std::vector<std::vector<float>> nanoquant_optimizer_output_importance(
             const llama_nanoquant_optimizer * optimizer) const;
 
-    // forward-only evaluation that stops after transformer block `block`, so activation
-    // collection does not pay for the layers above it. the eval callback still fires.
-    void nanoquant_forward_block(
+    // forward-only evaluation of transformer blocks [block_begin, block]. the layers outside
+    // that window are dropped from the graph, so neither their weights nor their compute are
+    // touched. when block_begin is 0 the window starts from `tokens`, otherwise it starts from
+    // `input_states`, the hidden states that block_begin consumes. the eval callback still fires.
+    void nanoquant_forward_window(
             llama_batch & batch,
             const llama_token * tokens,
+            const float * input_states,
+            size_t n_input_states,
             int32_t n_tokens,
+            int32_t block_begin,
             int32_t block);
 
 private:
@@ -428,9 +436,12 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // the block the cached nanoquant_forward_block graph stops at, -1 when there is none
+    // the window the cached nanoquant_forward_window graph covers, block -1 when there is none
     int32_t       nanoquant_fwd_block  = -1;
+    int32_t       nanoquant_fwd_begin  = 0;
     ggml_tensor * nanoquant_fwd_output = nullptr;
+    ggml_tensor * nanoquant_fwd_prev   = nullptr;
+    ggml_tensor * nanoquant_fwd_input  = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

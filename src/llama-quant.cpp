@@ -2511,6 +2511,58 @@ static bool block_output_callback(ggml_tensor * tensor, bool ask, void * user_da
     return static_cast<block_output_collector *>(user_data)->collect(tensor, ask);
 }
 
+// the hidden states one transformer block consumes, one entry per calibration sample
+using block_states = std::vector<std::vector<float>>;
+
+static const float * window_input(
+        const block_states & input_states,
+        int block_begin,
+        int32_t sample) {
+    if (block_begin <= 0) {
+        return nullptr;
+    }
+    if (size_t(sample) >= input_states.size() || input_states[size_t(sample)].empty()) {
+        throw std::runtime_error(format(
+                "NanoQuant: block %d has no recorded input hidden states for sample %d",
+                block_begin, sample));
+    }
+    return input_states[size_t(sample)].data();
+}
+
+static size_t window_input_size(
+        const block_states & input_states,
+        int block_begin,
+        int32_t sample) {
+    return block_begin <= 0 ? 0 : input_states[size_t(sample)].size();
+}
+
+// evaluates blocks [block_begin, block] only. the blocks below the window are replaced by the
+// hidden states recorded at the previous window, so their weights are never touched
+static void forward_block_window(
+        llama_context * context,
+        int block_begin,
+        int block,
+        const llama_token * tokens,
+        int32_t n_tokens,
+        const block_states & input_states,
+        int32_t sample,
+        llama_batch & batch) {
+    const float * states = nullptr;
+    size_t n_states = 0;
+    if (block_begin > 0) {
+        if (size_t(sample) >= input_states.size() ||
+            input_states[size_t(sample)].empty()) {
+            throw std::runtime_error(format(
+                    "NanoQuant: block %d has no recorded input hidden states for sample %d",
+                    block_begin, sample));
+        }
+        states = input_states[size_t(sample)].data();
+        n_states = input_states[size_t(sample)].size();
+    }
+    context->nanoquant_forward_window(
+            batch, tokens, states, n_states, n_tokens, block_begin, block);
+}
+
 static size_t calibration_sample_stride(const llama_model_quantize_params * params) {
     return size_t(params->nanoquant_sequence_length) + 1;
 }
@@ -2730,7 +2782,7 @@ static std::vector<std::vector<float>> collect_output_importance(
         std::unique_ptr<llama_nanoquant_optimizer, std::function<void(llama_nanoquant_optimizer *)>>
                 optimizer(
                         context->nanoquant_optimizer_init(
-                                llama_nanoquant_opt_loss::CROSS_ENTROPY, -1,
+                                llama_nanoquant_opt_loss::CROSS_ENTROPY, 0, -1,
                                 {}, 0, targets),
                         [context](llama_nanoquant_optimizer * value) {
                             context->nanoquant_optimizer_free(value);
@@ -2741,6 +2793,7 @@ static std::vector<std::vector<float>> collect_output_importance(
             context->nanoquant_optimizer_step(
                     optimizer.get(), batch, tokens,
                     params->nanoquant_sequence_length,
+                    nullptr, 0,
                     nullptr, 0, tokens + 1,
                     params->nanoquant_sequence_length,
                     nullptr, 0, 1.0f);
@@ -2777,7 +2830,9 @@ static std::vector<std::vector<calibration_data>> collect_projections(
         const std::vector<bool> & reachable,
         size_t block_begin,
         size_t block_end,
+        int window_begin,
         const std::vector<llama_token> & samples,
+        const block_states & input_states,
         const std::vector<std::vector<float>> & output_importance,
         const llama_model_quantize_params * params,
         llama_batch & batch) {
@@ -2815,15 +2870,16 @@ static std::vector<std::vector<calibration_data>> collect_projections(
         }
     }
 
-    const int32_t block = groups[block_begin].block;
+    const int block = groups[block_begin].block;
     for (int32_t sample = 0; sample < params->nanoquant_sample_count; ++sample) {
         const llama_token * tokens = calibration_sample(samples, sample, params);
         for (calibration_collector * collector : collector_set.active) {
             collector->begin_evaluation();
         }
-        // every collected projection lives in this block, so the layers above it are pure
-        // overhead - and they are the ones that fall back to the host on a large model
-        context->nanoquant_forward_block(batch, tokens, sequence_length, block);
+        // every collected projection lives in this block, so only the window has to run
+        forward_block_window(
+                context, window_begin, block, tokens, sequence_length,
+                input_states, sample, batch);
     }
 
     collector_set.active.clear();
@@ -3955,22 +4011,16 @@ static void get_training_tensor(const ggml_tensor * tensor, std::vector<float> &
 static std::vector<float> collect_block_target(
         llama_context * teacher,
         block_output_collector & collector,
+        int block_begin,
         int block,
         const llama_token * tokens,
         int32_t n_tokens,
+        const block_states & input_states,
+        int32_t sample,
         llama_batch & batch) {
-    batch.n_tokens = n_tokens;
-    for (int32_t token = 0; token < n_tokens; ++token) {
-        batch.token[token] = tokens[token];
-        batch.pos[token] = token;
-        batch.n_seq_id[token] = 1;
-        batch.seq_id[token][0] = 0;
-        batch.logits[token] = true;
-    }
     collector.reset(block);
-    // only the layers up to this block matter, and stopping there keeps the pass on the
-    // devices that hold them instead of dragging it through the host-resident tail
-    teacher->nanoquant_forward_block(batch, tokens, n_tokens, block);
+    forward_block_window(
+            teacher, block_begin, block, tokens, n_tokens, input_states, sample, batch);
     return collector.finish();
 }
 
@@ -3982,8 +4032,10 @@ struct block_training_data {
 static block_training_data collect_block_training_data(
         llama_context * teacher,
         block_output_collector & collector,
+        int block_begin,
         int block,
         const std::vector<llama_token> & samples,
+        const block_states & input_states,
         const llama_model_quantize_params * params) {
     block_training_data result;
     result.targets.reserve(params->nanoquant_sample_count);
@@ -3993,8 +4045,8 @@ static block_training_data collect_block_training_data(
     for (int32_t sample = 0; sample < params->nanoquant_sample_count; ++sample) {
         const llama_token * tokens = calibration_sample(samples, sample, params);
         std::vector<float> target = collect_block_target(
-                teacher, collector, block, tokens,
-                params->nanoquant_sequence_length, batch.value);
+                teacher, collector, block_begin, block, tokens,
+                params->nanoquant_sequence_length, input_states, sample, batch.value);
         if (target.size() % size_t(params->nanoquant_sequence_length) != 0) {
             throw std::runtime_error("NanoQuant: block target shape mismatch");
         }
@@ -4056,6 +4108,8 @@ static void run_nonfactor_reconstruction(
         const group & item,
         const std::vector<llama_token> & samples,
         const block_training_data & training_data,
+        int window_begin,
+        const block_states & input_states,
         const llama_model_quantize_params * params,
         llama_model * student_model,
         llama_context * student_context,
@@ -4114,7 +4168,7 @@ static void run_nonfactor_reconstruction(
     }};
     std::unique_ptr<llama_nanoquant_optimizer, std::function<void(llama_nanoquant_optimizer *)>> optimizer(
             student_context->nanoquant_optimizer_init(
-                    llama_nanoquant_opt_loss::MSE, item.block,
+                    llama_nanoquant_opt_loss::MSE, window_begin, item.block,
                     opt_params, state.optimizer_step),
             [student_context](llama_nanoquant_optimizer * value) {
                 student_context->nanoquant_optimizer_free(value);
@@ -4135,6 +4189,8 @@ static void run_nonfactor_reconstruction(
                 loss_sum += student_context->nanoquant_optimizer_step(
                         optimizer.get(), batch.value, tokens,
                         params->nanoquant_sequence_length,
+                        window_input(input_states, window_begin, sample),
+                        window_input_size(input_states, window_begin, sample),
                         target.data(), target.size(),
                         nullptr, 0,
                         training_data.loss_weights.data(),
@@ -4203,6 +4259,8 @@ static void run_factor_reconstruction(
         const group & item,
         const std::vector<llama_token> & samples,
         const block_training_data & training_data,
+        int window_begin,
+        const block_states & input_states,
         const llama_model_quantize_params * params,
         const std::filesystem::path & checkpoint_directory,
         const hash256 & source_hash,
@@ -4285,7 +4343,8 @@ static void run_factor_reconstruction(
     };
     std::unique_ptr<llama_nanoquant_optimizer, std::function<void(llama_nanoquant_optimizer *)>> optimizer(
             student_context->nanoquant_optimizer_init(
-                    llama_nanoquant_opt_loss::MSE, item.block, opt_params, state.optimizer_step),
+                    llama_nanoquant_opt_loss::MSE, window_begin, item.block,
+                    opt_params, state.optimizer_step),
             [student_context](llama_nanoquant_optimizer * value) {
                 student_context->nanoquant_optimizer_free(value);
             });
@@ -4305,6 +4364,8 @@ static void run_factor_reconstruction(
                 loss_sum += student_context->nanoquant_optimizer_step(
                         optimizer.get(), batch.value, tokens,
                         params->nanoquant_sequence_length,
+                        window_input(input_states, window_begin, sample),
+                        window_input_size(input_states, window_begin, sample),
                         target.data(), target.size(),
                         nullptr, 0,
                         training_data.loss_weights.data(),
@@ -4936,7 +4997,7 @@ static void run_model_scale_kl(
     };
     std::unique_ptr<llama_nanoquant_optimizer, std::function<void(llama_nanoquant_optimizer *)>> optimizer(
             student_context->nanoquant_optimizer_init(
-                    llama_nanoquant_opt_loss::CROSS_ENTROPY, -1,
+                    llama_nanoquant_opt_loss::CROSS_ENTROPY, 0, -1,
                     opt_params, optimizer_step),
             [student_context](llama_nanoquant_optimizer * value) {
                 student_context->nanoquant_optimizer_free(value);
@@ -4956,6 +5017,7 @@ static void run_model_scale_kl(
                 loss_sum += student_context->nanoquant_optimizer_step(
                         optimizer.get(), batch.value, tokens,
                         params->nanoquant_sequence_length,
+                        nullptr, 0,
                         probabilities.data(), probabilities.size(),
                         nullptr, 0,
                         nullptr, 0,
@@ -6310,6 +6372,10 @@ static void quantize(
             "NanoQuant: source and reconstructed weights use disjoint residency phases; "
             "optimizer parameters are allocated one group at a time\n");
 
+    // the window starts at the first block that still needs work and advances with it; the
+    // blocks below it are replayed from recorded hidden states instead of recomputed
+    int window_begin = 0;
+    block_states hidden_states;
     for (size_t block_begin = first_block; block_begin < groups.size();) {
         size_t block_end = block_begin + 1;
         while (block_end < groups.size() &&
@@ -6330,19 +6396,19 @@ static void quantize(
         if (reconstruct_block) {
             const int block = groups[block_begin].block;
             LLAMA_LOG_INFO(
-                    "NanoQuant: block %d runs on %s (layers 0-%d of the source model)\n",
+                    "NanoQuant: block %d runs on %s (window covers blocks %d-%d)\n",
                     block,
                     ggml_backend_dev_name(llama_model_get_device(teacher.get(), block)),
-                    block);
+                    window_begin, block);
             training_data = collect_block_training_data(
                     block_context.get(), block_collector,
-                    groups[block_begin].block, samples, params);
+                    window_begin, block, samples, hidden_states, params);
             const auto projection_start = std::chrono::steady_clock::now();
             calibrations = collect_projections(
                     projection_context.get(), collector_set, groups, model_states,
                     projection_reachable,
-                    block_begin, block_end, samples, output_importance,
-                    params, projection_batch.value);
+                    block_begin, block_end, window_begin, samples, hidden_states,
+                    output_importance, params, projection_batch.value);
             const auto projection_end = std::chrono::steady_clock::now();
             LLAMA_LOG_INFO(
                     "NanoQuant profile: block %d activation collection=%.3fs targets=%zu\n",
@@ -6399,7 +6465,8 @@ static void quantize(
                 const auto nonfactor_start = std::chrono::steady_clock::now();
                 if (reachable && item.n_expert == 1) {
                     run_nonfactor_reconstruction(
-                            backend, item, samples, training_data, params, teacher.get(),
+                            backend, item, samples, training_data,
+                            window_begin, hidden_states, params, teacher.get(),
                             block_context.get(), block_collector, state);
                 } else if (state.stage < checkpoint_stage::ADMM) {
                     state.stage = checkpoint_stage::NONFACTOR;
@@ -6423,7 +6490,8 @@ static void quantize(
                 run_admm(backend, item, *calibration, params, state);
                 const auto factor_start = std::chrono::steady_clock::now();
                 run_factor_reconstruction(
-                        backend, item, samples, training_data, params,
+                        backend, item, samples, training_data,
+                        window_begin, hidden_states, params,
                         checkpoint_directory, source_hash, config_hash,
                         teacher.get(), block_context.get(), block_collector,
                         item.n_expert > 1 || !reachable || calibration->repeated_use, state);
@@ -6455,6 +6523,13 @@ static void quantize(
                 checkpoint_directory, groups[block_begin].block, source_hash, config_hash);
         LLAMA_LOG_INFO(
                 "NanoQuant: completed block %d checkpoint\n", groups[block_begin].block);
+        if (reconstruct_block) {
+            // this block's teacher output is the next window's input, so the layers below it
+            // never run again. skipped blocks keep window_begin where it is, which folds them
+            // into the next window that actually needs them
+            hidden_states = std::move(training_data.targets);
+            window_begin  = groups[block_begin].block + 1;
+        }
         block_begin = block_end;
     }
 

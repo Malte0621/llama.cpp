@@ -1332,8 +1332,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    // a cached nanoquant_forward_block graph stops at a block and has no logits, so it can
-    // never be reused for a decode even when can_reuse() says the parameters match
+    // a cached nanoquant_forward_window graph covers part of the model and has no logits, so
+    // it can never be reused for a decode even when can_reuse() says the parameters match
     if (nanoquant_fwd_block < 0 && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1348,6 +1348,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         nanoquant_fwd_block  = -1;
         nanoquant_fwd_output = nullptr;
+        nanoquant_fwd_prev   = nullptr;
+        nanoquant_fwd_input  = nullptr;
 
         res->reset();
 
@@ -3281,6 +3283,8 @@ struct llama_nanoquant_optimizer {
     size_t n_labels = 0;
     llama_nanoquant_opt_loss loss;
     int32_t block;
+    int32_t block_begin = 0;
+    ggml_tensor * input_tensor = nullptr;
     std::vector<llama_nanoquant_opt_param> params;
     uint64_t step;
     float learning_rate_scale = 1.0f;
@@ -3331,6 +3335,7 @@ static ggml_opt_optimizer_params nanoquant_get_optimizer_params(void * userdata)
 
 llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
         llama_nanoquant_opt_loss loss,
+        int32_t block_begin,
         int32_t block,
         const std::vector<llama_nanoquant_opt_param> & params,
         uint64_t step,
@@ -3340,6 +3345,10 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
     }
     if (loss == llama_nanoquant_opt_loss::MSE && block < 0) {
         throw std::runtime_error("NanoQuant: block MSE requires a block index");
+    }
+    if (block_begin < 0 || (block >= 0 && block_begin > block) ||
+        (block < 0 && block_begin != 0)) {
+        throw std::runtime_error("NanoQuant: invalid optimizer block window");
     }
     if (loss == llama_nanoquant_opt_loss::CROSS_ENTROPY && block >= 0) {
         throw std::runtime_error("NanoQuant: full-model cross entropy cannot target a block");
@@ -3364,6 +3373,8 @@ llama_nanoquant_optimizer * llama_context::nanoquant_optimizer_init(
         /*.n_labels    =*/ 0,
         /*.loss       =*/ loss,
         /*.block      =*/ block,
+        /*.block_begin =*/ block_begin,
+        /*.input_tensor =*/ nullptr,
         /*.params     =*/ params,
         /*.step       =*/ step,
         /*.learning_rate_scale =*/ 1.0f,
@@ -3462,6 +3473,8 @@ float llama_context::nanoquant_optimizer_step(
         llama_batch & batch,
         const llama_token * tokens,
         int32_t n_tokens,
+        const float * input_states,
+        size_t n_input_states,
         const float * labels,
         size_t n_labels,
         const llama_token * sparse_labels,
@@ -3477,7 +3490,8 @@ float llama_context::nanoquant_optimizer_step(
         (!sparse && n_sparse_labels != 0) ||
         (sparse && (optimizer->loss != llama_nanoquant_opt_loss::CROSS_ENTROPY ||
                     n_labels != 0 || n_sparse_labels != size_t(n_tokens))) ||
-        (output_weights == nullptr) != (n_output_weights == 0)) {
+        (output_weights == nullptr) != (n_output_weights == 0) ||
+        (optimizer->block_begin > 0) != (input_states != nullptr)) {
         throw std::runtime_error("NanoQuant: invalid optimizer step");
     }
 
@@ -3522,24 +3536,34 @@ float llama_context::nanoquant_optimizer_step(
     gparams.cparams.auto_fhc = false;
     if (optimizer->opt_ctx == nullptr) {
         ggml_tensor * block_output = nullptr;
+        ggml_tensor * window_input = nullptr;
         if (optimizer->block >= 0) {
             const llm_graph_cb base_callback = gparams.cb;
             const int32_t block = optimizer->block;
-            gparams.cb = [base_callback, block, &block_output](
+            const int32_t block_begin = optimizer->block_begin;
+            gparams.cb = [base_callback, block, block_begin, &block_output, &window_input](
                     const llama_ubatch & callback_ubatch,
                     ggml_tensor * tensor,
                     const char * name,
                     int il) {
                 base_callback(callback_ubatch, tensor, name, il);
-                if (il == block && strcmp(name, "l_out") == 0) {
+                if (strcmp(name, "l_out") != 0) {
+                    return;
+                }
+                if (il == block) {
                     block_output = tensor;
+                }
+                if (block_begin > 0 && il == block_begin - 1) {
+                    window_input = tensor;
                 }
             };
         }
 
-        // this takes over gf_res_prev, so any cached nanoquant_forward_block graph is gone
+        // this takes over gf_res_prev, so any cached nanoquant_forward_window graph is gone
         nanoquant_fwd_block  = -1;
         nanoquant_fwd_output = nullptr;
+        nanoquant_fwd_prev   = nullptr;
+        nanoquant_fwd_input  = nullptr;
 
         res->reset();
         ggml_backend_sched_reset(sched.get());
@@ -3603,6 +3627,42 @@ float llama_context::nanoquant_optimizer_step(
                 return 0.0f;
             }
         }
+        if (optimizer->block_begin > 0) {
+            if (window_input == nullptr) {
+                throw std::runtime_error(format(
+                        "NanoQuant: block %d has no output in the source graph",
+                        optimizer->block_begin - 1));
+            }
+            if (window_input->type != GGML_TYPE_F32) {
+                throw std::runtime_error(format(
+                        "NanoQuant: block %d produces %s hidden states, which cannot be replayed",
+                        optimizer->block_begin - 1, ggml_type_name(window_input->type)));
+            }
+            // the trained block is reconstructed independently, so replay its recorded input
+            // instead of recomputing the blocks below it on every step
+            optimizer->input_tensor = ggml_new_tensor(
+                    res->get_ctx(), GGML_TYPE_F32, GGML_MAX_DIMS, window_input->ne);
+            if (optimizer->input_tensor == nullptr) {
+                throw std::runtime_error("NanoQuant: failed to allocate the window input tensor");
+            }
+            ggml_set_input(optimizer->input_tensor);
+            ggml_set_name(optimizer->input_tensor, "nanoquant_window_input");
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node == optimizer->input_tensor) {
+                    continue;
+                }
+                for (ggml_tensor *& src : node->src) {
+                    if (src == window_input) {
+                        src = optimizer->input_tensor;
+                    }
+                }
+                if (node->view_src == window_input) {
+                    node->view_src = optimizer->input_tensor;
+                }
+            }
+        }
+
         std::vector<ggml_tensor *> graph_inputs;
         if (optimizer->block >= 0) {
             std::vector<ggml_tensor *> pending;
@@ -3739,6 +3799,16 @@ float llama_context::nanoquant_optimizer_step(
         optimizer->moments_initialized = true;
     }
     res->set_inputs(&ubatch);
+    if (optimizer->input_tensor != nullptr) {
+        if (n_input_states != size_t(ggml_nelements(optimizer->input_tensor))) {
+            throw std::runtime_error(format(
+                    "NanoQuant: block %d expects %" PRId64 " hidden states, got %zu",
+                    optimizer->block_begin,
+                    ggml_nelements(optimizer->input_tensor), n_input_states));
+        }
+        ggml_backend_tensor_set(
+                optimizer->input_tensor, input_states, 0, n_input_states*sizeof(float));
+    }
     if (optimizer->weight_tensor != nullptr) {
         ggml_backend_tensor_set(
                 optimizer->weight_tensor, output_weights, 0,
@@ -3911,14 +3981,19 @@ std::vector<std::vector<float>> llama_context::nanoquant_optimizer_output_import
     return result;
 }
 
-void llama_context::nanoquant_forward_block(
+void llama_context::nanoquant_forward_window(
         llama_batch & batch,
         const llama_token * tokens,
+        const float * input_states,
+        size_t n_input_states,
         int32_t n_tokens,
+        int32_t block_begin,
         int32_t block) {
     if (tokens == nullptr || n_tokens <= 0 || block < 0 ||
+        block_begin < 0 || block_begin > block ||
+        (block_begin > 0) != (input_states != nullptr) ||
         uint32_t(n_tokens) > n_batch() || uint32_t(n_tokens) > n_ubatch()) {
-        throw std::runtime_error("NanoQuant: invalid block forward request");
+        throw std::runtime_error("NanoQuant: invalid block window forward request");
     }
 
     memory->clear(true);
@@ -3963,18 +4038,27 @@ void llama_context::nanoquant_forward_block(
     gparams.cparams.fused_dsv4_hc_post  = false;
     gparams.cparams.auto_fhc            = false;
 
-    if (nanoquant_fwd_block != block || graph_reuse_disable || !res->can_reuse(gparams)) {
+    if (nanoquant_fwd_block != block || nanoquant_fwd_begin != block_begin ||
+        graph_reuse_disable || !res->can_reuse(gparams)) {
         const llm_graph_cb base_callback = gparams.cb;
         nanoquant_fwd_output = nullptr;
+        nanoquant_fwd_prev   = nullptr;
+        nanoquant_fwd_input  = nullptr;
         nanoquant_fwd_block  = -1;
-        gparams.cb = [base_callback, block, this](
+        gparams.cb = [base_callback, block, block_begin, this](
                 const llama_ubatch & callback_ubatch,
                 ggml_tensor * tensor,
                 const char * name,
                 int il) {
             base_callback(callback_ubatch, tensor, name, il);
-            if (il == block && strcmp(name, "l_out") == 0) {
+            if (strcmp(name, "l_out") != 0) {
+                return;
+            }
+            if (il == block) {
                 nanoquant_fwd_output = tensor;
+            }
+            if (block_begin > 0 && il == block_begin - 1) {
+                nanoquant_fwd_prev = tensor;
             }
         };
 
@@ -3989,6 +4073,41 @@ void llama_context::nanoquant_forward_block(
         if (nanoquant_fwd_output == nullptr) {
             throw std::runtime_error(format(
                     "NanoQuant: block %d has no output in the source graph", block));
+        }
+
+        if (block_begin > 0) {
+            if (nanoquant_fwd_prev == nullptr) {
+                throw std::runtime_error(format(
+                        "NanoQuant: block %d has no output in the source graph", block_begin - 1));
+            }
+            if (nanoquant_fwd_prev->type != GGML_TYPE_F32) {
+                throw std::runtime_error(format(
+                        "NanoQuant: block %d produces %s hidden states, which cannot be replayed",
+                        block_begin - 1, ggml_type_name(nanoquant_fwd_prev->type)));
+            }
+            // the window starts mid-model, so feed it the recorded hidden states instead of
+            // the ones the dropped layers would have produced
+            nanoquant_fwd_input = ggml_new_tensor(
+                    res->get_ctx(), GGML_TYPE_F32, GGML_MAX_DIMS, nanoquant_fwd_prev->ne);
+            if (nanoquant_fwd_input == nullptr) {
+                throw std::runtime_error("NanoQuant: failed to allocate the window input tensor");
+            }
+            ggml_set_input(nanoquant_fwd_input);
+            ggml_set_name(nanoquant_fwd_input, "nanoquant_window_input");
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node == nanoquant_fwd_input) {
+                    continue;
+                }
+                for (ggml_tensor *& src : node->src) {
+                    if (src == nanoquant_fwd_prev) {
+                        src = nanoquant_fwd_input;
+                    }
+                }
+                if (node->view_src == nanoquant_fwd_prev) {
+                    node->view_src = nanoquant_fwd_input;
+                }
+            }
         }
 
         // every input has to stay in the graph so that set_inputs still finds it allocated
@@ -4020,8 +4139,8 @@ void llama_context::nanoquant_forward_block(
             }
         }
 
-        // drop the layers above the collected block - none of their activations are used
-        // and on a partially offloaded model they are the ones that fall back to the host
+        // keep only the window: everything outside it is unreachable now, so neither its
+        // weights nor its compute reach the scheduler
         ggml_graph_clear(gf);
         for (ggml_tensor * input : graph_inputs) {
             ggml_build_forward_expand(gf, input);
@@ -4029,19 +4148,31 @@ void llama_context::nanoquant_forward_block(
         ggml_build_forward_expand(gf, nanoquant_fwd_output);
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            throw std::runtime_error("NanoQuant: failed to allocate the block forward graph");
+            throw std::runtime_error("NanoQuant: failed to allocate the block window graph");
         }
         nanoquant_fwd_block = block;
+        nanoquant_fwd_begin = block_begin;
     } else if (cparams.pipeline_parallel) {
         ggml_backend_sched_synchronize(sched.get());
     }
 
     res->set_inputs(&ubatch);
 
+    if (nanoquant_fwd_input != nullptr) {
+        if (n_input_states != size_t(ggml_nelements(nanoquant_fwd_input))) {
+            throw std::runtime_error(format(
+                    "NanoQuant: block %d expects %" PRId64 " hidden states, got %zu",
+                    block_begin, ggml_nelements(nanoquant_fwd_input), n_input_states));
+        }
+        ggml_backend_tensor_set(
+                nanoquant_fwd_input, input_states, 0, n_input_states*sizeof(float));
+    }
+
     const ggml_status status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         throw std::runtime_error(format(
-                "NanoQuant: the block %d forward pass failed (status %d)", block, int(status)));
+                "NanoQuant: the block %d-%d forward pass failed (status %d)",
+                block_begin, block, int(status)));
     }
     ggml_backend_sched_synchronize(sched.get());
 }
