@@ -5878,6 +5878,16 @@ static void quantize(
     std::vector<group> groups = find_groups(loader, params->allow_requantize);
     const std::vector<const llama_model_loader::llama_tensor_weight *> weights =
             ordered_weights(loader);
+    for (const auto * weight : weights) {
+        const ggml_tensor * tensor = weight->tensor;
+        if (tensor->ne[2] > 1 && ggml_is_quantized(tensor->type)) {
+            throw std::runtime_error(format(
+                    "NanoQuant: source expert tensor '%s' is %s; block training differentiates through "
+                    "mul_mat_id, which cannot transpose a block-quantized weight - convert the source model "
+                    "to F32/F16/BF16 first",
+                    ggml_get_name(tensor), ggml_type_name(tensor->type)));
+        }
+    }
     std::unordered_map<std::string, size_t> group_by_name;
     group_by_name.reserve(groups.size());
     for (size_t i = 0; i < groups.size(); ++i) {

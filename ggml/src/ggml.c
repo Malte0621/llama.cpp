@@ -7389,6 +7389,8 @@ static void ggml_compute_backward(
         case GGML_OP_MUL_MAT_ID: {
             GGML_ASSERT(!src0_needs_grads && !src2_needs_grads);
             if (src1_needs_grads) {
+                // src0 has to be transposed, which a block-quantized layout cannot represent
+                GGML_ASSERT(!ggml_is_quantized(src0->type) && "backward pass not implemented for quantized mul_mat_id weights");
                 struct ggml_tensor * tmp = ggml_mul_mat_id(
                         ctx, ggml_cont(ctx, ggml_transpose(ctx, src0)), grad, src2);
                 if (!ggml_are_same_shape(tmp, src1)) {
