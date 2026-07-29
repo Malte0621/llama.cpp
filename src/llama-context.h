@@ -258,6 +258,14 @@ struct llama_context {
     std::vector<std::vector<float>> nanoquant_optimizer_output_importance(
             const llama_nanoquant_optimizer * optimizer) const;
 
+    // forward-only evaluation that stops after transformer block `block`, so activation
+    // collection does not pay for the layers above it. the eval callback still fires.
+    void nanoquant_forward_block(
+            llama_batch & batch,
+            const llama_token * tokens,
+            int32_t n_tokens,
+            int32_t block);
+
 private:
     //
     // output
@@ -419,6 +427,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // the block the cached nanoquant_forward_block graph stops at, -1 when there is none
+    int32_t       nanoquant_fwd_block  = -1;
+    ggml_tensor * nanoquant_fwd_output = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

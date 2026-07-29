@@ -2815,26 +2815,15 @@ static std::vector<std::vector<calibration_data>> collect_projections(
         }
     }
 
+    const int32_t block = groups[block_begin].block;
     for (int32_t sample = 0; sample < params->nanoquant_sample_count; ++sample) {
         const llama_token * tokens = calibration_sample(samples, sample, params);
-        batch.n_tokens = sequence_length;
-        for (int32_t token = 0; token < sequence_length; ++token) {
-            batch.token[token] = tokens[token];
-            batch.pos[token] = token;
-            batch.n_seq_id[token] = 1;
-            batch.seq_id[token][0] = 0;
-            batch.logits[token] = true;
-        }
         for (calibration_collector * collector : collector_set.active) {
             collector->begin_evaluation();
         }
-        llama_memory_clear(llama_get_memory(context), true);
-        const int decode_result = llama_decode(context, batch);
-        if (decode_result != 0) {
-            throw std::runtime_error(format(
-                    "NanoQuant: projection evaluation failed at sample %d (code %d)",
-                    sample, decode_result));
-        }
+        // every collected projection lives in this block, so the layers above it are pure
+        // overhead - and they are the ones that fall back to the host on a large model
+        context->nanoquant_forward_block(batch, tokens, sequence_length, block);
     }
 
     collector_set.active.clear();
@@ -2897,8 +2886,23 @@ struct compute_backend {
     std::vector<ggml_gallocr_t> allocators;
     std::vector<cached_graph *> active_graphs;
     ggml_backend_solve_spd_t solve_spd_fn = nullptr;
+    int nthread = 0;
 
-    explicit compute_backend(const char * device, bool report = true) {
+    static void set_backend_threads(ggml_backend_t target, int nthread) {
+        if (target == nullptr || nthread <= 0) {
+            return;
+        }
+        ggml_backend_reg_t reg =
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(target));
+        auto set_n_threads = (ggml_backend_set_n_threads_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads != nullptr) {
+            set_n_threads(target, nthread);
+        }
+    }
+
+    explicit compute_backend(const char * device, int nthread, bool report = true)
+        : nthread(nthread) {
         backend = device != nullptr && device[0] != '\0' ?
                 ggml_backend_init_by_name(device, nullptr) :
                 ggml_backend_init_best();
@@ -2910,11 +2914,15 @@ struct compute_backend {
             throw std::runtime_error("NanoQuant: no GGML compute backend is available");
         }
         backends.push_back(backend);
+        set_backend_threads(backend, nthread);
         if (ggml_backend_dev_type(ggml_backend_get_device(backend)) !=
             GGML_BACKEND_DEVICE_TYPE_CPU) {
             ggml_backend_t cpu =
                     ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
             if (cpu != nullptr) {
+                // otherwise every graph that falls back to the host runs on the default
+                // thread count instead of the one the caller configured
+                set_backend_threads(cpu, nthread);
                 backends.push_back(cpu);
             }
         }
@@ -3569,7 +3577,7 @@ static void run_admm(
     std::unique_ptr<compute_backend> auxiliary;
     if (backend.solve_spd_fn != nullptr) {
         auxiliary = std::make_unique<compute_backend>(
-                params->nanoquant_device, false);
+                params->nanoquant_device, backend.nthread, false);
         if (auxiliary->solve_spd_fn == nullptr) {
             auxiliary.reset();
         }
@@ -3894,6 +3902,38 @@ static ggml_backend_buffer_type_t training_buft(const ggml_tensor * tensor) {
     return ggml_backend_buffer_get_type(tensor->buffer);
 }
 
+// a trainable override replaces a model tensor, so it belongs on the same device: anything
+// else splits the layer and copies activations across the bus on every optimizer step
+static ggml_backend_buffer_type_t layer_training_buft(
+        const compute_backend & backend,
+        const ggml_tensor * source,
+        size_t parameter_bytes,
+        const char * name) {
+    ggml_backend_buffer_type_t buft = training_buft(source);
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (device == nullptr ||
+        ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        // a host-resident layer has no device to stay on; let the primary device take the
+        // parameters so the override itself still runs accelerated
+        return backend.optimizer_buffer_type(parameter_bytes, name);
+    }
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(device, &free, &total);
+    static constexpr size_t MIB = 1024u*1024u;
+    const size_t reserve = std::max<size_t>(512u*MIB, total/16);
+    const size_t available = free > reserve ? free - reserve : 0;
+    if (parameter_bytes <= available/5) {
+        return buft;
+    }
+    LLAMA_LOG_INFO(
+            "NanoQuant: %s cannot keep its parameters on %s "
+            "(parameters=%.2f MiB free=%.2f MiB reserve=%.2f MiB)\n",
+            name, ggml_backend_dev_name(device),
+            parameter_bytes/double(MIB), free/double(MIB), reserve/double(MIB));
+    return backend.optimizer_buffer_type(parameter_bytes, name);
+}
+
 static void set_training_tensor(ggml_tensor * tensor, const std::vector<float> & values) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_F32 ||
         ggml_nelements(tensor) != int64_t(values.size())) {
@@ -3928,14 +3968,9 @@ static std::vector<float> collect_block_target(
         batch.logits[token] = true;
     }
     collector.reset(block);
-    llama_memory_clear(llama_get_memory(teacher), true);
-    const int result = llama_decode(teacher, batch);
-    if (result != 0) {
-        throw std::runtime_error(format(
-                "NanoQuant: teacher block evaluation failed (block %d, code %d)",
-                block, result));
-    }
-    llama_synchronize(teacher);
+    // only the layers up to this block matter, and stopping there keeps the pass on the
+    // devices that hold them instead of dragging it through the host-resident tail
+    teacher->nanoquant_forward_block(batch, tokens, n_tokens, block);
     return collector.finish();
 }
 
@@ -4059,7 +4094,8 @@ static void run_nonfactor_reconstruction(
     training_tensor_storage storage(1);
     ggml_tensor * weight = storage.new_2d(
             item.n_in, item.n_out, "nanoquant_training_weight");
-    storage.allocate(backend.optimizer_buffer_type(ggml_nbytes(weight), item.name.c_str()));
+    storage.allocate(layer_training_buft(
+            backend, source, ggml_nbytes(weight), item.name.c_str()));
     set_training_tensor(weight, state.weight);
     release_vector(state.weight);
 
@@ -4214,7 +4250,8 @@ static void run_factor_reconstruction(
     ggml_tensor * scale_post = storage.new_1d(item.n_out, "nanoquant_training_scale_post");
     const size_t parameter_bytes =
             ggml_nbytes(v) + ggml_nbytes(u) + ggml_nbytes(scale_pre) + ggml_nbytes(scale_post);
-    storage.allocate(backend.optimizer_buffer_type(parameter_bytes, item.name.c_str()));
+    storage.allocate(layer_training_buft(
+            backend, source, parameter_bytes, item.name.c_str()));
     set_training_tensor(v, state.v);
     set_training_tensor(u, state.u);
     set_training_tensor(scale_pre, state.scale_pre);
@@ -6079,7 +6116,7 @@ static void quantize(
             hash_hex(source_hash).c_str(), hash_hex(dataset_hash).c_str(), hash_hex(config_hash).c_str());
 
     calibration_collector_set collector_set;
-    compute_backend backend(params->nanoquant_device);
+    compute_backend backend(params->nanoquant_device, nthread);
     llama_model_params model_params = llama_model_default_params();
     std::vector<ggml_backend_dev_t> model_devices;
     std::vector<float> model_tensor_split(llama_max_devices(), 0.0f);
@@ -6291,6 +6328,12 @@ static void quantize(
         block_training_data training_data;
         std::vector<std::vector<calibration_data>> calibrations;
         if (reconstruct_block) {
+            const int block = groups[block_begin].block;
+            LLAMA_LOG_INFO(
+                    "NanoQuant: block %d runs on %s (layers 0-%d of the source model)\n",
+                    block,
+                    ggml_backend_dev_name(llama_model_get_device(teacher.get(), block)),
+                    block);
             training_data = collect_block_training_data(
                     block_context.get(), block_collector,
                     groups[block_begin].block, samples, params);

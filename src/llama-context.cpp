@@ -1332,7 +1332,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // a cached nanoquant_forward_block graph stops at a block and has no logits, so it can
+    // never be reused for a decode even when can_reuse() says the parameters match
+    if (nanoquant_fwd_block < 0 && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1344,6 +1346,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        nanoquant_fwd_block  = -1;
+        nanoquant_fwd_output = nullptr;
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -3532,6 +3537,10 @@ float llama_context::nanoquant_optimizer_step(
             };
         }
 
+        // this takes over gf_res_prev, so any cached nanoquant_forward_block graph is gone
+        nanoquant_fwd_block  = -1;
+        nanoquant_fwd_output = nullptr;
+
         res->reset();
         ggml_backend_sched_reset(sched.get());
         ggml_cgraph * gf = model.build_graph(gparams);
@@ -3900,6 +3909,141 @@ std::vector<std::vector<float>> llama_context::nanoquant_optimizer_output_import
         }
     }
     return result;
+}
+
+void llama_context::nanoquant_forward_block(
+        llama_batch & batch,
+        const llama_token * tokens,
+        int32_t n_tokens,
+        int32_t block) {
+    if (tokens == nullptr || n_tokens <= 0 || block < 0 ||
+        uint32_t(n_tokens) > n_batch() || uint32_t(n_tokens) > n_ubatch()) {
+        throw std::runtime_error("NanoQuant: invalid block forward request");
+    }
+
+    memory->clear(true);
+    batch.n_tokens = n_tokens;
+    for (int32_t token = 0; token < n_tokens; ++token) {
+        batch.token[token]     = tokens[token];
+        batch.pos[token]       = token;
+        batch.n_seq_id[token]  = 1;
+        batch.seq_id[token][0] = 0;
+        batch.logits[token]    = true;
+    }
+    if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(),
+                cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        throw std::runtime_error("NanoQuant: failed to initialize the block forward batch");
+    }
+
+    auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS || !mctx->apply()) {
+        throw std::runtime_error("NanoQuant: failed to initialize the block forward memory");
+    }
+    const llama_ubatch & ubatch = mctx->get_ubatch();
+    if (ubatch.n_tokens != uint32_t(n_tokens)) {
+        throw std::runtime_error("NanoQuant: the block forward batch was split");
+    }
+    n_outputs = ubatch.n_tokens;
+
+    auto * res = gf_res_prev.get();
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+    // the teacher activations are the target the student reproduces, so this pass has to
+    // use the same graph topology that nanoquant_optimizer_step builds
+    gparams.no_cache                    = true;
+    gparams.cparams.flash_attn          = false;
+    gparams.cparams.auto_fa             = false;
+    gparams.cparams.fused_gdn_ar        = false;
+    gparams.cparams.fused_gdn_ch        = false;
+    gparams.cparams.auto_fgdn           = false;
+    gparams.cparams.fused_lid           = false;
+    gparams.cparams.auto_flid           = false;
+    gparams.cparams.fused_dsv4_hc_pre   = false;
+    gparams.cparams.fused_dsv4_hc_comb  = false;
+    gparams.cparams.fused_dsv4_hc_post  = false;
+    gparams.cparams.auto_fhc            = false;
+
+    if (nanoquant_fwd_block != block || graph_reuse_disable || !res->can_reuse(gparams)) {
+        const llm_graph_cb base_callback = gparams.cb;
+        nanoquant_fwd_output = nullptr;
+        nanoquant_fwd_block  = -1;
+        gparams.cb = [base_callback, block, this](
+                const llama_ubatch & callback_ubatch,
+                ggml_tensor * tensor,
+                const char * name,
+                int il) {
+            base_callback(callback_ubatch, tensor, name, il);
+            if (il == block && strcmp(name, "l_out") == 0) {
+                nanoquant_fwd_output = tensor;
+            }
+        };
+
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        ggml_cgraph * gf = model.build_graph(gparams);
+        if (gf == nullptr) {
+            throw std::runtime_error("NanoQuant: the block forward graph was not built");
+        }
+        if (nanoquant_fwd_output == nullptr) {
+            throw std::runtime_error(format(
+                    "NanoQuant: block %d has no output in the source graph", block));
+        }
+
+        // every input has to stay in the graph so that set_inputs still finds it allocated
+        std::vector<ggml_tensor *> graph_inputs;
+        {
+            std::vector<ggml_tensor *> pending;
+            std::unordered_set<ggml_tensor *> visited;
+            pending.reserve(size_t(ggml_graph_n_nodes(gf)));
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                pending.push_back(ggml_graph_node(gf, i));
+            }
+            while (!pending.empty()) {
+                ggml_tensor * tensor = pending.back();
+                pending.pop_back();
+                if (tensor == nullptr || !visited.insert(tensor).second) {
+                    continue;
+                }
+                if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+                    graph_inputs.push_back(tensor);
+                }
+                if (tensor->view_src != nullptr) {
+                    pending.push_back(tensor->view_src);
+                }
+                for (ggml_tensor * src : tensor->src) {
+                    if (src != nullptr) {
+                        pending.push_back(src);
+                    }
+                }
+            }
+        }
+
+        // drop the layers above the collected block - none of their activations are used
+        // and on a partially offloaded model they are the ones that fall back to the host
+        ggml_graph_clear(gf);
+        for (ggml_tensor * input : graph_inputs) {
+            ggml_build_forward_expand(gf, input);
+        }
+        ggml_build_forward_expand(gf, nanoquant_fwd_output);
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            throw std::runtime_error("NanoQuant: failed to allocate the block forward graph");
+        }
+        nanoquant_fwd_block = block;
+    } else if (cparams.pipeline_parallel) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    res->set_inputs(&ubatch);
+
+    const ggml_status status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error(format(
+                "NanoQuant: the block %d forward pass failed (status %d)", block, int(status)));
+    }
+    ggml_backend_sched_synchronize(sched.get());
 }
 
 static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
