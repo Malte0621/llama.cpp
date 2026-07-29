@@ -5878,14 +5878,24 @@ static void quantize(
     std::vector<group> groups = find_groups(loader, params->allow_requantize);
     const std::vector<const llama_model_loader::llama_tensor_weight *> weights =
             ordered_weights(loader);
+    // the mul_mat_id gradient needs its weight transposed, which a block-quantized layout cannot represent
+    bool differentiable_source = true;
     for (const auto * weight : weights) {
         const ggml_tensor * tensor = weight->tensor;
         if (tensor->ne[2] > 1 && ggml_is_quantized(tensor->type)) {
-            throw std::runtime_error(format(
-                    "NanoQuant: source expert tensor '%s' is %s; block training differentiates through "
-                    "mul_mat_id, which cannot transpose a block-quantized weight - convert the source model "
-                    "to F32/F16/BF16 first",
-                    ggml_get_name(tensor), ggml_type_name(tensor->type)));
+            if (!params->allow_requantize) {
+                // find_groups skips these, so they would reach the student and break its scale tuning
+                throw std::runtime_error(format(
+                        "NanoQuant: source expert tensor '%s' is %s but requantization is disabled; "
+                        "pass --allow-requantize so the experts are reconstructed instead of copied",
+                        ggml_get_name(tensor), ggml_type_name(tensor->type)));
+            }
+            LLAMA_LOG_WARN(
+                    "NanoQuant: source expert tensor '%s' is %s; task-gradient importance is unavailable, "
+                    "falling back to uniform output importance\n",
+                    ggml_get_name(tensor), ggml_type_name(tensor->type));
+            differentiable_source = false;
+            break;
         }
     }
     std::unordered_map<std::string, size_t> group_by_name;
@@ -6207,13 +6217,20 @@ static void quantize(
     const size_t first_block = 0;
 
     owned_batch projection_batch(params->nanoquant_sequence_length);
-    const std::vector<std::vector<float>> output_importance =
-            collect_output_importance(
-                    teacher_context.get(), groups, projection_targets,
-                    projection_reachable,
-                    samples, backend.gradient_memory_budget(),
-                    params, projection_batch.value);
-    if (projection_targets.empty()) {
+    std::vector<std::vector<float>> output_importance(groups.size());
+    if (differentiable_source) {
+        output_importance = collect_output_importance(
+                teacher_context.get(), groups, projection_targets,
+                projection_reachable,
+                samples, backend.gradient_memory_budget(),
+                params, projection_batch.value);
+    } else {
+        for (const size_t index : projection_targets) {
+            output_importance[index].assign(size_t(groups[index].n_out), 1.0f);
+        }
+    }
+    // the reachability callback only fires during a decode, so probe when no gradient pass ran
+    if (projection_targets.empty() || !differentiable_source) {
         llama_batch & reachability_batch = projection_batch.value;
         reachability_batch.n_tokens = params->nanoquant_sequence_length;
         const llama_token * tokens = calibration_sample(samples, 0, params);
