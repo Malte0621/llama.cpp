@@ -5814,6 +5814,47 @@ static bool reduce_model_gpu_layers(llama_model_params & model_params, const cha
     return true;
 }
 
+// the fit is only an estimate, so report where the weights actually ended up
+static void log_model_residency(
+        const char * what,
+        const llama_model * model,
+        const llama_context * context,
+        int32_t n_gpu_layers) {
+    static constexpr double MIB = 1024.0*1024.0;
+    const int32_t n_devices = llama_model_n_devices(model);
+    std::vector<double> device_bytes(size_t(std::max<int32_t>(n_devices, 0)), 0.0);
+    double host_bytes = 0.0;
+    for (const auto & [buft, memory] : llama_get_memory_breakdown(context)) {
+        const size_t bytes = memory.total();
+        if (bytes == 0) {
+            continue;
+        }
+        ggml_backend_dev_t device =
+                ggml_backend_buft_is_host(buft) ? nullptr : ggml_backend_buft_get_device(buft);
+        int32_t index = -1;
+        for (int32_t i = 0; device != nullptr && i < n_devices; ++i) {
+            if (llama_model_get_device(model, i) == device) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0) {
+            host_bytes += bytes;
+        } else {
+            device_bytes[index] += bytes;
+        }
+    }
+    const int32_t max_gpu_layers =
+            llama_model_n_layer(model) + llama_model_n_layer_nextn(model) + 1;
+    for (int32_t i = 0; i < n_devices; ++i) {
+        LLAMA_LOG_INFO("NanoQuant: %s uses %.2f MiB on %s\n",
+                what, device_bytes[i]/MIB,
+                ggml_backend_dev_name(llama_model_get_device(model, i)));
+    }
+    LLAMA_LOG_INFO("NanoQuant: %s uses %.2f MiB on the host; %d/%d layers offloaded\n",
+            what, host_bytes/MIB, std::min(n_gpu_layers, max_gpu_layers), max_gpu_layers);
+}
+
 
 static void quantize(
         const std::string & input_path,
@@ -6113,6 +6154,8 @@ static void quantize(
             throw std::runtime_error("NanoQuant: failed to load the source teacher model");
         }
     }
+    log_model_residency(
+            "source model", teacher.get(), teacher_context.get(), model_params.n_gpu_layers);
     const std::vector<llama_token> samples = make_calibration_samples(teacher.get(), params);
     LLAMA_LOG_INFO(
             "NanoQuant phase 1/3: calibrated %d deterministic samples x %d tokens; projection cache <= %zu bytes/block\n",
@@ -6414,6 +6457,8 @@ static void quantize(
                         "NanoQuant: failed to load the reconstructed student model");
             }
         }
+        log_model_residency(
+                "student model", student.get(), student_context.get(), model_params.n_gpu_layers);
 
         std::vector<bool> scale_tuning_reachable = projection_reachable;
         size_t fixed_expert_groups = 0;

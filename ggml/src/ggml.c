@@ -7825,6 +7825,37 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                     }
                 } break;
+                case GGML_GLU_OP_SWIGLU_OAI: {
+                    // forward: x = min(src0, limit), y = clamp(src1, -limit, limit), dst = x*sigmoid(alpha*x)*(y + 1)
+                    GGML_ASSERT(src1 && "backward pass only implemented for split swiglu_oai");
+                    const float alpha = ggml_get_op_params_f32(tensor, 2);
+                    const float limit = ggml_get_op_params_f32(tensor, 3);
+
+                    // x and y are contiguous copies, and saturating the input leaves them at the limit,
+                    // so they also serve as the saturation masks
+                    struct ggml_tensor * x = ggml_clamp(ctx, src0, -INFINITY, limit);
+                    struct ggml_tensor * y = ggml_clamp(ctx, src1, -limit, limit);
+                    struct ggml_tensor * s = ggml_sigmoid(ctx, ggml_scale(ctx, x, alpha));
+
+                    if (src0_needs_grads) {
+                        // d/dx [x*sigmoid(alpha*x)] = s*(1 + alpha*x*(1 - s))
+                        struct ggml_tensor * ds = ggml_mul(ctx, s,
+                            ggml_scale_bias(ctx,
+                                ggml_mul(ctx, ggml_scale(ctx, x, alpha), ggml_scale_bias(ctx, s, -1.0f, 1.0f)),
+                                1.0f, 1.0f));
+                        struct ggml_tensor * unsaturated = ggml_step(ctx, ggml_scale_bias(ctx, x, -1.0f, limit));
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_mul(ctx,
+                                ggml_mul(ctx, ggml_mul(ctx, grad, ggml_scale_bias(ctx, y, 1.0f, 1.0f)), ds),
+                                unsaturated));
+                    }
+                    if (src1_needs_grads) {
+                        struct ggml_tensor * unsaturated = ggml_step(ctx,
+                            ggml_scale_bias(ctx, ggml_abs(ctx, y), -1.0f, limit));
+                        ggml_add_or_set(ctx, cgraph, isrc1,
+                            ggml_mul(ctx, ggml_mul(ctx, grad, ggml_mul(ctx, x, s)), unsaturated));
+                    }
+                } break;
                 default: {
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
