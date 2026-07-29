@@ -131,6 +131,7 @@ static void usage(const char * executable) {
     printf("       [--nanoquant-nonfactor-epochs] [--nanoquant-factor-epochs] [--nanoquant-model-epochs]\n");
     printf("       [--nanoquant-nonfactor-lr] [--nanoquant-factor-lr] [--nanoquant-model-lr]\n");
     printf("       [--nanoquant-checkpoint-dir] [--nanoquant-resume] [--nanoquant-seed]\n");
+    printf("       [--nanoquant-device] [--nanoquant-gpu-layers] [--nanoquant-calibration-column]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");

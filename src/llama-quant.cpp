@@ -896,6 +896,7 @@ namespace nanoquant {
 static constexpr uint32_t CHECKPOINT_VERSION = 6;
 static constexpr size_t PROJECTION_MEMORY_BUDGET = 256u * 1024u * 1024u;
 static constexpr size_t GRADIENT_MEMORY_BUDGET = 256u * 1024u * 1024u;
+static constexpr size_t MODEL_DEVICE_RESERVE = size_t(2u) * 1024u * 1024u * 1024u;
 static constexpr int32_t ADMM_LOG_INTERVAL = 25;
 static constexpr float CALIBRATION_SHRINKAGE = 0.4f;
 static constexpr float ADMM_REGULARIZATION = 3.0e-2f;
@@ -5648,21 +5649,55 @@ static void write_grouped_gguf(
     }
 }
 
+struct model_fit_config {
+    ggml_backend_dev_t training_device = nullptr;
+    size_t n_model_devices = 0;
+    size_t n_contexts = 1;
+};
+
 struct model_fit_probe {
     int32_t max_gpu_layers = 0;
     size_t n_gpu_devices = 0;
-    double fit_ratio = 1.0;
     bool fits = true;
 };
+
+struct model_fit_result {
+    int32_t n_gpu_layers = 0;
+    int32_t max_gpu_layers = 0;
+};
+
+// the device that also holds the training tensors needs headroom beyond the source model itself
+static size_t model_device_reserve(
+        ggml_backend_dev_t device,
+        const model_fit_config & config) {
+    const bool is_meta = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META;
+    const size_t reserve_count = is_meta ? std::max<size_t>(config.n_model_devices, 1) : 1;
+    if (reserve_count > std::numeric_limits<size_t>::max()/MODEL_DEVICE_RESERVE) {
+        throw std::runtime_error("NanoQuant: device reserve size overflow");
+    }
+    size_t reserve = MODEL_DEVICE_RESERVE*reserve_count;
+    if (device == config.training_device || is_meta) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        reserve += std::min(MODEL_DEVICE_RESERVE, total/4);
+    }
+    return reserve;
+}
 
 static model_fit_probe probe_model_fit(
         const std::string & path,
         llama_model_params model_params,
-        const llama_context_params & context_params,
-        size_t model_device_count) {
+        llama_context_params context_params,
+        const model_fit_config & config) {
     model_params.no_alloc = true;
     model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     model_params.check_tensors = false;
+    const enum llama_flash_attn_type flash_attn_type = context_params.flash_attn_type;
+    // the projection context runs without flash attention, which needs the largest compute buffers
+    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    context_params.cb_eval = nullptr;
+    context_params.cb_eval_user_data = nullptr;
 
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(path.c_str(), model_params), llama_model_free);
@@ -5672,12 +5707,19 @@ static model_fit_probe probe_model_fit(
     std::unique_ptr<llama_context, decltype(&llama_free)> context(
             llama_init_from_model(model.get(), context_params), llama_free);
     if (!context) {
+        // architectures that require flash attention only support the caller's setting
+        context_params.flash_attn_type = flash_attn_type;
+        context.reset(llama_init_from_model(model.get(), context_params));
+    }
+    if (!context) {
         throw std::runtime_error("NanoQuant: failed to probe source context memory");
     }
 
     model_fit_probe result;
     result.max_gpu_layers =
             llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get()) + 1;
+    // the reconstruction phase keeps several contexts on the same model alive at once
+    const size_t n_contexts = std::max<size_t>(config.n_contexts, 1);
     std::unordered_map<ggml_backend_dev_t, size_t> device_usage;
     for (const auto & [buft, memory] : llama_get_memory_breakdown(context.get())) {
         if (ggml_backend_buft_is_host(buft)) {
@@ -5693,7 +5735,11 @@ static model_fit_probe probe_model_fit(
             type != GGML_BACKEND_DEVICE_TYPE_META) {
             continue;
         }
-        const size_t bytes = memory.total();
+        const size_t per_context = memory.context + memory.compute;
+        if (per_context > (std::numeric_limits<size_t>::max() - memory.model)/n_contexts) {
+            throw std::runtime_error("NanoQuant: source model memory size overflow");
+        }
+        const size_t bytes = memory.model + per_context*n_contexts;
         size_t & used = device_usage[device];
         if (bytes > std::numeric_limits<size_t>::max() - used) {
             throw std::runtime_error("NanoQuant: source model memory size overflow");
@@ -5701,72 +5747,71 @@ static model_fit_probe probe_model_fit(
         used += bytes;
     }
 
-    static constexpr size_t GIB = size_t(1024u)*1024u*1024u;
     result.n_gpu_devices = device_usage.size();
     for (const auto & [device, used] : device_usage) {
         size_t free = 0;
         size_t total = 0;
         ggml_backend_dev_memory(device, &free, &total);
-        const size_t reserve_count =
-                ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META ?
-                model_device_count : 1;
-        if (reserve_count > std::numeric_limits<size_t>::max()/(2u*GIB)) {
-            throw std::runtime_error("NanoQuant: device reserve size overflow");
-        }
-        const size_t reserve = 2u*GIB*reserve_count;
+        const size_t reserve = model_device_reserve(device, config);
         const size_t available = free > reserve ? free - reserve : 0;
         if (used > available) {
             result.fits = false;
-        }
-        if (used > 0) {
-            result.fit_ratio = std::min(result.fit_ratio, available/double(used));
         }
     }
     return result;
 }
 
-static int32_t fit_model_gpu_layers(
+static model_fit_result fit_model_gpu_layers(
         const std::string & path,
         llama_model_params model_params,
         const llama_context_params & context_params,
-        size_t model_device_count) {
+        const model_fit_config & config) {
     model_params.n_gpu_layers = -1;
-    model_fit_probe probe =
-            probe_model_fit(path, model_params, context_params, model_device_count);
-    if (probe.fits) {
-        return -1;
-    }
+    model_fit_probe probe = probe_model_fit(path, model_params, context_params, config);
+
+    model_fit_result result;
+    result.max_gpu_layers = probe.max_gpu_layers;
     if (probe.max_gpu_layers <= 0 || probe.n_gpu_devices == 0) {
-        return 0;
+        return result;
+    }
+    if (probe.fits) {
+        result.n_gpu_layers = probe.max_gpu_layers;
+        return result;
     }
 
     LLAMA_LOG_INFO(
-            "NanoQuant: source model exceeds available device memory; auto-fitting GPU layers\n");
-    int32_t candidate = std::min<int32_t>(
-            probe.max_gpu_layers - 1,
-            std::max<int32_t>(0, int32_t(std::floor(
-                    probe.max_gpu_layers*std::clamp(probe.fit_ratio, 0.0, 1.0)))));
-    while (true) {
+            "NanoQuant: model exceeds available device memory; finding the maximum GPU layer count\n");
+    int32_t first = 1;
+    int32_t last = probe.max_gpu_layers - 1;
+    while (first <= last) {
+        const int32_t candidate = first + (last - first)/2;
         model_params.n_gpu_layers = candidate;
-        probe = probe_model_fit(
-                path, model_params, context_params, model_device_count);
-        if (probe.fits) {
-            LLAMA_LOG_INFO(
-                    "NanoQuant: source model uses %d/%d GPU layers; %d remain host-resident\n",
-                    candidate, probe.max_gpu_layers, probe.max_gpu_layers - candidate);
-            return candidate;
+        probe = probe_model_fit(path, model_params, context_params, config);
+        if (probe.fits && probe.n_gpu_devices > 0) {
+            result.n_gpu_layers = candidate;
+            first = candidate + 1;
+        } else {
+            last = candidate - 1;
         }
-        if (candidate == 0) {
-            throw std::runtime_error(
-                    "NanoQuant: source context does not fit available device memory");
-        }
-        int32_t next = int32_t(std::floor(
-                candidate*std::clamp(probe.fit_ratio, 0.0, 1.0)));
-        if (next >= candidate) {
-            next = candidate - 1;
-        }
-        candidate = std::max<int32_t>(0, next);
     }
+    LLAMA_LOG_INFO(
+            "NanoQuant: model uses %d/%d GPU layers; %d remain host-resident\n",
+            result.n_gpu_layers, result.max_gpu_layers,
+            result.max_gpu_layers - result.n_gpu_layers);
+    return result;
+}
+
+// an over-optimistic memory estimate must degrade towards the CPU instead of aborting the run
+static bool reduce_model_gpu_layers(llama_model_params & model_params, const char * what) {
+    if (model_params.n_gpu_layers <= 0) {
+        return false;
+    }
+    const int32_t next = model_params.n_gpu_layers/2;
+    LLAMA_LOG_WARN(
+            "NanoQuant: %s does not fit with %d GPU layers; retrying with %d\n",
+            what, model_params.n_gpu_layers, next);
+    model_params.n_gpu_layers = next;
+    return true;
 }
 
 
@@ -5976,6 +6021,7 @@ static void quantize(
     compute_backend backend(params->nanoquant_device);
     llama_model_params model_params = llama_model_default_params();
     std::vector<ggml_backend_dev_t> model_devices;
+    std::vector<float> model_tensor_split(llama_max_devices(), 0.0f);
     model_params.load_mode = load_mode;
     ggml_backend_dev_t training_device = ggml_backend_get_device(backend.backend);
     const bool cpu_training =
@@ -5992,16 +6038,44 @@ static void quantize(
                 model_devices.push_back(device);
             }
         }
+        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         if (model_devices.empty()) {
-            throw std::runtime_error(
-                    "NanoQuant: training backend has no model devices");
+            LLAMA_LOG_WARN(
+                    "NanoQuant: backend %s exposes no model devices; the source model stays host-resident\n",
+                    ggml_backend_reg_name(training_reg));
+        } else {
+            LLAMA_LOG_INFO(
+                    "NanoQuant: source layers are distributed across %zu devices from backend %s\n",
+                    model_devices.size(), ggml_backend_reg_name(training_reg));
         }
-        model_params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
-        LLAMA_LOG_INFO(
-                "NanoQuant: source tensors are sharded across %zu devices from backend %s\n",
-                model_devices.size(), ggml_backend_reg_name(training_reg));
     }
-    const size_t model_device_count = model_devices.size();
+    model_fit_config fit_config;
+    fit_config.training_device = cpu_training ? nullptr : training_device;
+    fit_config.n_model_devices = model_devices.size();
+    // the projection and block reconstruction contexts are alive at the same time
+    fit_config.n_contexts = 2;
+    if (!cpu_training && !model_devices.empty()) {
+        GGML_ASSERT(model_devices.size() <= model_tensor_split.size());
+        double usable_gib = 0.0;
+        for (size_t i = 0; i < model_devices.size(); ++i) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(model_devices[i], &free, &total);
+            const size_t reserve = model_device_reserve(model_devices[i], fit_config);
+            const size_t usable = free > reserve ? free - reserve : 0;
+            model_tensor_split[i] = float(usable/double(1024u*1024u*1024u));
+            usable_gib += model_tensor_split[i];
+            LLAMA_LOG_INFO(
+                    "NanoQuant: source device %s has %.2f GiB available for model layers\n",
+                    ggml_backend_dev_name(model_devices[i]), model_tensor_split[i]);
+        }
+        if (usable_gib > 0.0) {
+            model_params.tensor_split = model_tensor_split.data();
+        } else {
+            LLAMA_LOG_WARN(
+                    "NanoQuant: no device has memory left for model layers; the source model stays host-resident\n");
+        }
+    }
     model_devices.push_back(nullptr);
     model_params.devices = model_devices.data();
     const int32_t configured_model_gpu_layers =
@@ -6017,22 +6091,27 @@ static void quantize(
     context_params.n_threads_batch = nthread;
     context_params.no_perf = true;
     if (model_params.n_gpu_layers < 0) {
-        model_params.n_gpu_layers = fit_model_gpu_layers(
-                input_path, model_params, context_params, model_device_count);
-    }
-    std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(
-            llama_model_load_from_file(input_path.c_str(), model_params), llama_model_free);
-    if (!teacher) {
-        throw std::runtime_error("NanoQuant: failed to load the source teacher model");
+        model_params.n_gpu_layers =
+                fit_model_gpu_layers(input_path, model_params, context_params, fit_config).n_gpu_layers;
     }
     std::vector<bool> projection_reachable(groups.size(), false);
     projection_reachability reachability { group_by_name, projection_reachable };
     context_params.cb_eval = projection_reachability_callback;
     context_params.cb_eval_user_data = &reachability;
-    std::unique_ptr<llama_context, decltype(&llama_free)> teacher_context(
-            llama_init_from_model(teacher.get(), context_params), llama_free);
-    if (!teacher_context) {
-        throw std::runtime_error("NanoQuant: failed to create the teacher calibration context");
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> teacher(nullptr, llama_model_free);
+    std::unique_ptr<llama_context, decltype(&llama_free)> teacher_context(nullptr, llama_free);
+    while (true) {
+        teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
+        if (teacher) {
+            teacher_context.reset(llama_init_from_model(teacher.get(), context_params));
+            if (teacher_context) {
+                break;
+            }
+            teacher.reset();
+        }
+        if (!reduce_model_gpu_layers(model_params, "the source teacher model")) {
+            throw std::runtime_error("NanoQuant: failed to load the source teacher model");
+        }
     }
     const std::vector<llama_token> samples = make_calibration_samples(teacher.get(), params);
     LLAMA_LOG_INFO(
@@ -6101,17 +6180,6 @@ static void quantize(
     teacher_context.reset();
     context_params.cb_eval = nullptr;
     context_params.cb_eval_user_data = nullptr;
-    if (ggml_backend_dev_type(ggml_backend_get_device(backend.backend)) !=
-        GGML_BACKEND_DEVICE_TYPE_CPU) {
-        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-        teacher.reset();
-        teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
-        if (!teacher) {
-            throw std::runtime_error(
-                    "NanoQuant: failed to reload the block-training source model");
-        }
-        LLAMA_LOG_INFO("NanoQuant: block training uses layer sharding\n");
-    }
 
     llama_context_params projection_context_params = context_params;
     projection_context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -6317,25 +6385,34 @@ static void quantize(
         release_vector(read_data);
         release_vector(conversion);
 
-        model_params.tensor_buft_overrides = nullptr;
-        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-        model_params.n_gpu_layers = configured_model_gpu_layers;
-        std::unique_ptr<llama_model, decltype(&llama_model_free)> student(
-                llama_model_load_from_file(
-                        intermediate_student.string().c_str(), model_params),
-                llama_model_free);
-        if (!student) {
-            throw std::runtime_error(
-                    "NanoQuant: failed to load the reconstructed student model");
-        }
         llama_context_params student_context_params = context_params;
         student_context_params.cb_eval = nullptr;
         student_context_params.cb_eval_user_data = nullptr;
-        std::unique_ptr<llama_context, decltype(&llama_free)> student_context(
-                llama_init_from_model(student.get(), student_context_params), llama_free);
-        if (!student_context) {
-            throw std::runtime_error(
-                    "NanoQuant: failed to create the reconstructed student context");
+        model_fit_config student_fit_config = fit_config;
+        student_fit_config.n_contexts = 1;
+        model_params.n_gpu_layers = configured_model_gpu_layers;
+        if (model_params.n_gpu_layers < 0) {
+            model_params.n_gpu_layers = fit_model_gpu_layers(
+                    intermediate_student.string(), model_params,
+                    student_context_params, student_fit_config).n_gpu_layers;
+        }
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> student(nullptr, llama_model_free);
+        std::unique_ptr<llama_context, decltype(&llama_free)> student_context(nullptr, llama_free);
+        while (true) {
+            student.reset(llama_model_load_from_file(
+                    intermediate_student.string().c_str(), model_params));
+            if (student) {
+                student_context.reset(
+                        llama_init_from_model(student.get(), student_context_params));
+                if (student_context) {
+                    break;
+                }
+                student.reset();
+            }
+            if (!reduce_model_gpu_layers(model_params, "the reconstructed student model")) {
+                throw std::runtime_error(
+                        "NanoQuant: failed to load the reconstructed student model");
+            }
         }
 
         std::vector<bool> scale_tuning_reachable = projection_reachable;
