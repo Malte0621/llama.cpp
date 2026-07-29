@@ -5901,6 +5901,77 @@ static model_fit_result fit_model_gpu_layers(
 }
 
 // an over-optimistic memory estimate must degrade towards the CPU instead of aborting the run
+// which transformer blocks are pinned to a device for the current phase-2 window. the windowed
+// forward only touches one block at a time, so the model itself no longer has to fit in VRAM -
+// only the chunk of blocks the window is walking through does
+struct residency_window {
+    int begin = 0;
+    int end = 0;
+    std::vector<std::string> patterns;
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<llama_model_tensor_buft_override> overrides;
+
+    // the override array points into `patterns`, which moves when this object does
+    void rebind() {
+        overrides.assign(patterns.size() + 1, { nullptr, nullptr });
+        for (size_t i = 0; i < patterns.size(); ++i) {
+            overrides[i].pattern = patterns[i].c_str();
+            overrides[i].buft    = bufts[i];
+        }
+    }
+
+    bool covers(int block) const {
+        return block >= begin && block < end;
+    }
+
+    const llama_model_tensor_buft_override * data() const {
+        return patterns.empty() ? nullptr : overrides.data();
+    }
+};
+
+static residency_window plan_residency_window(
+        int first_block,
+        int n_block,
+        const std::vector<size_t> & block_bytes,
+        const std::vector<ggml_backend_dev_t> & devices,
+        const model_fit_config & fit_config) {
+    residency_window window;
+    window.begin = first_block;
+    window.end   = first_block;
+    std::vector<size_t> budget(devices.size(), 0);
+    for (size_t i = 0; i < devices.size(); ++i) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(devices[i], &free, &total);
+        const size_t reserve = model_device_reserve(devices[i], fit_config);
+        budget[i] = free > reserve ? free - reserve : 0;
+    }
+    window.patterns.reserve(size_t(n_block));
+    window.bufts.reserve(size_t(n_block));
+    size_t device = 0;
+    for (int block = first_block; block < n_block; ++block) {
+        const size_t bytes = size_t(block) < block_bytes.size() ? block_bytes[size_t(block)] : 0;
+        while (device < devices.size() && budget[device] < bytes) {
+            ++device;
+        }
+        if (device >= devices.size()) {
+            break;
+        }
+        budget[device] -= bytes;
+        window.patterns.push_back(format("^blk\\.%d\\.", block));
+        window.bufts.push_back(ggml_backend_dev_buffer_type(devices[device]));
+        window.end = block + 1;
+    }
+    if (window.end == window.begin) {
+        // not even one block fits, so stop planning windows and keep the source host-resident
+        window.end = n_block;
+        window.patterns.clear();
+        window.bufts.clear();
+    }
+    window.rebind();
+    return window;
+}
+
 static bool reduce_model_gpu_layers(llama_model_params & model_params, const char * what) {
     if (model_params.n_gpu_layers <= 0) {
         return false;
@@ -6236,6 +6307,7 @@ static void quantize(
                     "NanoQuant: no device has memory left for model layers; the source model stays host-resident\n");
         }
     }
+    const std::vector<ggml_backend_dev_t> model_devices_gpu = model_devices;
     model_devices.push_back(nullptr);
     model_params.devices = model_devices.data();
     const int32_t configured_model_gpu_layers =
@@ -6253,6 +6325,22 @@ static void quantize(
     if (model_params.n_gpu_layers < 0) {
         model_params.n_gpu_layers =
                 fit_model_gpu_layers(input_path, model_params, context_params, fit_config).n_gpu_layers;
+    }
+    const int32_t fitted_model_gpu_layers = model_params.n_gpu_layers;
+    // phase 2 pins whole blocks with buffer-type overrides instead of offloading a prefix, so
+    // it needs the size of each block rather than a layer count
+    int n_decoder_block = 0;
+    std::vector<size_t> block_bytes;
+    for (const auto & entry : loader.weights_map) {
+        const int block = decoder_block(entry.first);
+        if (block < 0) {
+            continue;
+        }
+        if (size_t(block) >= block_bytes.size()) {
+            block_bytes.resize(size_t(block) + 1, 0);
+        }
+        block_bytes[size_t(block)] += ggml_nbytes(entry.second.tensor);
+        n_decoder_block = std::max(n_decoder_block, block + 1);
     }
     std::vector<bool> projection_reachable(groups.size(), false);
     projection_reachability reachability { group_by_name, projection_reachable };
@@ -6354,20 +6442,64 @@ static void quantize(
     projection_context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     projection_context_params.cb_eval = calibration_callback;
     projection_context_params.cb_eval_user_data = &collector_set;
-    std::unique_ptr<llama_context, decltype(&llama_free)> projection_context(
-            llama_init_from_model(teacher.get(), projection_context_params), llama_free);
-    if (!projection_context) {
-        throw std::runtime_error("NanoQuant: failed to create the teacher projection context");
-    }
     block_output_collector block_collector;
     llama_context_params block_context_params = context_params;
     block_context_params.cb_eval = block_output_callback;
     block_context_params.cb_eval_user_data = &block_collector;
-    std::unique_ptr<llama_context, decltype(&llama_free)> block_context(
-            llama_init_from_model(teacher.get(), block_context_params), llama_free);
-    if (!block_context) {
-        throw std::runtime_error("NanoQuant: failed to create the block reconstruction context");
-    }
+    std::unique_ptr<llama_context, decltype(&llama_free)> projection_context(nullptr, llama_free);
+    std::unique_ptr<llama_context, decltype(&llama_free)> block_context(nullptr, llama_free);
+
+    // phase 2 only ever evaluates one block at a time, so instead of offloading a prefix of the
+    // model it pins as many whole blocks as the devices hold and reloads when the window leaves
+    // them. the source model no longer has to fit in VRAM for any of this to run on the GPUs.
+    residency_window residency;
+    residency.end = 0;
+    const bool window_residency = !cpu_training && !model_devices_gpu.empty();
+    auto load_source_window = [&](int from_block) {
+        projection_context.reset();
+        block_context.reset();
+        teacher.reset();
+        llama_model_params window_params = model_params;
+        if (window_residency) {
+            residency = plan_residency_window(
+                    from_block, n_decoder_block, block_bytes, model_devices_gpu, fit_config);
+            window_params.tensor_buft_overrides = residency.data();
+            window_params.n_gpu_layers = 0;
+            window_params.tensor_split = nullptr;
+        } else {
+            residency.begin = 0;
+            residency.end = n_decoder_block;
+        }
+        window_params.check_tensors = false;
+        teacher.reset(llama_model_load_from_file(input_path.c_str(), window_params));
+        if (!teacher) {
+            throw std::runtime_error("NanoQuant: failed to reload the source model for the block window");
+        }
+        projection_context.reset(
+                llama_init_from_model(teacher.get(), projection_context_params));
+        if (!projection_context) {
+            throw std::runtime_error("NanoQuant: failed to create the teacher projection context");
+        }
+        block_context.reset(llama_init_from_model(teacher.get(), block_context_params));
+        if (!block_context) {
+            throw std::runtime_error("NanoQuant: failed to create the block reconstruction context");
+        }
+        if (residency.patterns.empty()) {
+            LLAMA_LOG_WARN(
+                    "NanoQuant: no device holds a whole transformer block; "
+                    "the source model stays host-resident for block reconstruction\n");
+        } else {
+            size_t window_bytes = 0;
+            for (int block = residency.begin; block < residency.end; ++block) {
+                window_bytes += block_bytes[size_t(block)];
+            }
+            LLAMA_LOG_INFO(
+                    "NanoQuant: block window %d-%d is device-resident (%.2f GiB over %zu devices)\n",
+                    residency.begin, residency.end - 1,
+                    window_bytes/double(1024u*1024u*1024u), model_devices_gpu.size());
+        }
+    };
+    load_source_window(0);
     LLAMA_LOG_INFO(
             "NanoQuant: source and reconstructed weights use disjoint residency phases; "
             "optimizer parameters are allocated one group at a time\n");
@@ -6383,6 +6515,11 @@ static void quantize(
             ++block_end;
         }
 
+        if (!residency.covers(groups[block_begin].block) &&
+            residency.begin != groups[block_begin].block) {
+            load_source_window(groups[block_begin].block);
+        }
+
         bool reconstruct_block = false;
         for (size_t index = block_begin; index < block_end; ++index) {
             if (model_states[index].stage < checkpoint_stage::GROUP_DONE &&
@@ -6395,10 +6532,12 @@ static void quantize(
         std::vector<std::vector<calibration_data>> calibrations;
         if (reconstruct_block) {
             const int block = groups[block_begin].block;
+            const ggml_tensor * resident = teacher->get_tensor(groups[block_begin].name.c_str());
             LLAMA_LOG_INFO(
-                    "NanoQuant: block %d runs on %s (window covers blocks %d-%d)\n",
+                    "NanoQuant: block %d weights are on %s (replayed window covers blocks %d-%d)\n",
                     block,
-                    ggml_backend_dev_name(llama_model_get_device(teacher.get(), block)),
+                    resident != nullptr && resident->buffer != nullptr ?
+                            ggml_backend_buffer_name(resident->buffer) : "an unknown buffer",
                     window_begin, block);
             training_data = collect_block_training_data(
                     block_context.get(), block_collector,
@@ -6545,11 +6684,36 @@ static void quantize(
         }
     }
 
-    teacher_context.reset(llama_init_from_model(teacher.get(), context_params));
+    // the teacher probability cache runs the whole model again, so give the layers back the
+    // prefix offload the block window replaced
+    if (window_residency) {
+        teacher.reset();
+        fit_config.n_contexts = 1;
+        model_params.n_gpu_layers = fitted_model_gpu_layers;
+        model_params.check_tensors = false;
+        while (true) {
+            teacher.reset(llama_model_load_from_file(input_path.c_str(), model_params));
+            if (teacher) {
+                teacher_context.reset(llama_init_from_model(teacher.get(), context_params));
+                if (teacher_context) {
+                    break;
+                }
+                teacher.reset();
+            }
+            if (!reduce_model_gpu_layers(model_params, "the teacher probability model")) {
+                throw std::runtime_error(
+                        "NanoQuant: failed to reload the source model for the teacher probability cache");
+            }
+        }
+    } else {
+        teacher_context.reset(llama_init_from_model(teacher.get(), context_params));
+    }
     if (!teacher_context) {
         throw std::runtime_error(
                 "NanoQuant: failed to create the teacher probability context");
     }
+    log_model_residency(
+            "source model", teacher.get(), teacher_context.get(), model_params.n_gpu_layers);
     const std::filesystem::path teacher_cache_path =
             output_path + ".nanoquant.teacher.tmp";
     auto teacher_cache = std::make_unique<teacher_probability_cache>(
