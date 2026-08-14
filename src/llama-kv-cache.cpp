@@ -2851,10 +2851,6 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, ggml
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur], source);
 }
 
-ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) const {
-    return kv->get_k_idx(ctx, il, n_kv, sinfos[i_cur]);
-}
-
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
 }

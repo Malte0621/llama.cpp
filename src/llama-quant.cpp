@@ -6044,7 +6044,7 @@ static void quantize(
     std::vector<std::string> splits;
     llama_model_loader loader(
             nullptr, nullptr, nullptr, input_path, splits, nullptr,
-            load_mode, true, false, params->kv_overrides, nullptr);
+            load_mode, true, false, false, params->kv_overrides, nullptr);
     std::vector<group> groups = find_groups(loader, params->allow_requantize);
     const std::vector<const llama_model_loader::llama_tensor_weight *> weights =
             ordered_weights(loader);

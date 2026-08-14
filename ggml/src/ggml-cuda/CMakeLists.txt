@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+if (CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR)
+    set(CUDAToolkit_ROOT "${CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR}")
+endif()
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
