@@ -1305,8 +1305,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARANGE:
-        case GGML_OP_ROLL:
             return true;
+        case GGML_OP_ROLL:
+            return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
@@ -1431,8 +1432,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
-        case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+            return has_simdgroup_reduction;
+        case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
@@ -1464,6 +1466,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q5_0:
                            case GGML_TYPE_Q5_1:
                            case GGML_TYPE_IQ4_NL:
+                           case GGML_TYPE_TQ2_0:
                            case GGML_TYPE_I32:
                            case GGML_TYPE_TURBO2_0:
                            case GGML_TYPE_TURBO3_0:
@@ -1495,6 +1498,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TQ2_0:
                     case GGML_TYPE_TQ3_1S:
                     case GGML_TYPE_TQ4_1S:
                         switch (op->type) {
@@ -1532,6 +1539,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TQ2_0:
                     case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
