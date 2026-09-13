@@ -35,6 +35,8 @@ set(LLAMA_CORE_SOURCES
     llama-mmap.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
+    llama-parquet.cpp
+    llama-parquet.h
     llama-model.cpp
     llama-quant.cpp
     llama-sampler.cpp

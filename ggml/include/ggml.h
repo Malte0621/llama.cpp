@@ -2065,12 +2065,6 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-    // clamp
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   n_offs);
-
     // set the offset dims for RoPE
     // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
     // vision RoPE is not supported

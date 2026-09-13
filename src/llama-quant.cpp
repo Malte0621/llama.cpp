@@ -297,17 +297,6 @@ static void llama_tensor_dequantize_impl(
     workers.clear();
 }
 
-static void llama_tensor_dequantize_impl(
-    ggml_tensor * tensor, std::vector<no_init<float>> & output, std::vector<std::thread> & workers,
-    const size_t nelements, const int nthread
-) {
-    if (output.size() < nelements) {
-        output.resize(nelements);
-    }
-    llama_tensor_dequantize_to_f32(
-            tensor, reinterpret_cast<float *>(output.data()), workers, nelements, nthread);
-}
-
 //
 // do we allow this tensor to be quantized?
 //
@@ -5349,8 +5338,8 @@ static std::vector<float> load_weight(
         staging.ne[2] = 1;
         staging.buffer = nullptr;
         staging.data = read_data.data();
-        llama_tensor_dequantize_to_f32(
-                &staging, result.data(), workers, elements, nthread);
+        llama_tensor_dequantize_impl(
+                staging.type, staging.data, result.data(), workers, elements, nthread);
     }
     for (float value : result) {
         if (!std::isfinite(value)) {
@@ -5639,7 +5628,8 @@ static size_t write_quantized_auxiliary(
         read_data.resize(source_size);
         tensor->data = read_data.data();
     }
-    loader.load_data_for(tensor);
+    tensor->data = (uint8_t *) loader.load_data_range(
+            loader.require_weight(ggml_get_name(tensor)), 0, ggml_nbytes(tensor), tensor->data);
 
     static constexpr size_t CONVERSION_MEMORY_BUDGET = 64u * 1024u * 1024u;
     const int64_t n_per_row = tensor->ne[0];
@@ -5662,8 +5652,8 @@ static size_t write_quantized_auxiliary(
             staging.buffer = nullptr;
             staging.data = reinterpret_cast<uint8_t *>(tensor->data) +
                     size_t(first_row)*ggml_row_size(tensor->type, n_per_row);
-            llama_tensor_dequantize_to_f32(
-                    &staging, reinterpret_cast<float *>(conversion.data()),
+            llama_tensor_dequantize_impl(
+                    staging.type, staging.data, reinterpret_cast<float *>(conversion.data()),
                     workers, elements, nthread);
             f32_data = reinterpret_cast<const float *>(conversion.data());
         }
@@ -5671,7 +5661,7 @@ static size_t write_quantized_auxiliary(
         quantized.resize(chunk_size);
         const size_t actual_size = llama_tensor_quantize_impl(
                 type, f32_data, quantized.data(), elements,
-                rows, n_per_row, nullptr, workers, nthread);
+                first_row, rows, nrows, n_per_row, nullptr, workers, nthread);
         if (actual_size != chunk_size) {
             throw std::runtime_error("NanoQuant: auxiliary quantization size mismatch");
         }
@@ -5723,7 +5713,8 @@ static void write_grouped_gguf(
                     read_data.resize(size);
                     tensor->data = read_data.data();
                 }
-                loader.load_data_for(tensor);
+                tensor->data = (uint8_t *) loader.load_data_range(
+                        loader.require_weight(ggml_get_name(tensor)), 0, ggml_nbytes(tensor), tensor->data);
                 output.write(reinterpret_cast<const char *>(tensor->data), size);
             } else {
                 const size_t actual_size = write_quantized_auxiliary(
@@ -7347,7 +7338,6 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
         /*.nanoquant_calibration_dataset =*/ nullptr,
         /*.nanoquant_checkpoint_directory =*/ nullptr,
         /*.nanoquant_calibration_column =*/ nullptr,
@@ -7365,7 +7355,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.nanoquant_factor_learning_rate =*/ 1.0e-5f,
         /*.nanoquant_model_learning_rate =*/ 1.0e-5f,
         /*.nanoquant_seed              =*/ 0,
-        /*.nanoquant_resume            =*/ false
+        /*.nanoquant_resume            =*/ false,
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
     };
 
     return result;

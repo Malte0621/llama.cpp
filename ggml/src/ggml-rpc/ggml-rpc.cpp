@@ -717,7 +717,7 @@ static bool ggml_backend_rpc_diffusion_sample(
     auto * buffer_ctx = (ggml_backend_rpc_buffer_context *) logits->buffer->context;
     auto * buft_ctx = (ggml_backend_rpc_buffer_type_context *)
         ggml_backend_buffer_get_type(logits->buffer)->context;
-    if (buffer_ctx == nullptr || buffer_ctx->sock == nullptr || buft_ctx == nullptr) {
+    if (buffer_ctx == nullptr || buffer_ctx->dispatcher == nullptr || buft_ctx == nullptr) {
         return false;
     }
 
@@ -734,14 +734,14 @@ static bool ggml_backend_rpc_diffusion_sample(
     request.n_tokens = n_tokens;
     request.inv_temp = inv_temp;
 
-    std::vector<uint8_t> input(sizeof(request) + count * sizeof(float));
-    memcpy(input.data(), &request, sizeof(request));
-    memcpy(input.data() + sizeof(request), uniforms, count * sizeof(float));
+    const size_t input_size = sizeof(request) + count * sizeof(float);
+    uint8_t * input = new uint8_t[input_size]();
+    memcpy(input, &request, sizeof(request));
+    memcpy(input + sizeof(request), uniforms, count * sizeof(float));
+    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
 
     std::vector<uint8_t> output(sizeof(rpc_msg_diffusion_sample_rsp) + count * result_stride);
-    const bool status = send_rpc_cmd(buffer_ctx->sock, RPC_CMD_DIFFUSION_SAMPLE,
-            input.data(), input.size(), output.data(), output.size());
-    RPC_STATUS_ASSERT(status);
+    buffer_ctx->dispatcher->send(RPC_CMD_DIFFUSION_SAMPLE, input_ptr, input_size, output.data(), output.size());
 
     rpc_msg_diffusion_sample_rsp response;
     memcpy(&response, output.data(), sizeof(response));
@@ -2404,18 +2404,16 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
-    rpc_msg_supports_op_req request = {};
-    request.device = ctx->device;
-    request.tensor = serialize_tensor(op);
+    auto request = std::make_shared<rpc_msg_supports_op_req>();
+    request->device = ctx->device;
+    request->tensor = serialize_tensor(op);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        request.srcs[i] = serialize_tensor(op->src[i]);
+        request->srcs[i] = serialize_tensor(op->src[i]);
     }
 
     rpc_msg_supports_op_rsp response;
-    auto sock = get_socket(ctx->endpoint);
-    const bool status = sock && send_rpc_cmd(sock, RPC_CMD_SUPPORTS_OP,
-            &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    dispatcher->send(RPC_CMD_SUPPORTS_OP, request, sizeof(*request), &response, sizeof(response));
     return response.result;
 }
 
