@@ -43,6 +43,8 @@ if (MUSAToolkit_FOUND)
         add_compile_definitions(GGML_MUSA_MUDNN_COPY)
     endif()
 
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+
     if (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
         list(APPEND GGML_SOURCES_MUSA ${SRCS})
@@ -96,7 +98,6 @@ if (MUSAToolkit_FOUND)
     endif()
 
     add_compile_definitions(GGML_USE_MUSA)
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_MUSA_GRAPHS)
         add_compile_definitions(GGML_MUSA_GRAPHS)

@@ -72,6 +72,8 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
+ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+
 if (GGML_CUDA_FA_ALL_QUANTS)
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})

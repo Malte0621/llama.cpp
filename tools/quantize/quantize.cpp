@@ -125,7 +125,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       [--nanoquant-calibration-dataset] [--nanoquant-sequence-length] [--nanoquant-sample-count]\n");
     printf("       [--nanoquant-target-bits] [--nanoquant-admm-outer] [--nanoquant-admm-inner]\n");
     printf("       [--nanoquant-nonfactor-epochs] [--nanoquant-factor-epochs] [--nanoquant-model-epochs]\n");
@@ -171,6 +171,9 @@ static void usage(const char * executable) {
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("  --max-buffer-size MiB\n");
+    printf("                                      max amount of tensor rows kept in memory while quantizing one tensor (default: 8192)\n");
+    printf("                                      lower it to quantize models with very large tensors on a machine with little RAM\n\n");
     printf("  --nanoquant-calibration-dataset PATH\n");
     printf("                                      UTF-8 text or Parquet calibration dataset; required for NANOQUANT conversion\n");
     printf("  --nanoquant-calibration-column NAME\n");
@@ -207,6 +210,7 @@ static void usage(const char * executable) {
     printf("                                      resume after validating source, dataset, and configuration hashes\n");
     printf("  --nanoquant-seed N\n");
     printf("                                      deterministic calibration and factorization seed (default: 0)\n");
+    printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -646,6 +650,16 @@ int llama_quantize(int argc, char ** argv) {
             params.nanoquant_resume = true;
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--max-buffer-size") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            const int mib = atoi(argv[++arg_idx]);
+            if (mib <= 0) {
+                fprintf(stderr, "%s: invalid --max-buffer-size '%s'\n", __func__, argv[arg_idx]);
+                return 1;
+            }
+            params.max_buf_size = (size_t) mib * 1024 * 1024;
         } else {
             usage(argv[0]);
         }
